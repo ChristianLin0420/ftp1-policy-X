@@ -5,13 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-repo_id="pretrain_small_example"
-exp_name="pretrain_small_norm"
-dataset_config_path="scripts_exp_zarr/pretrain_small/data_config_pretrain_small.json"
+cache_root="${FTP1_CACHE_ROOT:-${REPO_ROOT}/.cache/ftp1}"
+repo_id="${FTP1_REPO_ID:-pretrain_small_example}"
+exp_name="${FTP1_EXP_NAME:-pretrain_small_norm}"
+dataset_config_path="${FTP1_DATASET_CONFIG:-scripts_exp_zarr/pretrain_small/data_config_pretrain_small.json}"
 
-checkpoint_base_dir="/path/to/ftp1_cache/checkpoints"
-assets_base_dir="/path/to/ftp1_cache/assets"
-export OPENPI_DATA_HOME="/path/to/ftp1_cache/openpi"
+checkpoint_base_dir="${FTP1_CHECKPOINT_BASE_DIR:-${cache_root}/checkpoints}"
+assets_base_dir="${FTP1_ASSETS_BASE_DIR:-${cache_root}/assets}"
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${cache_root}/openpi}"
 
 val_ratio=0.021
 batch_size=256
@@ -20,6 +21,9 @@ norm_type="zscore"
 norm_sample_ratio=0.1
 norm_batch_size=64
 norm_num_workers=12
+
+mkdir -p "${checkpoint_base_dir}" "${assets_base_dir}" "${OPENPI_DATA_HOME}"
+uv run python scripts/ftp1_preflight.py --dataset-config "${dataset_config_path}"
 
 COMPUTE_ARGS=(
   ftp1

@@ -16,11 +16,11 @@ UniVTAC HDF5 -> FTP1 Zarr parser.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from pathlib import Path
 import shutil
 import sys
-from pathlib import Path
-from typing import Optional
 
 import cv2
 import h5py
@@ -34,8 +34,7 @@ _DATA_PROCESSING_ROOT = _SCRIPT_DIR.parent
 if str(_DATA_PROCESSING_ROOT) not in sys.path:
     sys.path.insert(0, str(_DATA_PROCESSING_ROOT))
 
-from common.replay_buffer import ReplayBuffer
-import json
+from common.replay_buffer import ReplayBuffer  # noqa: E402
 
 # Default FAAS gripper slot, aligned with other FTP1 parsers.
 DEFAULT_GRIPPER_IDX = 28
@@ -51,7 +50,7 @@ def _save_video(
     base_path: Path,
     episode_idx: int,
     fps: int = VIDEO_FPS,
-) -> Optional[Path]:
+) -> Path | None:
     """Write a `camera_ego_rgb` frame sequence to mp4."""
     if frames is None or len(frames) == 0:
         return None
@@ -209,34 +208,40 @@ def _load_univtac_episode(
     return episode
 
 
-# 实际数据规则：base_dir/<task>/demo/hdf5/<id>.hdf5
-HDF5_SUBDIR = "demo/hdf5"
+# The upstream repository historically used demo/hdf5/. The published UniVTAC
+# dataset uses clean/. Accept both without requiring users to rearrange downloads.
+HDF5_SUBDIR_CANDIDATES = ("demo/hdf5", "clean")
 
 
-def _discover_task_dirs(base_dir: Path, task_list: list[str] | None) -> list[tuple[str, Path]]:
+def _discover_task_dirs(base_dir: Path, task_list: list[str] | None) -> list[tuple[str, Path, Path]]:
     """
     发现所有包含 demo/hdf5/*.hdf5 的 task 目录。
-    规则：base_dir/<task>/demo/hdf5/<id>.hdf5，每个 task 一个文件夹。
-    返回 [(task_id, task_dir), ...]，task_dir 即 base_dir/task，HDF5 在 task_dir/demo/hdf5/ 下。
+    Support both base_dir/<task>/demo/hdf5/<id>.hdf5 and the released
+    base_dir/<task>/clean/<id>.hdf5 layout.
     """
     base_dir = Path(base_dir)
     if not base_dir.is_dir():
         return []
 
-    results: list[tuple[str, Path]] = []
+    results: list[tuple[str, Path, Path]] = []
     try:
         for first in sorted(base_dir.iterdir()):
             if not first.is_dir():
                 continue
-            clean_dir = first / HDF5_SUBDIR
-            if not clean_dir.is_dir():
-                continue
-            if not list(clean_dir.glob("*.hdf5")):
+            hdf5_dir = next(
+                (
+                    first / subdir
+                    for subdir in HDF5_SUBDIR_CANDIDATES
+                    if (first / subdir).is_dir() and any((first / subdir).glob("*.hdf5"))
+                ),
+                None,
+            )
+            if hdf5_dir is None:
                 continue
             task_id = first.name
             if task_list is not None and task_id not in task_list:
                 continue
-            results.append((task_id, first))
+            results.append((task_id, first, hdf5_dir))
     except OSError:
         pass
     return results
@@ -263,10 +268,11 @@ def _run(
         task_settings = {}
     task_dirs = _discover_task_dirs(base_dir, task_list)
     if not task_dirs:
-        print(f"No task directories with {HDF5_SUBDIR}/*.hdf5 found under {base_dir}")
-        print(f"  Expected layout: base_dir/<task>/{HDF5_SUBDIR}/<id>.hdf5")
+        layouts = " or ".join(f"base_dir/<task>/{subdir}/<id>.hdf5" for subdir in HDF5_SUBDIR_CANDIDATES)
+        print(f"No UniVTAC task HDF5 directories found under {base_dir}")
+        print(f"  Expected layout: {layouts}")
         return
-    
+
     instruction_map = {
         "grasp_classify": "use grasped tool for tactile sensing to move to target surface.",
         "insert_HDMI": "insert the HDMI to the fixed slot.",
@@ -278,8 +284,7 @@ def _run(
         "put_bottle_in_shelf": "grasp the bottle, then position it into the shelf cavity.",
     }
 
-    for task_id, task_dir in task_dirs:
-        hdf5_dir = task_dir / HDF5_SUBDIR
+    for task_id, _task_dir, hdf5_dir in task_dirs:
         def _episode_sort_key(p: Path) -> int:
             try:
                 return int(p.stem)
@@ -319,7 +324,7 @@ def _run(
             instruction_org = instruction_map.get(task_id, f"solve the task: {task_id}.")
             instruction = instruction_org.ljust(INSTRUCTION_PAD_LEN)
             episode["sub_task_instruction"] = np.array([instruction] * len(episode["timestamps"]))
-            
+
             # print(f"====================================== Task: {task_id} ======================================")
             # _save_video(episode["camera_ego_rgb"], zarr_path, count, fps=VIDEO_FPS)
             # for key in episode.keys():

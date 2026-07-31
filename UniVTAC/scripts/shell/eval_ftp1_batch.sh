@@ -22,6 +22,7 @@ GPU=${GPU:-"0"}
 LOW_MEMORY=${LOW_MEMORY:-0}
 NO_VIDEO=${NO_VIDEO:-0}
 MODEL_NAME=${1:-${MODEL_NAME:-FTP1}}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-""}
 SAVE_ROOT=${SAVE_ROOT:-"eval_results/${MODEL_NAME}"}
 SAVE_INFER_INPUT_DIR=${SAVE_INFER_INPUT_DIR:-"${SAVE_ROOT}/infer_input_sample"}
 ACTION_REP=${ACTION_REP:-auto}
@@ -50,12 +51,12 @@ DOMAIN_NAMES=(
 )
 
 CKPT_DIRS=(
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac1/FTP1_UniVTAC_pull_out_key_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac/FTP1_UniVTAC_insert_hole_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac/FTP1_UniVTAC_insert_tube_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac/FTP1_UniVTAC_lift_bottle_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac/FTP1_UniVTAC_lift_can_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/rtac1_cache/checkpoints/rtac/FTP1_UniVTAC_put_bottle_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_pull_out_key_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_insert_hole_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_insert_tube_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_lift_bottle_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_lift_can_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_put_bottle_expert_gsmall_ftp1/19999"
 )
 RUN_SUFFIXES=(
   "FTP1_UniVTAC_pull_out_key_expert_gsmall_ftp1"
@@ -67,6 +68,7 @@ RUN_SUFFIXES=(
 )
 
 n=${#CKPT_DIRS[@]}
+: "${CHECKPOINT_ROOT:?Set CHECKPOINT_ROOT to the extracted ftp1_univtac_finetune model directory}"
 if [[ ${#TASKS[@]} -ne $n || ${#DOMAIN_NAMES[@]} -ne $n || ${#RUN_SUFFIXES[@]} -ne $n ]]; then
   echo "[eval_ftp1_batch.sh] array length mismatch for per-task mode" >&2
   echo "  TASKS=${#TASKS[@]} DOMAIN_NAMES=${#DOMAIN_NAMES[@]} CKPT_DIRS=${#CKPT_DIRS[@]} RUN_SUFFIXES=${#RUN_SUFFIXES[@]}" >&2

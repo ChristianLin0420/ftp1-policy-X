@@ -17,6 +17,11 @@ import openpi.training.data_loader as _data_loader
 
 
 def main(config: _config.TrainConfig):
+    # FTP1 derives its MultiZarr data factory from CLI-overridable fields such
+    # as dataset_config_path. Rebuild it after tyro has applied those overrides,
+    # matching the train and evaluation entrypoints.
+    if isinstance(config, _config.FTP1TrainConfig):
+        config.finalize_config()
     data_config = config.data.create(config.assets_dirs, config.model)
     action_horizon = config.model.action_horizon
     batch_size = config.norm_batch_size
@@ -52,7 +57,7 @@ def main(config: _config.TrainConfig):
 
         if hasattr(dataset, "domain_list") and hasattr(dataset, "domain_dataset_list"):
             # MultiZarrDataset: iterate through each domain
-            for domain_name, domain_dataset in zip(dataset.domain_list, dataset.domain_dataset_list):
+            for domain_name, domain_dataset in zip(dataset.domain_list, dataset.domain_dataset_list, strict=True):
                 # Get current split's trajectory count (not total)
                 num_frames = len(domain_dataset)
                 if hasattr(domain_dataset, "indices") and hasattr(domain_dataset, "episodes_idxs"):
@@ -228,18 +233,17 @@ def main(config: _config.TrainConfig):
         """Recursively convert numpy types to Python native types."""
         if isinstance(obj, np.integer):
             return int(obj)
-        elif isinstance(obj, np.floating):
+        if isinstance(obj, np.floating):
             return float(obj)
-        elif isinstance(obj, np.ndarray):
+        if isinstance(obj, np.ndarray):
             return obj.tolist()
-        elif isinstance(obj, dict):
+        if isinstance(obj, dict):
             return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
+        if isinstance(obj, list):
             return [convert_to_json_serializable(item) for item in obj]
-        elif isinstance(obj, pathlib.Path):
+        if isinstance(obj, pathlib.Path):
             return str(obj)
-        else:
-            return obj
+        return obj
 
     stats_doc_serializable = convert_to_json_serializable(stats_doc)
     with open(stats_json_path, "w") as f:

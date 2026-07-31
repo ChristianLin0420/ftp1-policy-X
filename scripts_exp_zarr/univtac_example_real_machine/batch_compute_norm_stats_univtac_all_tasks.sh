@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bash scripts_exp_zarr/univtac/rtac50k/batch_compute_norm_stats_univtac_all_tasks.sh
-export USE_SWANLAB="${USE_SWANLAB-true}"
+export USE_SWANLAB="${USE_SWANLAB-false}"
 
 #
 # Batch compute norm stats for every UniVTAC task directory:
@@ -11,12 +11,16 @@ export USE_SWANLAB="${USE_SWANLAB-true}"
 
 set -euo pipefail
 
-data_root="/cephfs/shared/yuanchengbo/ftp1_cache/data/UniVTAC"
-checkpoint_base_dir="/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints"
-assets_base_dir="/cephfs/shared/yuanchengbo/ftp1_cache/assets"
-openpi_data_home="/cephfs/shared/yuanchengbo/ftp1_cache/openpi"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${repo_root}"
+cache_root="${FTP1_CACHE_ROOT:-${repo_root}/.cache/ftp1}"
+: "${UNIVTAC_DATA_ROOT:?Set UNIVTAC_DATA_ROOT to the directory containing task Zarr directories}"
+data_root="${UNIVTAC_DATA_ROOT}"
+checkpoint_base_dir="${FTP1_CHECKPOINT_BASE_DIR:-${cache_root}/checkpoints}"
+assets_base_dir="${FTP1_ASSETS_BASE_DIR:-${cache_root}/assets}"
+openpi_data_home="${OPENPI_DATA_HOME:-${cache_root}/openpi}"
 
-val_ratio=0.00
+val_ratio="${FTP1_VAL_RATIO:-0.1}"
 batch_size=32
 action_down_sample_steps=1
 norm_type="zscore"
@@ -89,6 +93,8 @@ PY
     echo "[TASK] $task_name | [BASELINE] ftp1 | [REPO] $repo_id"
     echo "============================================================"
 
+    uv run python scripts/ftp1_preflight.py --dataset-config "$dataset_config_path"
+
     uv run python scripts/zarr_compute_norm_stats.py ftp1 \
         --repo_id="$repo_id" \
         --data.repo-id="$repo_id" \
@@ -96,7 +102,7 @@ PY
         --use_val_dataset \
         --create_train_val_split \
         --val_ratio="$val_ratio" \
-        --wandb_enabled \
+        --no-wandb_enabled \
         --checkpoint_base_dir="$checkpoint_base_dir" \
         --assets_base_dir="$assets_base_dir" \
         --dataset_config_path="$dataset_config_path" \

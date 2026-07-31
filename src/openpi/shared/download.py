@@ -107,13 +107,25 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
         total_size = fs.du(url)
     else:
         total_size = info["size"]
+    local_path.parent.mkdir(parents=True, exist_ok=True)
     with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
+        if not is_dir:
+            # Some fsspec backends are not compatible with the callback used by
+            # AbstractFileSystem.get(). Streaming also ensures that the temporary
+            # file has exactly the path expected by maybe_download().
+            with fs.open(url, "rb") as remote_file, local_path.open("wb") as local_file:
+                while chunk := remote_file.read(1024 * 1024):
+                    local_file.write(chunk)
+                    pbar.update(len(chunk))
+            return
+
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(fs.get, url, local_path, recursive=is_dir)
         while not future.done():
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
             time.sleep(1)
+        future.result()
         pbar.update(total_size - pbar.n)
 
 
@@ -166,12 +178,7 @@ def _ensure_permissions(path: pathlib.Path) -> None:
 
 def _get_mtime(year: int, month: int, day: int) -> float:
     """Get the mtime of a given date at midnight UTC."""
-    try:
-       UTC = datetime.UTC
-    except AttributeError:
-       from datetime import timezone
-       UTC = timezone.utc
-    date = datetime.datetime(year, month, day, tzinfo=UTC)
+    date = datetime.datetime(year, month, day, tzinfo=datetime.UTC)
     return time.mktime(date.timetuple())
 
 

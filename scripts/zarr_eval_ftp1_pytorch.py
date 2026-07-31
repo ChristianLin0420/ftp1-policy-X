@@ -307,8 +307,7 @@ def eval_loop(checkpoint_dir: pathlib.Path, config: _config.TrainConfig | None =
     
     # Aggregate validation metrics
     aggregated_metrics = aggregate_validation_metrics(val_infos)
-    import pdb; pdb.set_trace()
-    
+
     elapsed_time = time.time() - start_time
     
     # Log results

@@ -1,0 +1,4 @@
+interface:
+  display_name: "FTP-1 Workflow"
+  short_description: "Run FTP-1 training, evaluation, and deployment"
+  default_prompt: "Use $ftp1-workflow to prepare and run an FTP-1 tactile-policy experiment."

@@ -2,7 +2,7 @@
   "datasets": [
     {
       "name": "UniVTAC_lift_bottle",
-      "path": "/cephfs/shared/yuanchengbo/rtac1_cache/data/UniVTAC/lift_bottle",
+      "path": "/path/to/processed_univtac_zarr_dir/lift_bottle",
       "use_trajectory_ratio": 1.0,
       "enabled": true
     }

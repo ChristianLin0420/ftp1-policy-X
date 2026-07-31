@@ -10,6 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 MODEL_NAME=${1:-${MODEL_NAME:-FTP1}}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-""}
 TARGET_SUCCESSES=${TARGET_SUCCESSES:-5}
 MAX_EPISODES=${MAX_EPISODES:-0}
 TASK_CONFIG=${TASK_CONFIG:-"contact.yml"}
@@ -44,24 +45,25 @@ DOMAIN_NAMES=(
 )
 
 CKPT_DIRS=(
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_pull_out_key_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_insert_hole_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_insert_tube_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_lift_bottle_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_lift_can_expert_gsmall_ftp1/19999"
-  "/cephfs/shared/yuanchengbo/ftp1_cache/checkpoints/ftp1/FTP50k_UniVTAC_put_bottle_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_pull_out_key_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_insert_hole_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_insert_tube_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_lift_bottle_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_lift_can_expert_gsmall_ftp1/19999"
+  "${CHECKPOINT_ROOT}/FTP1_UniVTAC_put_bottle_expert_gsmall_ftp1/19999"
 )
 
 RUN_SUFFIXES=(
-  "FTP50k_UniVTAC_pull_out_key_expert_gsmall_ftp1"
-  "FTP50k_UniVTAC_insert_hole_expert_gsmall_ftp1"
-  "FTP50k_UniVTAC_insert_tube_expert_gsmall_ftp1"
-  "FTP50k_UniVTAC_lift_bottle_expert_gsmall_ftp1"
-  "FTP50k_UniVTAC_lift_can_expert_gsmall_ftp1"
-  "FTP50k_UniVTAC_put_bottle_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_pull_out_key_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_insert_hole_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_insert_tube_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_lift_bottle_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_lift_can_expert_gsmall_ftp1"
+  "FTP1_UniVTAC_put_bottle_expert_gsmall_ftp1"
 )
 
 n=${#CKPT_DIRS[@]}
+: "${CHECKPOINT_ROOT:?Set CHECKPOINT_ROOT to the extracted ftp1_univtac_finetune model directory}"
 if [[ ${#TASKS[@]} -ne $n || ${#DOMAIN_NAMES[@]} -ne $n || ${#RUN_SUFFIXES[@]} -ne $n ]]; then
   echo "[eval_ftp1_until_success_batch.sh] array length mismatch" >&2
   echo "  TASKS=${#TASKS[@]} DOMAIN_NAMES=${#DOMAIN_NAMES[@]} CKPT_DIRS=${#CKPT_DIRS[@]} RUN_SUFFIXES=${#RUN_SUFFIXES[@]}" >&2

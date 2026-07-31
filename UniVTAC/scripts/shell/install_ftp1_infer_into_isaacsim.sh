@@ -29,26 +29,54 @@ echo "[install] Python: $(which python) ($(python -c 'import sys; print(sys.vers
 echo "[install] PyTorch: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'not found')"
 echo ""
 
+python - <<'PY'
+import sys
+
+if sys.version_info[:2] not in {(3, 10), (3, 11)}:
+    raise SystemExit(f"FTP1 UniVTAC inference expects Python 3.10 or 3.11, got {sys.version.split()[0]}")
+PY
+
+torch_version_before="$(python -c 'import torch; print(torch.__version__)')"
+
 # 1) Install FTP1 inference deps (no torch in this file)
-echo "[install] Step 1/4: pip install -r requirements-univtac-infer-into-isaacsim.txt"
+echo "[install] Step 1/5: pip install -r requirements-univtac-infer-into-isaacsim.txt"
 pip install -r "$REQUIREMENTS"
 
 # 2) Install openpi (ftp1) editable, no deps
-echo "[install] Step 2/4: pip install --no-deps -e . (openpi)"
-pip install --no-deps -e "$FTP1_ROOT"
+echo "[install] Step 2/5: pip install --no-deps -e . (openpi)"
+# The training project targets Python >=3.11, while Isaac Sim 4.5 uses Python 3.10.
+# The inference subset is Python 3.10-compatible and intentionally installed without dependencies.
+pip install --ignore-requires-python --no-deps -e "$FTP1_ROOT"
 
 # 3) Install openpi-client
-echo "[install] Step 3/4: pip install --no-deps -e packages/openpi-client"
+echo "[install] Step 3/5: pip install --no-deps -e packages/openpi-client"
 pip install --no-deps -e "$FTP1_ROOT/packages/openpi-client"
 
-# 4) Verify
-echo "[install] Step 4/4: Verify FTP1 inference import..."
+# 4) Install the repository's compatible Transformers implementation.
+echo "[install] Step 4/5: Install transformers_replace into the active environment"
+transformers_dir="$(python - <<'PY'
+from pathlib import Path
+import transformers
+
+print(Path(transformers.__file__).resolve().parent)
+PY
+)"
+cp -r "$FTP1_ROOT/src/openpi/models_pytorch/transformers_replace/." "$transformers_dir/"
+
+# 5) Verify imports and ensure Isaac Sim's PyTorch was not replaced.
+echo "[install] Step 5/5: Verify FTP1 inference import..."
 cd "$FTP1_ROOT"
 python -c "
 from openpi.policies.ftp1_inference_wrapper import FTP1InferenceWrapper
 from openpi.models_pytorch.ftp1_pytorch import FTP1Pytorch
 print('FTP1 inference import OK')
 "
+
+torch_version_after="$(python -c 'import torch; print(torch.__version__)')"
+if [[ "$torch_version_before" != "$torch_version_after" ]]; then
+  echo "[ERROR] PyTorch changed from $torch_version_before to $torch_version_after" >&2
+  exit 1
+fi
 
 echo ""
 echo "[install] Done. FTP1 inference is available in this (Isaac Sim) environment."
