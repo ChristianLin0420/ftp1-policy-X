@@ -29,9 +29,17 @@ ACTIVE_GROUPS = ("total", "right-arm-joints", "right-hand-joint")
 
 TRAIN_METRICS = ("Trainning/loss",)
 GRAD_METRICS = (
-    "GradNorm/tactile_over_vision",
     "GradNorm/tactile_total",
     "GradNorm/vision_tower",
+    "GradNorm/vlm_language",
+    "GradNorm/action_expert",
+)
+# Ratios are logged only when their denominator branch has a gradient, so a missing series
+# means that branch is frozen -- or that its parameter prefix matched nothing.
+GRAD_RATIOS = (
+    "GradNorm/tactile_over_vision",
+    "GradNorm/tactile_over_vlm",
+    "GradNorm/tactile_over_action",
 )
 
 
@@ -89,7 +97,7 @@ def main() -> None:
     val_keys += [f"Validation/jitter_rms_{group}" for group in ACTIVE_GROUPS]
 
     baseline_hist = fetch_history(baseline, [*val_keys, *TRAIN_METRICS])
-    pact_hist = fetch_history(pact, [*val_keys, *TRAIN_METRICS, *GRAD_METRICS])
+    pact_hist = fetch_history(pact, [*val_keys, *TRAIN_METRICS, *GRAD_METRICS, *GRAD_RATIOS])
 
     run = wandb.init(
         project=args.project.split("/")[-1],
@@ -127,6 +135,14 @@ def main() -> None:
             "PACT gradient norms by branch", "pre-clip grad norm", grad_arms, logy=True
         )
         panels["compare/pact_grad_norms"] = wandb.Image(fig)
+        plt.close(fig)
+
+    ratio_arms = {key.split("/")[-1]: pact_hist[key] for key in GRAD_RATIOS if key in pact_hist}
+    if ratio_arms:
+        fig = plot_overlay(
+            "PACT tactile gradient share", "tactile / branch", ratio_arms, logy=True
+        )
+        panels["compare/pact_tactile_share"] = wandb.Image(fig)
         plt.close(fig)
 
     table = wandb.Table(columns=["metric", "baseline", "pact", "delta", "pct_change"])

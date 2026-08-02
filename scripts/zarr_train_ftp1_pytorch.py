@@ -257,10 +257,14 @@ def _extract_loss_and_extras(
     return loss, {}
 
 
+# Prefixes must match the real parameter paths. Note the `.model.` segment inside paligemma:
+# `paligemma_with_expert.paligemma.model.vision_tower.*`. Omitting it silently matches nothing
+# and reports a gradient norm of exactly 0.
 _MODALITY_PARAM_PREFIXES = {
     "tactile_encoder": ("hpt_tactile_encoder.",),
     "tactile_expert": ("paligemma_with_expert.gemma_tactile_expert.",),
-    "vision_tower": ("paligemma_with_expert.paligemma.vision_tower.",),
+    "vision_tower": ("paligemma_with_expert.paligemma.model.vision_tower.",),
+    "vlm_language": ("paligemma_with_expert.paligemma.model.language_model.",),
     "action_expert": ("paligemma_with_expert.gemma_expert.",),
 }
 
@@ -287,8 +291,16 @@ def compute_modality_grad_norms(model) -> dict[str, float]:
     payload = {f"GradNorm/{branch}": value for branch, value in norms.items()}
     tactile = norms["tactile_encoder"] + norms["tactile_expert"]
     payload["GradNorm/tactile_total"] = tactile
-    if norms["vision_tower"] > 0.0:
-        payload["GradNorm/tactile_over_vision"] = tactile / norms["vision_tower"]
+
+    # A branch legitimately reads 0 when it is frozen, so guard every ratio. A silently missing
+    # ratio means the numerator or denominator matched no parameters -- check the prefixes.
+    for name, denominator in (
+        ("tactile_over_vision", norms["vision_tower"]),
+        ("tactile_over_vlm", norms["vlm_language"]),
+        ("tactile_over_action", norms["action_expert"]),
+    ):
+        if denominator > 0.0:
+            payload[f"GradNorm/{name}"] = tactile / denominator
     return payload
 
 
