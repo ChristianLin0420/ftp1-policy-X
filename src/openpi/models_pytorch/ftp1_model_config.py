@@ -47,7 +47,16 @@ class FTP1TactileTokenizerConfig:
     """Configuration for FTP1HptTactileEncoder."""
 
     single_hand_num_tactile_areas: int = FTP1_SINGLE_HAND_NUM_TACTILE_AREAS
-    
+
+    # [PACT] Tokens emitted per tactile function area.
+    # 1  -> legacy FTP-1: the shared chunk trunk is reduced to its CLS token and the
+    #       remaining 196 patch tokens are discarded (see SharedImageChunkEncoder).
+    # >1 -> PACT spatial tokens: CLS ++ (spatial_pool_grid ** 2) adaptively pooled patch
+    #       tokens, so a gel frame keeps spatial structure. tokens_per_area must equal
+    #       1 + spatial_pool_grid ** 2.
+    tokens_per_area: int = 1
+    spatial_pool_grid: int = 3
+
     # [state encoding]: FourierStateEncoder parameters for vector-type tactile data
     fourier_dim: int = 8  # Dimension of Fourier encoding for each state dimension
     fourier_min_period: float = 1e-3  # Minimum period for Fourier encoding
@@ -88,6 +97,18 @@ class FTP1ModelConfig(_model.BaseModelConfig):
     # - the hetegeneous tactile encoder & expert is added to the model.
     use_tactile_input: bool = True
     disable_history: bool = True
+
+    # [PACT] Open the vision -> tactile attention edge. FTP-1 keeps the prefix and the
+    # tactile branch strictly block-diagonal, so image and tactile tokens never attend to
+    # each other at any layer; they meet only as independent K/V for the action expert.
+    # When True, tactile rows may read the *image* columns of the prefix. Language columns
+    # stay closed, and vision never reads tactile, so the prefix KV cache is preserved and
+    # a fully gated batch is bit-identical to a vision-language-only policy.
+    tactile_reads_vision: bool = False
+
+    # [PACT] Drop the spatial tactile tokens of a function area that is not in contact,
+    # keeping its CLS token. Requires the dataset to emit `tactile_contact`.
+    contact_gating: bool = False
     tactile_input_config_file: str = None   # only for inference. When training, we generate it automatically from dataset.
     tactile_tokenizer_config: FTP1TactileTokenizerConfig = dataclasses.field(
         default_factory=FTP1TactileTokenizerConfig
@@ -109,6 +130,21 @@ class FTP1ModelConfig(_model.BaseModelConfig):
             object.__setattr__(self, "discrete_state_input", False)
         if self.state_input_mode not in ['adarms', 'vl_expert', 'action_expert', 'none']:
             raise ValueError(f"Invalid state input mode: {self.state_input_mode}, should be one of ['adarms', 'vl_expert', 'action_expert', 'none']")
+
+        tok_cfg = self.tactile_tokenizer_config
+        expected_tokens = 1 + tok_cfg.spatial_pool_grid ** 2
+        if tok_cfg.tokens_per_area not in (1, expected_tokens):
+            raise ValueError(
+                f"tokens_per_area={tok_cfg.tokens_per_area} is inconsistent with "
+                f"spatial_pool_grid={tok_cfg.spatial_pool_grid}; expected 1 (legacy CLS) "
+                f"or {expected_tokens} (CLS + {tok_cfg.spatial_pool_grid}x{tok_cfg.spatial_pool_grid} pool)."
+            )
+        if self.contact_gating and tok_cfg.tokens_per_area == 1:
+            raise ValueError(
+                "contact_gating requires tokens_per_area > 1: with a single CLS token per area "
+                "there are no spatial tokens to gate, and dropping the CLS would remove the "
+                "'pad present but feels nothing' signal."
+            )
 
     @property
     @override

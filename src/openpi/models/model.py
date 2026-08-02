@@ -117,6 +117,9 @@ class Observation(Generic[ArrayT]):
     tactile_function_areas: dict[str, at.Int[ArrayT, "*b n"]] | None = None
     # Tactile sensors.
     tactile_sensors: dict[str, list[str]] | None = None
+    # [PACT] Per-area contact flags, shape (B, N) bool. Consumed only when the model is built
+    # with contact_gating=True; otherwise every area is treated as in contact.
+    tactile_contact: dict[str, at.Bool[ArrayT, "*b n"]] | None = None
 
     # Domain names.
     domain_names: list[str] | None = None

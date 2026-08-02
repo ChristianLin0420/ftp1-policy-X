@@ -300,16 +300,22 @@ class SharedImageChunkEncoder(nn.Module):
     They are always created or not created together.
     """
     def __init__(self, embed_dim: int, token_dim: int, shared_chunk_config=None,
-                 load_t3_pretrained_checkpoint=False, cache_t3_pretrained_checkpoint_dir=None):
+                 load_t3_pretrained_checkpoint=False, cache_t3_pretrained_checkpoint_dir=None,
+                 tokens_per_area: int = 1, spatial_pool_grid: int = 3):
         """
         Args:
             embed_dim: Embedding dimension (default 768)
             token_dim: Output token dimension
             shared_chunk_config: T3SharedChunkConfig (uses default if None)
+            tokens_per_area: 1 keeps the legacy CLS-only readout; 1 + spatial_pool_grid**2
+                emits CLS plus a pooled patch grid (PACT).
+            spatial_pool_grid: side length of the adaptive pool over the ViT patch grid.
         """
         super().__init__()
         if shared_chunk_config is None:
             shared_chunk_config = T3SharedChunkConfig()
+        self.tokens_per_area = tokens_per_area
+        self.spatial_pool_grid = spatial_pool_grid
         
         # For shared_chunk_encoder, we use a generic name since it's shared across all sensors
         # The pretrained checkpoint loading for shared_chunk is not implemented yet
@@ -333,18 +339,31 @@ class SharedImageChunkEncoder(nn.Module):
         Args:
             tokens: (B, num_patches+1, embed_dim) tensor from ViT encoder
         Returns:
-            (B, token_dim) tensor after shared chunk encoding and projection
+            (B, tokens_per_area, token_dim) tensor after shared chunk encoding and projection.
         """
         # Apply shared chunk encoder: (B, num_patches+1, embed_dim) -> (B, num_patches+1, embed_dim)
         tokens = self.shared_chunk_encoder(tokens)
-        
-        # Extract CLS token (index 0): (B, num_patches+1, embed_dim) -> (B, embed_dim)
-        tokens_cls = tokens[:, 0, :]  # (B, embed_dim)
-        
-        # Project from embed_dim to token_dim: (B, embed_dim) -> (B, token_dim)
-        tokens_cls = self.image_proj(tokens_cls)  # (B, token_dim)
-        
-        return tokens_cls
+
+        if self.tokens_per_area == 1:
+            # Legacy FTP-1 readout: keep only CLS, discard every patch token.
+            readout = tokens[:, :1, :]  # (B, 1, embed_dim)
+        else:
+            cls_token = tokens[:, :1, :]  # (B, 1, embed_dim)
+            patch_tokens = tokens[:, 1:, :]  # (B, num_patches, embed_dim)
+            bsz, num_patches, embed_dim = patch_tokens.shape
+            side = int(round(math.sqrt(num_patches)))
+            if side * side != num_patches:
+                raise ValueError(
+                    f"Expected a square patch grid for spatial pooling, got {num_patches} patches."
+                )
+            # (B, P, E) -> (B, E, side, side) -> pool -> (B, E, g, g) -> (B, g*g, E)
+            grid = patch_tokens.transpose(1, 2).reshape(bsz, embed_dim, side, side)
+            pooled = F.adaptive_avg_pool2d(grid, (self.spatial_pool_grid, self.spatial_pool_grid))
+            pooled = pooled.flatten(2).transpose(1, 2)  # (B, g*g, E)
+            readout = torch.cat([cls_token, pooled], dim=1)  # (B, 1 + g*g, E)
+
+        # Project from embed_dim to token_dim.
+        return self.image_proj(readout)  # (B, tokens_per_area, token_dim)
 
 
 class TactileDataEncoder(nn.Module):
@@ -551,6 +570,18 @@ class FTP1HptTactileEncoder(nn.Module):
         self.tokenizer_config = config.tactile_tokenizer_config
         self.total_num_tactile_tokens = 2 * self.tokenizer_config.single_hand_num_tactile_areas
         self.func_area_idx_embedding = nn.Embedding(self.total_num_tactile_tokens, token_dim)
+
+        # [PACT] Tokens emitted per function area. With tokens_per_area == 1 the encoder keeps
+        # FTP-1's scatter into `total_num_tactile_tokens` canonical slots. With > 1 it emits a
+        # compact sequence of (num_present_areas * tokens_per_area) tokens instead, so the
+        # sequence length tracks the areas that actually exist on the embodiment rather than the
+        # 48-slot worst case. Area identity is still carried by `func_area_idx_embedding`, which
+        # is indexed by the true function-area id, so the pretrained table is reused unchanged.
+        self.tokens_per_area = self.tokenizer_config.tokens_per_area
+        self.spatial_token_embedding = (
+            nn.Embedding(self.tokens_per_area, token_dim) if self.tokens_per_area > 1 else None
+        )
+        self.contact_gating = bool(getattr(config, "contact_gating", False))
         
         # Load configuration first to check if there are image type data
         with open(self.input_config_path, 'r') as f:
@@ -577,7 +608,9 @@ class FTP1HptTactileEncoder(nn.Module):
                 token_dim=token_dim,
                 shared_chunk_config=shared_chunk_config,
                 load_t3_pretrained_checkpoint=self.tokenizer_config.load_t3_pretrained_checkpoint,
-                cache_t3_pretrained_checkpoint_dir=self.tokenizer_config.cache_t3_pretrained_checkpoint_dir
+                cache_t3_pretrained_checkpoint_dir=self.tokenizer_config.cache_t3_pretrained_checkpoint_dir,
+                tokens_per_area=self.tokens_per_area,
+                spatial_pool_grid=self.tokenizer_config.spatial_pool_grid,
             )
             
             # Freeze shared chunk encoder (t3_chunk) if frozen_shared_chunk is True
@@ -650,11 +683,14 @@ class FTP1HptTactileEncoder(nn.Module):
             nn.Linear(token_dim, token_dim),
         )
 
-    def forward(self, tactiles, tactile_function_areas, tactile_sensors):
+    def forward(self, tactiles, tactile_function_areas, tactile_sensors, tactile_contact=None):
         """
         Args:
             tactiles: dict[str, torch.Tensor] with keys like 'left_tactile_palm', 'left_tactile_fingers', etc.
                      Each tensor has shape (B, T, N, *D)
+            tactile_contact: optional dict[str, torch.Tensor] of shape (B, N) bool. When
+                     contact_gating is enabled, areas reported as not-in-contact keep their CLS
+                     token and have their spatial tokens masked out of attention.
             tactile_function_areas: dict[str, torch.Tensor] with same keys as tactiles
                                    Each tensor has shape (B, N) with function area indices (same across batch)
             tactile_sensors: dict[str, list[str]] with same keys as tactiles
@@ -680,6 +716,12 @@ class FTP1HptTactileEncoder(nn.Module):
         # - pad mask for missing areas is False so downstream attention ignores them
         output_tokens = torch.zeros(batch_size, T, self.total_num_tactile_tokens, self.token_dim, device=device)
         output_pad_masks = torch.zeros(batch_size, T, self.total_num_tactile_tokens, dtype=torch.bool, device=device)
+
+        # [PACT] Accumulators for the compact spatial layout (tokens_per_area > 1).
+        compact_tokens: List[torch.Tensor] = []
+        compact_areas: List[torch.Tensor] = []
+        compact_contact: List[torch.Tensor] = []
+        compact_spatial_valid: List[torch.Tensor] = []
 
         # Process each tactile_key and fill in the corresponding function areas
         for tactile_key in tactile_keys:
@@ -775,8 +817,18 @@ class FTP1HptTactileEncoder(nn.Module):
                 # encoded_tokens shape: (B, T, N, num_patches+1, embed_dim)
                 B_tokens, T_tokens, N_tokens, num_patches_plus_one, embed_dim = encoded_tokens.shape
                 tokens_flat = encoded_tokens.reshape(B_tokens * T_tokens * N_tokens, num_patches_plus_one, embed_dim)
-                tokens_cls = self.shared_image_chunk_encoder(tokens_flat)  # (B*T*N, token_dim)
-                encoded_tokens = tokens_cls.reshape(B_tokens, T_tokens, N_tokens, self.token_dim)
+                readout = self.shared_image_chunk_encoder(tokens_flat)  # (B*T*N, P, token_dim)
+                encoded_tokens = readout.reshape(
+                    B_tokens, T_tokens, N_tokens, self.tokens_per_area, self.token_dim
+                )
+                if self.tokens_per_area == 1:
+                    encoded_tokens = encoded_tokens.squeeze(3)  # (B, T, N, token_dim)
+            elif self.tokens_per_area > 1:
+                # Non-image tokenizers emit a single token per area. Place it in the CLS slot and
+                # leave the spatial slots as inactive zeros so the sequence layout stays uniform.
+                encoded_tokens = F.pad(
+                    encoded_tokens.unsqueeze(3), (0, 0, 0, self.tokens_per_area - 1)
+                )  # (B, T, N, P, token_dim)
             
             # Fill encoded tokens into output_tokens based on function_area indices
             # All tokenizers now return (B, T, N, token_dim)
@@ -788,6 +840,23 @@ class FTP1HptTactileEncoder(nn.Module):
             assert (fill_idx >= 0).all() and (fill_idx < self.total_num_tactile_tokens).all(), \
                 f"Invalid function_area indices in {tactile_key}: {fill_idx}. Must be in [0, {self.total_num_tactile_tokens})"
 
+            if self.tokens_per_area > 1:
+                # [PACT] Compact layout: keep the areas that exist instead of scattering into
+                # `total_num_tactile_tokens` mostly-empty slots.
+                compact_tokens.append(encoded_tokens)  # (B, T, N, P, token_dim)
+                compact_areas.append(func_areas)  # (B, N)
+                # Only image tokenizers produce real spatial tokens; others fill the CLS slot only.
+                has_spatial = tokenizer.encoder_type == 'image'
+                compact_spatial_valid.append(
+                    torch.full((batch_size, N), has_spatial, dtype=torch.bool, device=device)
+                )
+                if tactile_contact is not None and tactile_key in tactile_contact:
+                    in_contact = tactile_contact[tactile_key].to(device=device, dtype=torch.bool)
+                else:
+                    in_contact = torch.ones(batch_size, N, dtype=torch.bool, device=device)
+                compact_contact.append(in_contact)
+                continue
+
             # Fill tokens for each time step
             for t in range(T):
                 # Fill all positions at once using advanced indexing
@@ -795,6 +864,35 @@ class FTP1HptTactileEncoder(nn.Module):
                 # encoded_tokens[:, t, :, :] shape: (B, N, token_dim)
                 output_tokens[:, t, fill_idx[t], :] = encoded_tokens[:, t, :, :]
                 output_pad_masks[:, t, fill_idx[t]] = True
+
+        if self.tokens_per_area > 1:
+            # [PACT] Compact spatial layout. Sequence is [area0 tokens][area1 tokens]... per step,
+            # where each area contributes CLS ++ pooled patch grid.
+            tokens = torch.cat(compact_tokens, dim=2)  # (B, T, N_all, P, token_dim)
+            areas = torch.cat(compact_areas, dim=1)  # (B, N_all)
+            spatial_valid = torch.cat(compact_spatial_valid, dim=1)  # (B, N_all)
+            in_contact = torch.cat(compact_contact, dim=1)  # (B, N_all)
+            bsz, n_steps, n_areas, n_per_area, dim = tokens.shape
+
+            # Area identity uses the true function-area id, so the pretrained embedding table is
+            # reused unchanged; the spatial slot gets its own small positional embedding.
+            tokens = tokens + self.func_area_idx_embedding(areas)[:, None, :, None, :]
+            tokens = tokens + self.spatial_token_embedding.weight.view(1, 1, 1, n_per_area, dim)
+
+            pad_masks = torch.ones(
+                bsz, n_steps, n_areas, n_per_area, dtype=torch.bool, device=device
+            )
+            # The CLS slot always stays: "this pad is present and feels nothing" is informative.
+            spatial_keep = spatial_valid
+            if self.contact_gating:
+                spatial_keep = spatial_keep & in_contact
+            pad_masks[..., 1:] = spatial_keep[:, None, :, None]
+
+            tokens = tokens.reshape(bsz, n_steps * n_areas * n_per_area, dim)
+            pad_masks = pad_masks.reshape(bsz, n_steps * n_areas * n_per_area)
+            tokens = self.unified_proj(tokens)
+            tokens = tokens * pad_masks.unsqueeze(-1).to(tokens.dtype)
+            return tokens, pad_masks
 
         # Add function-area index embedding only on valid tactile tokens.
         func_area_emb = self.func_area_idx_embedding.weight.view(1, 1, self.total_num_tactile_tokens, self.token_dim)

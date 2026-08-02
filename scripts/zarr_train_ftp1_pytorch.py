@@ -257,6 +257,41 @@ def _extract_loss_and_extras(
     return loss, {}
 
 
+_MODALITY_PARAM_PREFIXES = {
+    "tactile_encoder": ("hpt_tactile_encoder.",),
+    "tactile_expert": ("paligemma_with_expert.gemma_tactile_expert.",),
+    "vision_tower": ("paligemma_with_expert.paligemma.vision_tower.",),
+    "action_expert": ("paligemma_with_expert.gemma_expert.",),
+}
+
+
+def compute_modality_grad_norms(model) -> dict[str, float]:
+    """Pre-clipping gradient norm of each modality branch.
+
+    `tactile_over_vision` is the modality-dominance monitor. A tactile branch trained only
+    through one cross-attention edge, against a web-pretrained vision-language stream, can be
+    starved to the point where the policy ignores touch entirely. If this ratio does not rise
+    during training, a headline gain is not coming from the tactile pathway.
+    """
+    base = model.module if hasattr(model, "module") else model
+    sq_sums = dict.fromkeys(_MODALITY_PARAM_PREFIXES, 0.0)
+    for name, param in base.named_parameters():
+        if param.grad is None:
+            continue
+        for branch, prefixes in _MODALITY_PARAM_PREFIXES.items():
+            if name.startswith(prefixes):
+                sq_sums[branch] += float(param.grad.detach().float().pow(2).sum())
+                break
+
+    norms = {branch: value**0.5 for branch, value in sq_sums.items()}
+    payload = {f"GradNorm/{branch}": value for branch, value in norms.items()}
+    tactile = norms["tactile_encoder"] + norms["tactile_expert"]
+    payload["GradNorm/tactile_total"] = tactile
+    if norms["vision_tower"] > 0.0:
+        payload["GradNorm/tactile_over_vision"] = tactile / norms["vision_tower"]
+    return payload
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -813,6 +848,11 @@ def train_loop(config: _config.TrainConfig):
                 with torch.profiler.record_function("backward"):
                     loss.backward()
 
+                # Per-branch gradient norms, measured pre-clipping and only on logging steps.
+                modality_grad_norms: dict[str, float] = {}
+                if is_main and global_step % config.log_interval == 0:
+                    modality_grad_norms = compute_modality_grad_norms(model)
+
                 # Gradient clipping
                 with torch.profiler.record_function("clip_grad"):
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -881,6 +921,7 @@ def train_loop(config: _config.TrainConfig):
                             }
                             if avg_grad_norm is not None:
                                 log_payload["grad_norm"] = avg_grad_norm
+                            log_payload.update(modality_grad_norms)
 
                             for idx, domain in enumerate(domain_names_for_logging):
                                 count_value = float(domain_loss_count_tensor[idx].item())

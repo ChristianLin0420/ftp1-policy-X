@@ -213,6 +213,7 @@ class FTP1Pytorch(nn.Module):
             suffix_pad_masks,
             suffix_att_masks,
             tactile_pad_masks=tactile_pad_masks,
+            num_image_tokens=self._tactile_vision_cols(),
         )
         att_2d_masks_4d = self._prepare_attention_masks_4d(
             expert_layout.att_2d_masks,
@@ -242,6 +243,12 @@ class FTP1Pytorch(nn.Module):
         )
         return outputs[1]
 
+    def _tactile_vision_cols(self) -> int:
+        """Number of leading prefix columns the tactile branch may read (0 disables the edge)."""
+        if not getattr(self.config, "tactile_reads_vision", False):
+            return 0
+        return int(getattr(self, "_num_image_tokens", 0) or 0)
+
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         # images, img_masks, lang_tokens, lang_masks, state, tactiles, tactile_function_areas, domain_names
@@ -267,6 +274,7 @@ class FTP1Pytorch(nn.Module):
             if hasattr(observation, "domain_names") and observation.domain_names is not None
             else None,
             action_masks,
+            getattr(observation, "tactile_contact", None),
         )
 
     def _encode_state_tokens(self, state: Tensor, state_masks: Tensor | None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -312,6 +320,7 @@ class FTP1Pytorch(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        num_image_tokens = 0
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):  # List[(B, C, H, W)], List[(B, )]
@@ -328,10 +337,16 @@ class FTP1Pytorch(nn.Module):
                 self._image_tokens_per_image = num_img_embs
 
             embs.append(img_emb)
+            num_image_tokens += num_img_embs
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))  # (B, ) --> (B, 14x14)
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        # Image tokens always precede language tokens in the prefix; the PACT vision -> tactile
+        # edge relies on that ordering to open the image columns without opening the language
+        # columns.
+        self._num_image_tokens = num_image_tokens
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -407,7 +422,7 @@ class FTP1Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond  # (B, N, D), (B, N), (B, N), (B, 1024)
 
-    def embed_tactile(self, tactiles, tactile_function_areas, tactile_sensors):
+    def embed_tactile(self, tactiles, tactile_function_areas, tactile_sensors, tactile_contact=None):
         """Embed tactile inputs using FTP1HptTactileEncoder."""
         if (
             not self.config.use_tactile_input
@@ -420,7 +435,7 @@ class FTP1Pytorch(nn.Module):
 
         def tactile_embed_func(tactiles, tactile_function_areas, tactile_sensors):
             tactile_embs, tactile_pad_masks = self.hpt_tactile_encoder(
-                tactiles, tactile_function_areas, tactile_sensors
+                tactiles, tactile_function_areas, tactile_sensors, tactile_contact=tactile_contact
             )
             return tactile_embs, tactile_pad_masks
 
@@ -447,6 +462,7 @@ class FTP1Pytorch(nn.Module):
             tactile_sensors,
             domain_names,
             action_masks,
+            tactile_contact,
         ) = self._preprocess_observation(observation, train=True)
 
         if actions.shape[-1] != self.action_dim:
@@ -476,7 +492,9 @@ class FTP1Pytorch(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             x_t, time
         )  # dim=1024 for 300m gemma
-        tactile_embs, tactile_pad_masks = self.embed_tactile(tactiles, tactile_function_areas, tactile_sensors)
+        tactile_embs, tactile_pad_masks = self.embed_tactile(
+            tactiles, tactile_function_areas, tactile_sensors, tactile_contact=tactile_contact
+        )
         if self.config.use_tactile_input and tactile_embs is None:
             raise ValueError(
                 "self.config.use_tactile_input=True, requires valid tactile inputs, but tactile embeddings are None."
@@ -558,11 +576,14 @@ class FTP1Pytorch(nn.Module):
             tactile_sensors,
             domain_names,
             action_masks,
+            tactile_contact,
         ) = self._preprocess_observation(observation, train=False)
 
         # get tactile embeddings + masks
         if self.config.use_tactile_input:
-            tactile_embs, tactile_pad_masks = self.embed_tactile(tactiles, tactile_function_areas, tactile_sensors)
+            tactile_embs, tactile_pad_masks = self.embed_tactile(
+                tactiles, tactile_function_areas, tactile_sensors, tactile_contact=tactile_contact
+            )
         else:
             tactile_embs, tactile_pad_masks = None, None
         if self.config.use_tactile_input and tactile_embs is None:
@@ -602,9 +623,12 @@ class FTP1Pytorch(nn.Module):
             if tactile_embs.dtype != tactile_branch_dtype:
                 tactile_embs = tactile_embs.to(dtype=tactile_branch_dtype)
 
+            vision_cols = self._tactile_vision_cols()
             tactile_layout = build_tactile_attention_layout(
                 tactile_pad_masks,
                 position_offset=prefix_layout.position_ids[:, -1:] + 1,
+                prefix_pad_masks=prefix_pad_masks if vision_cols > 0 else None,
+                num_image_tokens=vision_cols,
             )
 
             # Cache VLM tokens first.
@@ -621,25 +645,37 @@ class FTP1Pytorch(nn.Module):
                 tactile_layout.att_2d_masks,
                 dtype=tactile_branch_dtype,
             )
-            _, tactile_past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=tactile_att_2d_masks_4d,
-                position_ids=tactile_layout.position_ids,
-                past_key_values=None,
-                inputs_embeds=[None, tactile_embs, None],
-                use_cache=True,
-            )
-
-            combined_past_key_values = DynamicCache()
-            num_layers = len(vlm_past_key_values)
-            for layer_idx in range(num_layers):
-                vlm_kv = vlm_past_key_values[layer_idx]
-                tactile_kv = tactile_past_key_values[layer_idx]
-                combined_past_key_values.update(
-                    torch.cat([vlm_kv[0], tactile_kv[0]], dim=2),
-                    torch.cat([vlm_kv[1], tactile_kv[1]], dim=2),
-                    layer_idx,
+            if vision_cols > 0:
+                # [PACT] The tactile prefill reads the image columns of the VLM cache, so it must
+                # run against that cache. The returned cache is already [prefix ++ tactile] in the
+                # layout the action branch expects, so no manual merge is needed.
+                _, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=tactile_att_2d_masks_4d,
+                    position_ids=tactile_layout.position_ids,
+                    past_key_values=vlm_past_key_values,
+                    inputs_embeds=[None, tactile_embs, None],
+                    use_cache=True,
                 )
-            past_key_values = combined_past_key_values
+            else:
+                _, tactile_past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=tactile_att_2d_masks_4d,
+                    position_ids=tactile_layout.position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[None, tactile_embs, None],
+                    use_cache=True,
+                )
+
+                combined_past_key_values = DynamicCache()
+                num_layers = len(vlm_past_key_values)
+                for layer_idx in range(num_layers):
+                    vlm_kv = vlm_past_key_values[layer_idx]
+                    tactile_kv = tactile_past_key_values[layer_idx]
+                    combined_past_key_values.update(
+                        torch.cat([vlm_kv[0], tactile_kv[0]], dim=2),
+                        torch.cat([vlm_kv[1], tactile_kv[1]], dim=2),
+                        layer_idx,
+                    )
+                past_key_values = combined_past_key_values
         else:
             _, past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d,

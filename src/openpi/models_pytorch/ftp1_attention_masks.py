@@ -36,12 +36,37 @@ def build_tactile_attention_layout(
     tactile_pad_masks: torch.Tensor,
     *,
     position_offset: torch.Tensor | None = None,
+    prefix_pad_masks: torch.Tensor | None = None,
+    num_image_tokens: int = 0,
 ) -> AttentionLayout:
+    """Attention layout for the tactile prefill.
+
+    By default the tactile branch is self-attention only, which is FTP-1's behaviour. When
+    `prefix_pad_masks` is given and `num_image_tokens > 0` the layout is widened to
+    ``(B, tactile_len, prefix_len + tactile_len)`` so the tactile prefill can read the image
+    columns of an existing VLM KV cache. Language columns stay closed.
+    """
     position_ids = torch.cumsum(tactile_pad_masks, dim=1) - 1
     if position_offset is not None:
         position_ids = position_ids + position_offset
+
+    self_block = tactile_pad_masks[:, :, None] * tactile_pad_masks[:, None, :]
+    if prefix_pad_masks is None or num_image_tokens <= 0:
+        return AttentionLayout(att_2d_masks=self_block, position_ids=position_ids)
+
+    prefix_cols = torch.zeros(
+        tactile_pad_masks.shape[0],
+        tactile_pad_masks.shape[1],
+        prefix_pad_masks.shape[1],
+        dtype=self_block.dtype,
+        device=self_block.device,
+    )
+    img_cols = slice(0, num_image_tokens)
+    prefix_cols[:, :, img_cols] = (
+        tactile_pad_masks[:, :, None] * prefix_pad_masks[:, None, img_cols]
+    )
     return AttentionLayout(
-        att_2d_masks=tactile_pad_masks[:, :, None] * tactile_pad_masks[:, None, :],
+        att_2d_masks=torch.cat([prefix_cols, self_block], dim=2),
         position_ids=position_ids,
     )
 
@@ -52,6 +77,7 @@ def build_expert_attention_layout(
     suffix_att_masks: torch.Tensor,
     *,
     tactile_pad_masks: torch.Tensor | None = None,
+    num_image_tokens: int = 0,
 ) -> ExpertAttentionLayout:
     prefix_block = _build_branch_self_mask(prefix_pad_masks)
     suffix_block = _build_branch_self_mask(suffix_pad_masks, suffix_att_masks)
@@ -77,6 +103,18 @@ def build_expert_attention_layout(
 
     action_start = prefix_len + tactile_len
     att_2d_masks[:, action_start:, action_start:] = suffix_block
+
+    # [PACT] Vision -> tactile edge. FTP-1 leaves this block at zero, so image and tactile
+    # tokens never attend to each other at any layer and meet only as independent K/V for the
+    # action expert. Opening the image columns (and only the image columns) lets tactile read
+    # vision while vision stays blind to tactile, which keeps the prefix KV cache valid and
+    # keeps a fully gated batch bit-identical to a vision-language-only policy.
+    if tactile_pad_masks is not None and num_image_tokens > 0:
+        tactile_rows = slice(tactile_start, tactile_start + tactile_len)
+        img_cols = slice(0, num_image_tokens)
+        att_2d_masks[:, tactile_rows, img_cols] = (
+            tactile_pad_masks[:, :, None] * prefix_pad_masks[:, None, img_cols]
+        )
 
     action_rows = slice(action_start, action_start + suffix_pad_masks.shape[1])
     vlm_cols = slice(0, prefix_pad_masks.shape[1])

@@ -43,6 +43,12 @@ norm_type="zscore"
 norm_image_tactile_mode="channel_wise"
 state_input_mode="adarms"
 model_tactile_expert_variant="gemma_small"
+# PACT (vision-tactile alignment) knobs. Defaults reproduce the FTP-1 baseline exactly:
+#   tokens_per_area=1  -> tactile gel frame collapsed to its CLS token (2 real tokens of 48 slots)
+#   reads_vision=false -> prefix and tactile stay block-diagonal, never attending to each other
+# Set FTP1_TACTILE_TOKENS_PER_AREA=10 and FTP1_TACTILE_READS_VISION=true for the PACT arm.
+tactile_tokens_per_area="${FTP1_TACTILE_TOKENS_PER_AREA:-1}"
+tactile_reads_vision="${FTP1_TACTILE_READS_VISION:-false}"
 proprioception_pose_rep="relative"
 action_pose_rep="relative"
 proprioception_joint_rep="abs"
@@ -107,6 +113,7 @@ TRAIN_ARGS=(
   --model.state_input_mode=${state_input_mode}
   --model.tactile_expert_variant=${model_tactile_expert_variant}
   --model.use_tactile_input
+  --model.tactile-tokenizer-config.tokens-per-area=${tactile_tokens_per_area}
   --proprioception_pose_rep=${proprioception_pose_rep}
   --action_pose_rep=${action_pose_rep}
   --proprioception_joint_rep=${proprioception_joint_rep}
@@ -142,6 +149,12 @@ if [ "${use_wandb}" = "true" ]; then
   TRAIN_ARGS+=(--wandb_enabled)
 else
   TRAIN_ARGS+=(--no-wandb_enabled)
+fi
+
+if [ "${tactile_reads_vision}" = "true" ]; then
+  TRAIN_ARGS+=(--model.tactile-reads-vision)
+else
+  TRAIN_ARGS+=(--model.no-tactile-reads-vision)
 fi
 
 if [ "${use_torch_compile}" = "true" ]; then
