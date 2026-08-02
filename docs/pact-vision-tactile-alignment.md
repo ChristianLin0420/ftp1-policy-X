@@ -142,6 +142,58 @@ confound a controlled A/B. They belong in a separate arm.
   patch, and the two pads are ~0.90 patch apart. Gated behind extracting wrist-camera intrinsics
   and validating a reprojection overlay.
 
+## 5.5 Results (20 000 steps, UniVTAC lift_bottle, 2×A100)
+
+Both arms: identical data, seed-42 split, normalization statistics, and recipe; architecture is
+the only difference. Baseline W&B `4tdhuz7r`, PACT `2b3520wj`, comparison `dhws8jhv`.
+
+### Offline action error — no significant difference
+
+Paired across 10 validation points, PACT minus baseline:
+
+| metric | mean Δ | SE | t |
+|---|---|---|---|
+| `rmse_total` | +1.35% | 2.36% | +0.57 |
+| `rmse_right-arm-joints` | +1.35% | 2.36% | +0.57 |
+| `rmse_right-hand-joint` | +1.47% | 3.27% | +0.45 |
+| `mape_total` | +3.46% | 2.44% | +1.42 |
+| `jitter_rms_total` | +4.68% | 2.86% | +1.63 |
+
+Every |t| < 2. PACT is indistinguishable from baseline, trending marginally worse. The change is
+free in memory (~38.9 GiB/GPU, baseline-identical) and throughput (0.92 s/step), and does not
+damage the pretrained prior (step-0 within 0.6%).
+
+### Tactile ablation — the informative result
+
+`rmse_right-arm-joints` under test-time tactile substitution:
+
+| condition | baseline | Δ | PACT | Δ |
+|---|---|---|---|---|
+| `real` | 0.0136 | — | 0.0143 | — |
+| `zero` | 0.0166 | **+22.1%** | 0.0193 | **+35.0%** |
+| `noise` | 0.0166 | +22.1% | 0.0193 | +35.0% |
+| `shuffle` | 0.0137 | **+0.7%** | 0.0142 | **−0.7%** |
+
+1. **Both models use tactile substantially**, and use its *structure*: `noise` (matched mean/std,
+   structure destroyed) is worth exactly as much as `zero`.
+2. **PACT increased tactile reliance 1.6×** — 35.0% vs 22.1% degradation when touch is removed.
+   The architecture change measurably altered how much the policy leans on that pathway.
+3. **Neither model binds tactile to the current observation.** A real gel frame from an unrelated
+   timestep performs as well as the correct one on both arms. The tactile stream is a
+   distributional anchor, not observation-specific evidence.
+
+### Conclusion
+
+Connectivity is not the bottleneck. Nothing in the flow-matching action loss ever requires the
+tactile tokens to describe *this* contact, so the model has no reason to bind them to it — and
+does not, even with 10× the tokens and an open vision→tactile edge.
+
+This makes `L_phys` (§5) a measured requirement rather than an argument: it regresses penetration
+depth and shear, a target that **cannot be satisfied by a shuffled tactile input**. The falsifiable
+prediction is that after `L_phys`, `real`→`shuffle` must open a gap. The numbers above (+0.7% /
+−0.7%) are the pre-registered baseline for that test, and
+`scripts/zarr_eval_ftp1_pytorch.py --tactile_mode` is the instrument.
+
 ## 6. Risks
 
 1. **The evaluation task may be unable to show a gain.** UniVTAC reports `lift_bottle`-family
