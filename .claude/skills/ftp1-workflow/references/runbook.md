@@ -5,9 +5,15 @@
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync --all-extras --dev
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-cp -r src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
+TRANSFORMERS_DIR=$(
+  .venv/bin/python -c \
+    'import pathlib, transformers; print(pathlib.Path(transformers.__file__).resolve().parent)'
+)
+cp -r src/openpi/models_pytorch/transformers_replace/. "$TRANSFORMERS_DIR/"
 uv run python -c 'import torch; print(torch.__version__, torch.cuda.device_count())'
 ```
+
+Verify each selected GPU with a real CUDA tensor operation, not device enumeration alone. On Ampere A100, keep the locked CUDA wheel and do not run the Blackwell override below.
 
 For an NVIDIA Blackwell GPU (`sm_120`), the CUDA 12.6 wheel in the lock file cannot execute kernels. Apply the supported CUDA 12.8 wheel override after the normal sync, then prevent later launcher invocations from reconciling it away:
 
@@ -51,10 +57,43 @@ The Precision 7960 host has a verified local batch size of 2 on one GPU (one opt
 The parser accepts both historical `UniVTAC/<task>/demo/hdf5/*.hdf5` inputs and the published `UniVTAC/<task>/clean/*.hdf5` layout:
 
 ```bash
+PATH="$PWD/.venv/bin:$PATH" \
 BASE_DIR=/absolute/path/UniVTAC SAVE_DIR=/absolute/path/processed/UniVTAC \
 EPISODES_PER_TASK=100 TASK_LIST=lift_bottle \
+IMAGE_SIZE=224 \
 bash data_processing/parse_data_scripts/parse_data_univtac.sh
 ```
+
+The wrapper invokes bare `python`, so put `.venv/bin` first on `PATH`. It can also exit successfully when no raw files are discovered; require `lift_bottle_head.zarr`, preflight success, and the expected counts. The published 100-episode subset at the time of the A100 qualification produced exactly 30,432 steps and a 7.6 GiB Zarr store.
+
+Download only the required release artifacts after logging in through the standard user credential stores:
+
+```bash
+hf download MJJJJ1064/ftp1_v0426_50kstep --local-dir "$FTP1_PRETRAINED_CHECKPOINT"
+hf download byml/UniVTAC --repo-type dataset \
+  --include 'lift_bottle/clean/*.hdf5' --local-dir "$RAW_UNIVTAC"
+```
+
+Do not place tokens in command arguments, scripts, logs, or repository files. Expect 100 HDF5 files unless upstream changes; independently compute the converted step count as the sum of `embodiment/joint.shape[0] - 1`.
+
+For a two-GPU A100 run, preserve one namespace across normalization and training:
+
+```bash
+export FTP1_CACHE_ROOT=/absolute/path/runtime
+export FTP1_DATASET_CONFIG=/absolute/path/dataset_univtac_lift_bottle.json
+export FTP1_PRETRAINED_CHECKPOINT=/absolute/path/ftp1_pretrain_v0426_50kstep
+export FTP1_REPO_ID=univtac_lift_bottle_a100
+
+CUDA_VISIBLE_DEVICES=0 bash scripts_exp_zarr/univtac/compute_norm_stats_univtac_example.sh
+```
+
+Require `norm_params_snapshot.json`, `share_norm_stats_all_t0_zscore.json`, and `tactile_input_config.json`. Verify relative pose inputs/actions, absolute proprioceptive joints, `mix` action joints, channel-wise tactile statistics, and the seed-42 episode-level 90/10 split. Run preflight with both the absolute dataset config and pretrained checkpoint before normalization and every training launch.
+
+Qualify DDP with tracking and validation disabled: first set `FTP1_NUM_TRAIN_STEPS=1`, `FTP1_SAVE_INTERVAL=1`, and local batch 1; then use 100 steps, log/save interval 10/100. Keep compile disabled. Require both ranks, clean DDP synchronization, finite logged loss and pre-clipping gradient norm, no NCCL/CUDA/OOM error, symmetric GPU memory, and final optimizer counters of 1 and 100. Gate checkpoints are zero-based directories `0/` and `99/`.
+
+Launch production fresh from `FTP1_PRETRAINED_CHECKPOINT`, never a gate checkpoint. The qualified recipe uses two ranks, local/global batch 1/2, BF16, 20,000 steps, 500-step warmup, peak/end LR `5e-5`/`5e-6`, validation and checkpoint intervals of 2,000, compile off, T3 loading off, and W&B on. Set `USE_SWANLAB=false`, keep credentials out of the tmux command, and require a real HTTPS W&B run URL. Before handoff, wait for both ranks and HPT weights, snapshot match, finite step-0 validation, at least ten finite optimizer steps, active GPUs, and a live tmux session.
+
+The full 3,026-frame validation split takes about 6m50s on the qualified A100 stack and runs at step labels 0, 2000, ..., 18000, plus final label 19999. Do not derive ETA from the first logging window because step-0 validation is included in it; use later training windows plus validation/checkpoint overhead. The PyTorch saver does not prune by `keep_period`.
 
 ## Offline and UniVTAC evaluation
 

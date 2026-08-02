@@ -800,6 +800,8 @@ def train_loop(config: _config.TrainConfig):
                     output = model(observation, actions)
                 with torch.profiler.record_function("loss_extract"):
                     loss, loss_extras = _extract_loss_and_extras(output, device=device)
+                    if not torch.isfinite(loss).item():
+                        raise FloatingPointError(f"Non-finite training loss at step {global_step}: {loss.item()}")
                     loss_value = float(loss.item())
 
                 domain_idx = domain_name_to_index.get(domain_name, domain_unknown_idx)
@@ -814,7 +816,9 @@ def train_loop(config: _config.TrainConfig):
                 # Gradient clipping
                 with torch.profiler.record_function("clip_grad"):
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        trainable_parameters, max_norm=config.optimizer.clip_gradient_norm
+                        trainable_parameters,
+                        max_norm=config.optimizer.clip_gradient_norm,
+                        error_if_nonfinite=True,
                     )
 
                 # Optimizer step
@@ -858,6 +862,13 @@ def train_loop(config: _config.TrainConfig):
                             ]
                             if len(vals) > 0:
                                 avg_grad_norm = sum(vals) / len(vals)
+
+                        logging.info(
+                            f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} "
+                            f"grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                            if avg_grad_norm is not None
+                            else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                        )
 
                         # Log to wandb
                         if config.wandb_enabled and len(infos) > 0:

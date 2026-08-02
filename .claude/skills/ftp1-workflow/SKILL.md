@@ -18,7 +18,7 @@ Follow a gated path: validate artifacts, smoke-test one task, fine-tune, evaluat
 1. Run `uv run python scripts/ftp1_preflight.py --dataset-config <config>` before normalization.
 2. Add `--checkpoint <checkpoint> --domain-name <domain>` before inference or deployment.
 3. Compute normalization with the exact dataset config, split, pose representations, and joint representations used for training.
-4. Run a 50-100-step one-GPU smoke test before a distributed training launch.
+4. Qualify the target topology before a long run: run one optimizer step on every DDP rank, then run 100 steps with the production local batch size. Require finite loss and pre-clipping gradient norm, clean NCCL/CUDA logs, symmetric bounded memory, and optimizer step counters of 1 and 100 in the saved gates.
 5. Require `model.safetensors`, model/train configs, normalization, and tactile tokenizers in a deployable checkpoint.
 6. Capture exact model inputs during the first UniVTAC rollout and inspect pad order, colors, state packing, and gripper slot 28.
 7. Use fixed seeds and identical runtime settings when comparing checkpoints.
@@ -30,6 +30,8 @@ Follow a gated path: validate artifacts, smoke-test one task, fine-tune, evaluat
 - Keep the FTP-1 action representation consistent end to end: relative poses, absolute proprioceptive joints, and `mix` action joints for the UniVTAC reference path.
 - On NVIDIA Blackwell (`sm_120`), install the repository's CUDA 12.8 PyTorch override after `uv sync` and use `FTP1_UV_NO_SYNC=true` for every launcher so uv does not restore the locked CUDA 12.6 wheel.
 - Treat multi-GPU training as a separate acceptance gate. On the Precision 7960 reference host, basic NCCL collectives pass but DDP's initial synchronization of the 4.3B model triggers an illegal memory access; use the verified one-GPU path until that PyTorch/NCCL stack is upgraded and requalified.
+- At revision `fb235e7`, a 2x A100-80GB PCIe host passed the one-step and 100-step DDP gates with driver 580.173.02, PyTorch 2.7.1+cu126, and NCCL 2.26.2. Local batch 1 per rank peaked near 39 GiB per GPU and sustained about 0.9 seconds per optimizer step after worker warmup. Scope this result to that stack and re-run both gates after software or hardware changes.
+- The FTP-1 PyTorch saver currently ignores `keep_period` and retains every periodic checkpoint. Budget about 23 GiB for each fully populated UniVTAC AdamW checkpoint; a 20,000-step run saved every 2,000 steps requires roughly 226 GiB for ten checkpoints, plus gate artifacts.
 - Treat offline RMSE as a diagnostic, not a substitute for closed-loop success rate.
 - Record repository revision, model/dataset revision, effective CLI, GPU/driver versions, checkpoint step, seeds, and success metadata.
 - Add newly discovered failure modes and verified remedies to this skill rather than creating a standalone report.
