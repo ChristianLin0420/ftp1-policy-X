@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -117,7 +118,56 @@ def load_config_from_json(json_path: pathlib.Path) -> _config.TrainConfig:
     return base_config
 
 
-def eval_loop(checkpoint_dir: pathlib.Path, config: _config.TrainConfig | None = None, device: str = "cuda"):
+TACTILE_MODES = ("real", "zero", "noise", "shuffle")
+
+
+def apply_tactile_ablation(observation, mode: str, previous_tactiles: dict | None):
+    """Replace the tactile stream at test time to measure how much the policy actually uses it.
+
+    Tactile has already been normalized by the dataset at this point, so each mode strips a
+    different property while staying on the scale the model expects:
+
+      real     unmodified.
+      zero     the normalized mean, i.e. an uninformative constant. Distinguishes "uses touch"
+               from "ignores touch".
+      noise    Gaussian matched to this batch's per-key mean and std. Preserves the first two
+               moments and destroys spatial and temporal structure, so it separates "uses the
+               structure of touch" from "uses only its energy".
+      shuffle  a real tactile reading from a different batch. Keeps real statistics AND real
+               structure but breaks correspondence with the current observation. This is the
+               strongest control: a policy that scores well here is not binding touch to the
+               rest of the scene at all.
+
+    Returns (observation, tactiles_for_next_call).
+    """
+    tactiles = getattr(observation, "tactiles", None)
+    if mode == "real" or not tactiles:
+        return observation, tactiles
+
+    current = {key: value.detach().clone() for key, value in tactiles.items()}
+    replaced = {}
+    for key, value in tactiles.items():
+        if mode == "zero":
+            replaced[key] = torch.zeros_like(value)
+        elif mode == "noise":
+            replaced[key] = torch.randn_like(value) * value.std() + value.mean()
+        elif mode == "shuffle":
+            donor = None if previous_tactiles is None else previous_tactiles.get(key)
+            # The first batch has no donor yet; fall back to a within-batch roll, which is a
+            # no-op at batch size 1 and is why the first batch is dropped by the caller.
+            replaced[key] = value.roll(1, dims=0) if donor is None or donor.shape != value.shape else donor
+        else:
+            raise ValueError(f"Unknown tactile mode: {mode}")
+
+    return dataclasses.replace(observation, tactiles=replaced), current
+
+
+def eval_loop(
+    checkpoint_dir: pathlib.Path,
+    config: _config.TrainConfig | None = None,
+    device: str = "cuda",
+    tactile_mode: str = "real",
+):
     """Evaluate model on validation set."""
     init_logging()
     set_seed(42, 0)  # Fixed seed for reproducibility
@@ -251,6 +301,7 @@ def eval_loop(checkpoint_dir: pathlib.Path, config: _config.TrainConfig | None =
     
     val_batch_iter = iter(val_data_loader)
     val_idx = 0
+    previous_tactiles: dict | None = None
     
     if val_batch_count == 0:
         logging.warning("No validation batches found!")
@@ -267,6 +318,13 @@ def eval_loop(checkpoint_dir: pathlib.Path, config: _config.TrainConfig | None =
                 
                 val_idx += 1
                 val_observation = move_to_device(val_observation, device)
+                val_observation, previous_tactiles = apply_tactile_ablation(
+                    val_observation, tactile_mode, previous_tactiles
+                )
+                if tactile_mode == "shuffle" and val_idx == 1:
+                    # No donor batch existed yet, so this sample saw its own tactile.
+                    pbar_val.update(1)
+                    continue
                 sample_actions = model.sample_actions(device, val_observation)
                 
                 gt_actions = val_actions
@@ -335,7 +393,8 @@ def eval_loop(checkpoint_dir: pathlib.Path, config: _config.TrainConfig | None =
     aggregated_metrics = convert_to_serializable(aggregated_metrics)
     
     # Save to JSON file
-    output_json_path = ckpt_dir / "evaluation_aggregated_metrics.json"
+    suffix = "" if tactile_mode == "real" else f"_tactile-{tactile_mode}"
+    output_json_path = ckpt_dir / f"evaluation_aggregated_metrics{suffix}.json"
     with open(output_json_path, 'w') as f:
         json.dump(aggregated_metrics, f, indent=2)
     
@@ -366,6 +425,14 @@ def main():
         help="Device to run evaluation on (default: cuda if available, else cpu)"
     )
     
+    parser.add_argument(
+        "--tactile_mode",
+        type=str,
+        default="real",
+        choices=TACTILE_MODES,
+        help="Test-time tactile ablation: real | zero | noise | shuffle (default: real)",
+    )
+
     # Parse known args first to get checkpoint_dir
     args, remaining = parser.parse_known_args()
     
@@ -385,7 +452,7 @@ def main():
             logging.info("Will try to load config from checkpoint directory")
             config = None
     
-    eval_loop(checkpoint_dir, config, args.device)
+    eval_loop(checkpoint_dir, config, args.device, tactile_mode=args.tactile_mode)
 
 
 if __name__ == "__main__":
