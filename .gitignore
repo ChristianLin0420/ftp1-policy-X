@@ -135,6 +135,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .venv
 .vscode
 env/
@@ -198,3 +199,8 @@ plot_actions_comparison.py
 parse_data_envs
 .cursor
 .deps
+# MoT-JEPA: bulk data, run artifacts, cluster logs
+FTP-1-Dataset/
+logs/
+runs/
+*.sqsh
