@@ -141,10 +141,16 @@ class Rope3D(nn.Module):
 
         Returns:
             ``cos, sin`` broadcast-compatible with :func:`apply_rope`.
+
+        Handles an empty selection. Mode ``T_HARD`` removes tactile entirely, so the tactile
+        expert legitimately arrives with zero context tokens; the trailing dimension is
+        therefore stated explicitly rather than inferred, since ``-1`` is ambiguous for a
+        zero-element tensor.
         """
+        pairs = self.cos_table.shape[-1]
         flat = index.reshape(-1)
-        cos = self.cos_table.index_select(0, flat).reshape(*index.shape, -1)
-        sin = self.sin_table.index_select(0, flat).reshape(*index.shape, -1)
+        cos = self.cos_table.index_select(0, flat).reshape(*index.shape, pairs)
+        sin = self.sin_table.index_select(0, flat).reshape(*index.shape, pairs)
         return cos, sin
 
     def forward(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -133,6 +133,16 @@ def test_buffers_are_not_persisted(rope):
     assert "sin_table" not in rope.state_dict()
 
 
+def test_gather_supports_an_empty_selection(rope):
+    """Mode T_HARD leaves the tactile expert with zero context tokens, by design."""
+    empty = torch.zeros(4, 0, dtype=torch.int64)
+    cos, sin = rope.gather(empty)
+    assert cos.shape == (4, 0, CONFIG.head_dim // 2)
+    assert sin.shape == (4, 0, CONFIG.head_dim // 2)
+    x = torch.randn(4, 2, 0, CONFIG.head_dim)
+    assert apply_rope(x, cos, sin).shape == x.shape
+
+
 def test_gather_supports_batched_index(rope):
     index = torch.stack([torch.arange(10), torch.arange(10, 20)])
     cos, sin = rope.gather(index)
