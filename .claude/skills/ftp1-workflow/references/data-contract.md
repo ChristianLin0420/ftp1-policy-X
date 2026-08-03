@@ -50,3 +50,36 @@ normalization/
 ```
 
 The deployment `domain_name` must resolve under `normalization/`. Keep this step directory intact; copying only model weights loses the tactile tokenizer and denormalization contract.
+
+## Measured properties of the released corpus
+
+Verified on the staged `RDP` and `RDP_Bimanual` domains (190 episodes, 86,228 frames) with
+`scripts/mot_jepa_survey_corpus.py`. Re-run that tool on new domains rather than assuming
+these hold.
+
+**`timestamps` is unusable and must not drive sampling.** It stores absolute Unix epoch
+seconds in **float32**. At ~1.74e9 the float32 ulp is 128 s, so every frame in a clip rounds
+to the same value and 100% of within-episode inter-frame deltas are exactly 0 or 128.
+Deriving a rate from it yields ~0.008 Hz and inflates an 0.8-hour corpus into 3,000 hours.
+Index clips by frame, never by time. This is consistent with `disable_history=true` being the
+default. Any hour-based corpus figure quoted from this release is unverified.
+
+**A tactile type label is not evidence that a sensor was recording.** In
+`RDP_Bimanual/lift_v2`, `left_tactile_data_gripper_gelsightmini` and
+`right_tactile_data_gripper_mctac` are identically zero (mean 0, std 0 across space and
+time) while their per-hand partners are live — so each hand has exactly one working gel
+sensor, and which one differs by hand. Both dead streams are still labelled type `image`.
+Feeding a constant stream to a masked-prediction objective is worse than dropping it: the
+target is trivially predictable, so reconstruction modes score well while learning nothing,
+and it contributes no discriminative signal to a contrastive term. Check content, not just
+key presence (`openpi.mot_jepa.clip_dataset.is_degenerate`).
+
+**Shapes and chunking.** RGB and gel are both stored at 224x224x3 uint8, chunked at **14
+frames** along time (~2 MB) with **Blosc lz4, NOSHUFFLE** — not the zstd-bitshuffle setting
+the parse scripts use elsewhere. A 16-frame clip therefore straddles two chunks and
+decompresses ~28 frames to use 16. Measured cost of one 16-frame clip from the source store
+is ~682 ms: ~360 ms of zarr reads plus ~320 ms of on-the-fly resize. Decompressed size is
+3.61 MB/clip.
+
+**Low-dimensional tactile** appears as `*_tactile_data_gripperforce_flexivgripper`, shape
+`(T, 1, 1)`, type `state`.

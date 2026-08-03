@@ -139,3 +139,62 @@ bash scripts/stage_ftp1_archive.sh /archive/download/MotionTrans /data/ftp1/Moti
 ```
 
 Point `scripts_exp_zarr/pretrain_small/data_config_pretrain_small.json` at the extracted Zarr domain, then run its normalization and training launchers. Qualify a subset-pretrained checkpoint by fine-tuning and evaluating it on the same UniVTAC split; do not use pretraining loss alone as the transfer result.
+
+## MoT-JEPA pretraining on the H100 SLURM cluster
+
+Self-supervised video-tactile pretraining lives in `src/openpi/mot_jepa/` and
+`scripts/mot_jepa_*.py`, entirely separate from the FTP-1 flow-matching path so the baseline
+arm stays bit-identical. Launchers are in `scripts_exp_zarr/mot_jepa/` — read its README
+before submitting anything long.
+
+### Cluster facts (verified 2026-08-02)
+
+491 H100 nodes, each 8 GPU / **128 CPU** / **2 TB RAM**, with node-local NVMe at `/raid`
+(7 TB). Partitions: `batch` 4 h, `batch_long` 8 h, `backfill` 7 d, `batch_large_long` 14 d.
+pyxis/enroot available with `nvcr.io` credentials already in `~/.config/enroot/.credentials`.
+Lustre quota 250 T.
+
+Request `--cpus-per-task=128` and `--mem=0`, and `export SRUN_CPUS_PER_TASK` before `srun`:
+SLURM >= 22.05 stopped propagating `--cpus-per-task` to `srun`, and with `ntasks-per-node=1`
+plus torchrun forking 8 ranks, an under-provisioned cgroup pins 8 ranks and ~100 dataloader
+workers onto a fraction of a core. It presents as "GPUs at 15% util", not as an error.
+
+### Preemption and requeue
+
+**Verified on this cluster** (`scripts_exp_zarr/mot_jepa/signal_probe.sbatch`, job 6442100):
+`--signal=B:USR1@N` reaches the batch shell, the trap fires, `wait` returns 128+signum, the
+re-wait loop recovers, the worker sees the flag file and exits, and the script regains
+control at rc=0 before walltime.
+
+`--signal=B:USR1@N` delivers **only to the batch shell**, so `srun` must be backgrounded and
+`wait`ed or the trap fires only after the walltime kill. The trap touches a flag file, and
+that file is the primary mechanism — `scancel --signal` reaches the job step, not torchrun's
+worker children, and torchrun has historically not forwarded SIGUSR1. Rank 0 polls it and
+broadcasts, so ranks cannot disagree and hang a collective. Requeue keys on an armed flag,
+never on the exit code, so a genuine crash cannot loop forever.
+
+### Run continuity across a ~40-job chain
+
+`run_config.json` is frozen with `O_CREAT|O_EXCL` on first launch and re-read afterwards, so
+editing a launcher mid-chain cannot silently change hyperparameters; drift is logged and the
+frozen value wins. W&B continuity needs `wandb_id.txt` + `resume="must"` **and**
+`USE_SWANLAB=false` — the shim defaults to SwanLab and pops `id`/`resume`
+(`shared/wandb_compat.py:22,137-145`), which would fork a new run every job. The trainer
+asserts on the backend rather than trusting the env.
+
+### Derived clip store
+
+`scripts/mot_jepa_build_clip_zarr.py` rewrites a domain at model resolution with chunks
+aligned to exactly one clip. Measured on `RDP_Bimanual`: **4.1x faster reads** (1520 ->
+367 ms/clip) and **4.8x smaller** (14 G -> 2.9 G). The win is pre-resizing gel from its
+stored 224 to the model's 112, plus chunk alignment — not the compressor, which is already
+lz4 in the released stores.
+
+### Known-good commands
+
+```bash
+uv run python scripts/mot_jepa_survey_corpus.py --data-root <staged> --assumed-fps 30
+uv run python scripts/mot_jepa_build_clip_zarr.py --source <staged> --output <clips>
+EXP_NAME=pilot01 NODES=4 STAGE_SOURCE=<clips>/RDP bash scripts_exp_zarr/mot_jepa/submit.sh
+uv run python scripts/mot_jepa_analyze.py --checkpoint <ckpt>/<step> --data-glob '<clips>/*/*.zarr' --output reports/<name>
+```
