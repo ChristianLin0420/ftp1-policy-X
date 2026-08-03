@@ -97,9 +97,12 @@ class ProbeSuite:
     #: P2 must stay at or below 1.5x chance. Above that, retrieval is reading position.
     SHORTCUT_TOLERANCE = 1.5
 
-    def __init__(self, layout: TokenLayout, *, max_batches: int = 1) -> None:
+    def __init__(self, layout: TokenLayout, *, max_batches: int = 1, use_autocast: bool | None = None) -> None:
         self.layout = layout
         self.max_batches = max_batches
+        #: ``None`` means "autocast iff CUDA". Tests force it on to exercise the mixed-dtype
+        #: path on CPU, which is otherwise unreachable.
+        self.use_autocast = use_autocast
 
     @staticmethod
     def _pool(encoder_output, projectors) -> tuple[torch.Tensor, torch.Tensor]:
@@ -147,9 +150,20 @@ class ProbeSuite:
                 lowdim=batch["lowdim"].to(device).float(),
             )
 
-            with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
+            # Every forward AND every projection must sit inside autocast. `encode_full`
+            # under autocast returns bf16 readouts while the projector weights stay fp32, so
+            # applying the projectors outside raises "mat1 and mat2 must have the same
+            # dtype". `amp` is device-generic rather than hardcoded to CUDA precisely so a
+            # CPU test can reproduce that -- with autocast keyed to "cuda" the bug is
+            # invisible off-GPU, which is how it reached a real job.
+            enabled = device.type == "cuda" if self.use_autocast is None else self.use_autocast
+
+            def amp():
+                return torch.autocast(device.type, torch.bfloat16, enabled=enabled)
+
+            with amp():
                 encoded = student.backbone.encode_full(inputs)
-            video_vec, tactile_vec = self._pool(encoded, projectors)
+                video_vec, tactile_vec = self._pool(encoded, projectors)
             metrics.update(cross_modal_retrieval(video_vec, tactile_vec))
 
             # P2: identical positions, constant content. Retrieval must collapse to chance.
@@ -158,9 +172,9 @@ class ProbeSuite:
                 gel=_flatten_clip_mean(inputs.gel),
                 lowdim=_flatten_clip_mean(inputs.lowdim),
             )
-            with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
+            with amp():
                 control = student.backbone.encode_full(control_inputs)
-            control_video, control_tactile = self._pool(control, projectors)
+                control_video, control_tactile = self._pool(control, projectors)
             control_metrics = cross_modal_retrieval(control_video, control_tactile, ks=(1,))
             metrics["shortcut_top1"] = control_metrics["retrieval_top1"]
             chance = control_metrics["retrieval_chance"]
@@ -171,7 +185,7 @@ class ProbeSuite:
             # The headline is the gap, not the raw number.
             metrics["retrieval_gap"] = metrics.get("retrieval_top1", float("nan")) - metrics["shortcut_top1"]
 
-            with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
+            with amp():
                 teacher_out = teacher.module.encode_full(inputs)
             tactile_tokens = normalize_targets(teacher_out.tokens[1])
             student_tactile = normalize_targets(encoded.tokens[1])

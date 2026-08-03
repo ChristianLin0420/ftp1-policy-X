@@ -31,7 +31,11 @@ export WANDB_DIR="${RUN_DIR}/wandb"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 mkdir -p "${WANDB_DIR}"
 
-echo "[$(hostname)] node ${SLURM_NODEID}/${SLURM_NNODES} cpus=$(nproc) master=${MASTER_ADDR}:${MASTER_PORT}"
+# Report the AFFINITY count, not `nproc`: nproc honours OMP_NUM_THREADS (set to 8 just
+# above), so it would print 8 on a correctly-allocated 128-CPU node and send you chasing a
+# CPU cliff that is not there. sched_getaffinity is what the dataloader workers actually get.
+CPUS_AVAIL=$("${REPO_ROOT}/.venv/bin/python" -c "import os;print(len(os.sched_getaffinity(0)))" 2>/dev/null || nproc --all)
+echo "[$(hostname)] node ${SLURM_NODEID}/${SLURM_NNODES} cpus_affinity=${CPUS_AVAIL} (nproc=$(nproc), OMP=${OMP_NUM_THREADS}) master=${MASTER_ADDR}:${MASTER_PORT}"
 
 # Sourced, not executed: it exports DATA_GLOB, which a subshell could not hand back.
 if [[ -n "${STAGE_SOURCE:-}" ]]; then

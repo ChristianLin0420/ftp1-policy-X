@@ -23,13 +23,19 @@ DATA_GLOB='/lustre/fsw/portfolios/edgeai/users/chrislin/ftp1-clips/*/*.zarr' \
 bash scripts_exp_zarr/mot_jepa/submit.sh
 
 # (c) two nodes. Does c10d rendezvous, and does each task really see 128 CPUs?
-#     Check the log for "cpus=128"; anything less is the throughput cliff.
+#     Check the log for "cpus_affinity=128"; anything less is the throughput cliff.
+#     Note it also prints nproc, which will read 8 because nproc honours
+#     OMP_NUM_THREADS -- that is expected and is NOT the cliff.
 EXP_NAME=smoke2n NODES=2 TIME_LIMIT=00:30:00 CONFIG_NAME=mot_jepa_pilot \
 DATA_GLOB='/lustre/.../ftp1-clips/*/*.zarr' \
 bash scripts_exp_zarr/mot_jepa/submit.sh
 
 # (d) the one that matters: kill it mid-run and watch the chain heal.
-scancel --signal=USR1 <jobid>
+#     Use --batch (or just touch the flag). WITHOUT --batch the signal reaches the job step,
+#     where nothing handles USR1, so the default action terminates training instead of
+#     letting it checkpoint.
+scancel --signal=USR1 --batch <jobid>
+#     equivalently: touch <run_dir>/PREEMPT_REQUEST
 #     Expect, in order: "SIGUSR1 received", "preemption requested at step N;
 #     checkpointing", "requeueing job", then "resumed from step N" in the same log file,
 #     and one continuous W&B run rather than two.

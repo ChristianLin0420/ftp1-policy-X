@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import json
 
@@ -162,3 +163,39 @@ def test_config_diff_reports_changed_fields():
     base = CONFIGS["mot_jepa_debug"]
     changed = dataclasses.replace(base, seed=999)
     assert base.diff(changed) == {"seed": (base.seed, 999)}
+
+
+def test_resolve_run_config_is_safe_when_many_ranks_race(tmp_path):
+    """Reproduces the two-node failure: the claim is atomic, the content was not.
+
+    Every rank calls this at once. The old implementation claimed the destination with
+    O_CREAT|O_EXCL and wrote into that descriptor, so losers caught FileExistsError and read
+    a file that existed but was still EMPTY -- json.loads("") raised on every rank but one. A
+    single node survived on page-cache timing; two nodes on Lustre did not.
+    """
+    payload = json.dumps({"lr": 1.0, "steps": 10, "pad": "x" * 200_000})
+
+    def worker(_):
+        frozen, drift = runtime.resolve_run_config(tmp_path, payload)
+        return json.loads(frozen)["lr"], drift
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(worker, range(16)))
+
+    assert all(lr == 1.0 for lr, _ in results), "every rank must read the same frozen config"
+    assert all(drift == {} for _, drift in results)
+
+
+def test_resolve_run_config_never_leaves_a_partial_file(tmp_path):
+    """The destination must never exist in a half-written state."""
+    payload = json.dumps({"a": 1})
+    runtime.resolve_run_config(tmp_path, payload)
+    assert json.loads((tmp_path / "run_config.json").read_text()) == {"a": 1}
+    assert not list(tmp_path.glob("*.tmp")), "staging file must be renamed away"
+
+
+def test_resolve_run_config_times_out_rather_than_hanging(tmp_path):
+    """A claim with no config behind it must fail loudly, not block a whole job forever."""
+    (tmp_path / "run_config.claim").touch()  # winner claimed then died before writing
+    with pytest.raises(TimeoutError, match="did not become readable"):
+        runtime.resolve_run_config(tmp_path, json.dumps({"a": 1}), timeout_s=0.5, poll_s=0.05)

@@ -57,8 +57,12 @@ _on_usr1() {
   # torchrun's eight worker children -- torchrun has historically not forwarded SIGUSR1.
   # Rank 0 polls this path every few steps and broadcasts the decision to every rank.
   touch "${RUN_DIR}/PREEMPT_REQUEST"
-  # Secondary path, harmless if it does not reach the workers.
-  scancel --signal=USR1 "${SLURM_JOB_ID}" 2>/dev/null || true
+  # Do NOT `scancel --signal=USR1 $SLURM_JOB_ID` here. Without --batch that reaches the job
+  # STEP, and neither `bash srun_node.sh` nor torchrun installs a USR1 handler -- so the
+  # default action (terminate) kills training outright:
+  #     srun: error: gpu-h100-0273: task 0: User defined signal 1
+  # which destroys the graceful save this trap exists to trigger. The file flag above is the
+  # whole mechanism; rank 0 polls it and broadcasts.
   REQUEUE_ARMED=1
 }
 trap _on_usr1 USR1
@@ -78,10 +82,15 @@ SRUN_PID=$!
 
 wait "${SRUN_PID}"
 RC=$?
-# An interrupted `wait` returns 128+signum without the child having exited, so re-wait.
-while [[ ${RC} -gt 128 ]]; do
+# An interrupted `wait` returns 128+signum without the child having exited, so re-wait --
+# but bounded. If the step is already gone, an unbounded re-wait holds the whole allocation
+# idle until the walltime kill, which is how a 2-node smoke test sat on 16 idle H100s.
+DRAIN=0
+while [[ ${RC} -gt 128 ]] && [[ ${DRAIN} -lt 60 ]]; do
+  kill -0 "${SRUN_PID}" 2>/dev/null || { echo "[$(date -Is)] srun already exited"; break; }
   wait "${SRUN_PID}"
   RC=$?
+  DRAIN=$((DRAIN + 1))
 done
 
 echo "[$(date -Is)] srun exited rc=${RC} requeue_armed=${REQUEUE_ARMED}"

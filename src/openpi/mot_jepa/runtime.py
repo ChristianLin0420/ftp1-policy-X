@@ -13,6 +13,7 @@ import pathlib
 import re
 import shutil
 import signal
+import time
 import types
 
 import torch
@@ -39,9 +40,20 @@ def setup_ddp() -> tuple[bool, int, torch.device]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://", timeout=datetime.timedelta(minutes=30))
-        torch.cuda.set_device(local_rank)
-        return True, local_rank, torch.device(f"cuda:{local_rank}")
+        device = torch.device(f"cuda:{local_rank}")
+        # Set the device and pass device_id BEFORE init_process_group. Initializing first and
+        # binding after makes NCCL guess the rank-to-GPU mapping, which it warns about
+        # explicitly ("device used by this process is currently unknown ... can potentially
+        # cause a hang"). On one node it usually guesses right; across nodes a wrong guess is
+        # a deadlock that only surfaces as a 30-minute watchdog timeout.
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=datetime.timedelta(minutes=30),
+            device_id=device,
+        )
+        return True, local_rank, device
     device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -263,25 +275,58 @@ def load_checkpoint(
     return int(metadata["global_step"])
 
 
-def resolve_run_config(run_dir: pathlib.Path, config_json: str) -> tuple[str, dict]:
+def resolve_run_config(
+    run_dir: pathlib.Path, config_json: str, *, timeout_s: float = 120.0, poll_s: float = 0.2
+) -> tuple[str, dict]:
     """Freeze the config on first launch; re-read it on every later launch.
 
-    Uses ``O_CREAT | O_EXCL`` so the write is a single atomic claim even if several ranks
-    race. Returns the authoritative JSON and any differences against what was passed in, so
-    the caller can warn rather than silently switching hyperparameters mid-chain.
+    Returns the authoritative JSON plus any drift against what was passed in, so the caller
+    can warn rather than silently switching hyperparameters mid-chain.
+
+    **Every rank calls this simultaneously, so the content must appear atomically, not just
+    the file.** An earlier version claimed ``O_CREAT | O_EXCL`` on the destination and then
+    wrote into that descriptor. The *claim* is atomic but the *content* is not: losing ranks
+    caught ``FileExistsError`` and immediately read a file that existed but was still empty,
+    so ``json.loads("")`` raised. A single node survived on page-cache timing; two nodes on
+    Lustre failed every rank but one.
+
+    The fix is two-part. The winner writes a temporary file and ``os.replace``s it, so the
+    destination never exists in a partially-written state. Losers poll until it is present
+    and parses, because on a shared filesystem another node's rename is not instantly visible.
     """
     run_dir = pathlib.Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "run_config.json"
+    claim = run_dir / "run_config.claim"
+
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        frozen = path.read_text()
+        frozen = _await_config(path, timeout_s=timeout_s, poll_s=poll_s)
     else:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(config_json)
+        os.close(fd)
+        staging = run_dir / f"run_config.{os.getpid()}.tmp"
+        staging.write_text(config_json)
+        os.replace(staging, path)  # atomic: readers see either nothing or the whole file
+        _fsync_dir(run_dir)
         return config_json, {}
 
     incoming, existing = json.loads(config_json), json.loads(frozen)
     drift = {key: (existing.get(key), incoming.get(key)) for key in incoming if existing.get(key) != incoming.get(key)}
     return frozen, drift
+
+
+def _await_config(path: pathlib.Path, *, timeout_s: float, poll_s: float) -> str:
+    """Wait for a config written by another rank to become visible and parseable."""
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            text = path.read_text()
+            if text.strip():
+                json.loads(text)
+                return text
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            last_error = exc
+        time.sleep(poll_s)
+    raise TimeoutError(f"{path} did not become readable within {timeout_s}s (last error: {last_error})")
