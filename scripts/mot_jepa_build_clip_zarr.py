@@ -183,13 +183,21 @@ def main() -> int:
         entry["dest"] = str(dest)
         manifest["stores"].append(entry)
 
-    manifest_path = args.output / "manifest.json"
-    if manifest_path.exists():
-        existing = json.loads(manifest_path.read_text())
-        seen = {entry["dest"] for entry in manifest["stores"]}
-        manifest["stores"] += [entry for entry in existing.get("stores", []) if entry["dest"] not in seen]
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"\nWrote {manifest_path} ({len(manifest['stores'])} stores)")
+    # Per-domain manifests, never one shared file. This script is run as a SLURM array with
+    # one task per domain, and a shared manifest would be a read-modify-write race: tasks
+    # would clobber each other's entries and the record of what was built would be wrong in a
+    # way nothing downstream would notice. Nothing reads the manifest to locate data -- the
+    # dataset globs for *.zarr -- so per-domain files lose nothing.
+    for entry in manifest["stores"]:
+        domain_dir = args.output / entry["domain"]
+        domain_dir.mkdir(parents=True, exist_ok=True)
+        (domain_dir / "_manifest.json").write_text(
+            json.dumps(
+                {"video_size": args.video_size, "gel_size": args.gel_size, "stores": [entry]},
+                indent=2,
+            )
+        )
+    print(f"\nBuilt {len(manifest['stores'])} store(s); wrote per-domain _manifest.json")
     return 0
 
 
