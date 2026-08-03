@@ -9,6 +9,7 @@ from openpi.mot_jepa.clip_dataset import ClipIndex
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import discover_keys
+from openpi.mot_jepa.clip_dataset import is_degenerate
 from openpi.mot_jepa.layout import TokenLayout
 
 LAYOUT = TokenLayout(
@@ -38,10 +39,12 @@ def make_store(path, episode_lengths: list[int], *, size: int = 48) -> str:
     data.create_array("camera_ego_rgb", shape=rgb.shape, dtype="uint8")
     data["camera_ego_rgb"][:] = rgb
 
+    rng = np.random.default_rng(0)
     for name in ("gelsightmini", "mctac"):
         key = f"left_tactile_data_gripper_{name}"
         data.create_array(key, shape=(total, 1, size, size, 3), dtype="uint8")
-        data[key][:] = np.zeros((total, 1, size, size, 3), dtype=np.uint8)
+        # Must actually vary: a constant stream is now correctly treated as a dead sensor.
+        data[key][:] = rng.integers(0, 255, (total, 1, size, size, 3), dtype=np.uint8)
         type_key = f"left_tactile_type_gripper_{name}"
         data.create_array(type_key, shape=(total,), dtype="<U5")
         data[type_key][:] = np.array(["image"] * total)
@@ -58,6 +61,30 @@ def make_store(path, episode_lengths: list[int], *, size: int = 48) -> str:
 @pytest.fixture(name="store")
 def store_fixture(tmp_path) -> str:
     return make_store(tmp_path / "toy.zarr", [10, 12, 9])
+
+
+def test_degenerate_streams_are_dropped_by_content_not_by_label(tmp_path):
+    """A type label of ``image`` is not evidence that the sensor was recording.
+
+    The released RDP_Bimanual store labels two identically-zero gel streams as ``image``;
+    feeding those to the model is worse than dropping them, since a constant target is
+    trivially predictable and contributes nothing to the synchrony loss.
+    """
+    path = make_store(tmp_path / "dead.zarr", [12])
+    root = zarr.open(path, mode="a")
+    dead_key = "left_tactile_data_gripper_gelsightmini"
+    root["data"][dead_key][:] = 0  # sensor present in metadata, recording nothing
+
+    assert is_degenerate(root["data"][dead_key])
+    assert not is_degenerate(root["data"]["left_tactile_data_gripper_mctac"])
+
+    keys = discover_keys(zarr.open(path, mode="r"))
+    assert dead_key not in keys.gel
+    assert "left_tactile_data_gripper_mctac" in keys.gel
+
+    # Opting out keeps the declared-type behaviour, for surveying rather than training.
+    labelled = discover_keys(zarr.open(path, mode="r"), drop_degenerate=False)
+    assert dead_key in labelled.gel
 
 
 def test_discover_keys_splits_image_from_lowdim_tactile(store):

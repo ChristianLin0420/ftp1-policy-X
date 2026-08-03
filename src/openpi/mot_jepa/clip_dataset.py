@@ -71,8 +71,32 @@ def is_derived_store(store: zarr.Group) -> bool:
     return "video" in set(store["data"].array_keys())
 
 
-def discover_keys(store: zarr.Group, *, prefer_rgb: str | None = None) -> StoreKeys:
-    """Pick the RGB, gel and low-dimensional arrays of a store by inspecting its metadata."""
+def is_degenerate(array: zarr.Array, *, num_samples: int = 32) -> bool:
+    """True when a stream carries no signal at all (constant across space and time).
+
+    Not hypothetical: in the released ``RDP_Bimanual`` store each hand has exactly one
+    all-zero gel stream, and which one differs by hand -- ``left_gelsightmini`` and
+    ``right_mctac`` are identically zero while their partners are live. The *type label*
+    still says ``image``, so key presence alone reports them as usable tactile.
+
+    Feeding such a stream to the model is worse than dropping it: a constant target is
+    trivially predictable, so modes T and T_HARD score well on it while learning nothing,
+    and it contributes no discriminative signal to the synchrony loss.
+    """
+    length = array.shape[0]
+    if length == 0:
+        return True
+    index = np.unique(np.linspace(0, length - 1, min(num_samples, length)).astype(np.int64))
+    sample = np.asarray(array[index]).astype(np.float32)
+    return bool(sample.std() == 0.0)
+
+
+def discover_keys(store: zarr.Group, *, prefer_rgb: str | None = None, drop_degenerate: bool = True) -> StoreKeys:
+    """Pick the RGB, gel and low-dimensional arrays of a store by inspecting its metadata.
+
+    ``drop_degenerate`` additionally checks *content*, not just the declared type, because a
+    label of ``image`` is not evidence that a sensor was recording.
+    """
     data = store["data"]
     keys = set(data.array_keys())
     if is_derived_store(store):
@@ -90,6 +114,8 @@ def discover_keys(store: zarr.Group, *, prefer_rgb: str | None = None) -> StoreK
             continue
         type_key = f"{match['side']}_tactile_type_{match['detail']}"
         tactile_type = str(data[type_key][-1]) if type_key in keys else ""
+        if drop_degenerate and is_degenerate(data[key]):
+            continue
         (gel if tactile_type == "image" else lowdim).append(key)
     return StoreKeys(rgb=rgb, gel=tuple(gel), lowdim=tuple(lowdim))
 

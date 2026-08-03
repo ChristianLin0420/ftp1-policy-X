@@ -53,10 +53,16 @@ class TactileStream:
     sensor: str
     shape: tuple[int, ...]
     dtype: str
+    degenerate: bool = False
 
     @property
     def is_image(self) -> bool:
-        return self.tactile_type in IMAGE_TACTILE_TYPES
+        """Declared image type AND actually carrying signal.
+
+        The type label is not evidence that a sensor was recording: the released
+        ``RDP_Bimanual`` store labels two identically-zero streams as ``image``.
+        """
+        return self.tactile_type in IMAGE_TACTILE_TYPES and not self.degenerate
 
     def to_dict(self) -> dict:
         return {**dataclasses.asdict(self), "shape": list(self.shape), "is_image": self.is_image}
@@ -90,6 +96,15 @@ class StoreSurvey:
         payload["tactile"] = [stream.to_dict() for stream in self.tactile]
         payload["has_image_tactile"] = self.has_image_tactile
         return payload
+
+
+def _is_degenerate(array: zarr.Array, num_samples: int = 24) -> bool:
+    """True when a tactile stream is constant, i.e. the sensor recorded nothing."""
+    length = array.shape[0]
+    if length == 0:
+        return True
+    index = np.unique(np.linspace(0, length - 1, min(num_samples, length)).astype(np.int64))
+    return bool(np.asarray(array[index]).astype(np.float32).std() == 0.0)
 
 
 def _scalar_str(array: zarr.Array) -> str:
@@ -177,6 +192,7 @@ def survey_store(domain: str, store_path: pathlib.Path, *, assumed_fps: float) -
                 sensor=_scalar_str(data[sensor_key]) if sensor_key in keys else "<missing>",
                 shape=tuple(int(dim) for dim in data[key].shape),
                 dtype=str(data[key].dtype),
+                degenerate=_is_degenerate(data[key]),
             )
         )
 
@@ -281,8 +297,14 @@ def print_report(surveys: list[StoreSurvey], totals: dict, *, threshold: float) 
         print(f"  rgb={survey.rgb_keys} shape={survey.rgb_shape} chunks={survey.rgb_chunks}")
         print(f"  instruction_coverage={survey.instruction_coverage:.1%} unique={survey.unique_instructions}")
         for stream in survey.tactile:
-            flag = "IMAGE" if stream.is_image else stream.tactile_type.upper()
-            print(f"    [{flag:6s}] {stream.key:48s} {stream.sensor:20s} {tuple(stream.shape)}")
+            if stream.degenerate:
+                flag = "DEAD"
+            elif stream.is_image:
+                flag = "IMAGE"
+            else:
+                flag = stream.tactile_type.upper()
+            note = "  <-- constant, no signal" if stream.degenerate else ""
+            print(f"    [{flag:6s}] {stream.key:48s} {stream.sensor:20s} {tuple(stream.shape)}{note}")
 
     print("\n" + "=" * 100)
     print("Per-domain totals")
@@ -318,6 +340,12 @@ def print_report(surveys: list[StoreSurvey], totals: dict, *, threshold: float) 
         )
     else:
         print(f"\nR4 gate PASSED: image-tactile {fraction:.1%} >= {threshold:.0%} threshold.")
+
+    dead = [(s.domain, t.key) for s in surveys for t in s.tactile if t.degenerate]
+    if dead:
+        print(f"\nDEAD tactile streams ({len(dead)}) -- labelled but constant, excluded from the fraction above:")
+        for domain, key in dead:
+            print(f"  {domain}: {key}")
 
     sensor_counts = collections.Counter(
         stream.sensor for survey in surveys for stream in survey.tactile if stream.is_image

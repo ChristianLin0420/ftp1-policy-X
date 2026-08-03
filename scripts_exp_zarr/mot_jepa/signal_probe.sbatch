@@ -28,9 +28,14 @@
 
 set -uo pipefail
 
+PROBE_FLAG="${SLURM_SUBMIT_DIR:-$PWD}/logs/.signal_probe_${SLURM_JOB_ID}"
+rm -f "${PROBE_FLAG}"
+
 TRAP_FIRED=0
 _on_usr1() {
   echo "[$(date -Is)] TRAP FIRED: SIGUSR1 reached the batch shell"
+  # Exactly what the real launcher does: touch the flag the workers poll.
+  touch "${PROBE_FLAG}"
   TRAP_FIRED=1
 }
 trap _on_usr1 USR1
@@ -40,8 +45,18 @@ echo "[$(date -Is)] nproc=$(nproc) node=$(hostname)"
 echo "[$(date -Is)] SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "nvidia-smi unavailable"
 
-# Same shape as the real launcher: background, then wait.
-srun --wait=30 bash -c 'for i in $(seq 1 200); do echo "  step $i on $(hostname)"; sleep 1; done' &
+# Same shape as the real launcher: background, then wait. The worker polls the flag file
+# and exits cleanly, standing in for the trainer's checkpoint-and-exit.
+export PROBE_FLAG
+srun --wait=30 bash -c '
+  for i in $(seq 1 200); do
+    if [[ -f "${PROBE_FLAG}" ]]; then
+      echo "  worker on $(hostname) saw the flag at step $i; exiting cleanly"
+      exit 0
+    fi
+    echo "  step $i on $(hostname)"
+    sleep 1
+  done' &
 SRUN_PID=$!
 
 wait "${SRUN_PID}"
@@ -52,9 +67,11 @@ while [[ ${RC} -gt 128 ]]; do
   RC=$?
 done
 
+rm -f "${PROBE_FLAG}"
 echo "[$(date -Is)] probe finished rc=${RC} trap_fired=${TRAP_FIRED}"
 if [[ ${TRAP_FIRED} -eq 1 ]]; then
-  echo "RESULT: PASS -- the SIGUSR1 -> trap -> requeue path works on this cluster"
+  echo "RESULT: PASS -- SIGUSR1 reached the batch shell, the trap fired, the worker saw the"
+  echo "                flag and exited, and the batch script regained control before walltime."
 else
   echo "RESULT: FAIL -- SIGUSR1 never reached the batch shell; do not rely on save-on-signal"
 fi
