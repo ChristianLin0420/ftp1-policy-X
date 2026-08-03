@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import pathlib
 import re
 
@@ -37,6 +38,7 @@ import numpy as np
 import torch
 import zarr
 
+from openpi.mot_jepa import tactile_parse as tp
 from openpi.mot_jepa.layout import TokenLayout
 
 SUPPORTED_RGB_KEYS = (
@@ -51,6 +53,8 @@ _TACTILE_DATA_RE = re.compile(r"^(?P<side>left|right)_tactile_data_(?P<detail>.+
 # cv2 is faster single-threaded here: the DataLoader already provides parallelism, and
 # letting each worker spawn its own OpenCV pool oversubscribes the node badly.
 cv2.setNumThreads(0)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,13 +231,13 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         strides: tuple[int, ...] = (1, 2),
         index_step: int = 1,
         clip_index: ClipIndex | None = None,
-        lowdim_channels: int = 1,
+        lowdim_channels: int | None = None,
         prefer_rgb: str | None = None,
     ) -> None:
         self.store_paths = list(store_paths)
         self.layout = layout
         self.domain_ids = domain_ids or [0] * len(store_paths)
-        self.lowdim_channels = lowdim_channels
+        self.lowdim_channels = layout.lowdim_channels if lowdim_channels is None else lowdim_channels
         self.prefer_rgb = prefer_rgb
         self.clip_index = clip_index or ClipIndex.build(
             self.store_paths, num_frames=layout.num_frames, strides=strides, step=index_step
@@ -242,6 +246,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         self._stores: dict[int, zarr.Group] = {}
         self._keys: dict[int, StoreKeys] = {}
         self._derived: dict[int, bool] = {}
+        self._spec_cache: dict[int, list[tp.TactileSpec]] = {}
 
     def __len__(self) -> int:
         return len(self.clip_index)
@@ -252,7 +257,39 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             self._stores[store_idx] = group
             self._keys[store_idx] = discover_keys(group, prefer_rgb=self.prefer_rgb)
             self._derived[store_idx] = is_derived_store(group)
+            specs = [] if self._derived[store_idx] else tp.specs_for_store(group["data"])
+            self._spec_cache[store_idx] = specs
+            self._warn_on_overflow(store_idx, specs)
         return self._stores[store_idx], self._keys[store_idx]
+
+    def _specs(self, store_idx: int) -> list[tp.TactileSpec]:
+        return self._spec_cache[store_idx]
+
+    def _warn_on_overflow(self, store_idx: int, specs: list[tp.TactileSpec]) -> None:
+        """Say so when a store carries more tactile units than the layout has slots.
+
+        Dropping a sensor because the layout is too small is a legitimate configuration
+        choice, but it must never be invisible -- otherwise a domain quietly trains without
+        half its touch data and nothing in the metrics says why.
+        """
+        gel_units = sum(spec.num_units for spec in specs if spec.route == tp.GEL)
+        low_units = sum(spec.num_units for spec in specs if spec.route == tp.LOWDIM)
+        if gel_units > self.layout.num_gel_pads:
+            logger.warning(
+                "%s: %d gel pads present but layout has %d; dropping %d",
+                self.store_paths[store_idx],
+                gel_units,
+                self.layout.num_gel_pads,
+                gel_units - self.layout.num_gel_pads,
+            )
+        if low_units > self.layout.lowdim_slots:
+            logger.warning(
+                "%s: %d low-dim units present but layout has %d slots; dropping %d",
+                self.store_paths[store_idx],
+                low_units,
+                self.layout.lowdim_slots,
+                low_units - self.layout.lowdim_slots,
+            )
 
     def _read_derived(self, entry: ClipIndexEntry, frames: np.ndarray) -> ClipSample:
         """Fast path: arrays are already at model resolution and chunk-aligned to a clip.
@@ -280,7 +317,8 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
 
         lowdim = np.zeros((self.layout.num_frames, self.layout.lowdim_slots, self.lowdim_channels), dtype=np.float32)
         slots = min(lowdim_src.shape[1], self.layout.lowdim_slots)
-        lowdim[:, :slots, :1] = lowdim_src[:, :slots, :1]
+        width = min(lowdim_src.shape[2], self.lowdim_channels)
+        lowdim[:, :slots, :width] = lowdim_src[:, :slots, :width]
         lowdim_valid = torch.zeros(self.layout.lowdim_slots, dtype=torch.bool)
         lowdim_valid[:slots] = True
 
@@ -312,25 +350,30 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             dtype=np.uint8,
         )
         gel_valid = torch.zeros(self.layout.num_gel_pads, dtype=torch.bool)
-        for pad, key in enumerate(keys.gel[: self.layout.num_gel_pads]):
-            raw = np.asarray(data[key][frames])  # (T, N_src, H, W, C) or (T, H, W, C)
-            if raw.ndim == 5:
-                raw = raw[:, 0]
-            if raw.ndim == 3:
-                raw = raw[..., None]
-            if raw.shape[-1] == 1:
-                raw = np.repeat(raw, 3, axis=-1)
-            gel_stack[:, pad] = _resize_frames(raw, self.layout.gel_size)
-            gel_valid[pad] = True
+        specs = self._specs(entry.store_idx)
+        slot = 0
+        for spec in (sp for sp in specs if sp.route == tp.GEL):
+            units = tp.read_gel(np.asarray(data[spec.key][frames]), spec)
+            for unit in range(spec.num_units):
+                if slot >= self.layout.num_gel_pads:
+                    break
+                gel_stack[:, slot] = _resize_frames(units[:, unit], self.layout.gel_size)
+                gel_valid[slot] = True
+                slot += 1
         gel_t = torch.from_numpy(np.ascontiguousarray(gel_stack.transpose(0, 1, 4, 2, 3)))
 
         lowdim = np.zeros((self.layout.num_frames, self.layout.lowdim_slots, self.lowdim_channels), dtype=np.float32)
         lowdim_valid = torch.zeros(self.layout.lowdim_slots, dtype=torch.bool)
-        for slot, key in enumerate(keys.lowdim[: self.layout.lowdim_slots]):
-            raw = np.asarray(data[key][frames], dtype=np.float32).reshape(self.layout.num_frames, -1)
-            width = min(raw.shape[1], self.lowdim_channels)
-            lowdim[:, slot, :width] = raw[:, :width]
-            lowdim_valid[slot] = True
+        slot = 0
+        for spec in (sp for sp in specs if sp.route == tp.LOWDIM):
+            units = tp.read_lowdim(np.asarray(data[spec.key][frames]), spec)
+            width = min(spec.width, self.lowdim_channels)
+            for unit in range(spec.num_units):
+                if slot >= self.layout.lowdim_slots:
+                    break
+                lowdim[:, slot, :width] = units[:, unit, :width]
+                lowdim_valid[slot] = True
+                slot += 1
 
         return ClipSample(
             video=video_t,

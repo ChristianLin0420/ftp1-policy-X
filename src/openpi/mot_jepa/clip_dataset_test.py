@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
@@ -124,7 +126,7 @@ def test_dataset_returns_layout_shaped_tensors(store):
     sample = dataset[0]
     assert sample.video.shape == (LAYOUT.num_frames, 3, LAYOUT.video_size, LAYOUT.video_size)
     assert sample.gel.shape == (LAYOUT.num_frames, LAYOUT.num_gel_pads, 3, LAYOUT.gel_size, LAYOUT.gel_size)
-    assert sample.lowdim.shape == (LAYOUT.num_frames, LAYOUT.lowdim_slots, 1)
+    assert sample.lowdim.shape == (LAYOUT.num_frames, LAYOUT.lowdim_slots, LAYOUT.lowdim_channels)
     assert sample.video.dtype is torch.uint8, "images must stay uint8 until the GPU"
     assert sample.lowdim.dtype is torch.float32
 
@@ -187,3 +189,52 @@ def test_dataset_is_index_stable_across_repeated_reads(store):
     second = dataset[5]
     assert torch.equal(first.video, second.video)
     assert torch.equal(first.lowdim, second.lowdim)
+
+
+def test_all_three_tactile_types_survive_the_source_read(tmp_path):
+    """image, matrix and state together, which RH20TCfg7Tactile actually contains.
+
+    Guards the four defects the corpus survey exposed: dropped second pads, channels-first
+    images read as fake pads, ``matrix`` treated as a scalar, and wide ``state`` truncated to
+    its first channel.
+    """
+    path = tmp_path / "mixed.zarr"
+    total = 40
+    root = zarr.open(str(path), mode="w")
+    data = root.create_group("data")
+    meta = root.create_group("meta")
+    meta.create_array("episode_ends", shape=(1,), dtype="int64")
+    meta["episode_ends"][:] = [total]
+    rng = np.random.default_rng(0)
+
+    data.create_array("camera_ego_rgb", shape=(total, 48, 48, 3), dtype="uint8")
+    data["camera_ego_rgb"][:] = rng.integers(0, 255, (total, 48, 48, 3), dtype=np.uint8)
+
+    def add(key, arr, ttype, sensor):
+        data.create_array(key, shape=arr.shape, dtype=str(arr.dtype))
+        data[key][:] = arr
+        side, detail = key.split("_", 1)[0], key.split("_tactile_data_")[1]
+        for name, value in ((f"{side}_tactile_type_{detail}", ttype), (f"{side}_tactile_sensor_{detail}", sensor)):
+            a = data.create_array(name, shape=(total,), dtype=f"<U{max(len(value), 4)}")
+            a[:] = np.array([value] * total)
+
+    add("right_tactile_data_gel", rng.integers(1, 255, (total, 2, 24, 24, 3), dtype=np.uint8), "image", "FreeTacMan")
+    add("right_tactile_data_uskin", rng.random((total, 2, 4, 4, 3)).astype("float32"), "matrix", "uSkin")
+    add("right_tactile_data_ft", rng.random((total, 1, 6)).astype("float32"), "state", "ATIAxia80M20")
+
+    # 2 uSkin pads + 1 wrench needs 3 low-dim slots; the default LAYOUT here has 2.
+    layout = dataclasses.replace(LAYOUT, lowdim_slots=4)
+    dataset = MotJepaClipDataset([str(path)], layout, strides=(1,))
+    sample = dataset[0]
+
+    # Both gel pads present and distinct -- not one pad duplicated or dropped.
+    assert bool(sample.gel_valid[0])
+    assert bool(sample.gel_valid[1])
+    assert not torch.equal(sample.gel[:, 0], sample.gel[:, 1])
+
+    # 2 uSkin pads + 1 wrench = 3 low-dim slots, none of them all-zero.
+    assert int(sample.lowdim_valid.sum()) == 3
+    assert float(sample.lowdim[:, 0].abs().sum()) > 0
+    # uSkin carries 48 channels; the wrench carries 6. Both must exceed one.
+    assert int((sample.lowdim[:, 0].abs().sum(dim=0) > 0).sum()) > 1
+    assert int((sample.lowdim[:, 2].abs().sum(dim=0) > 0).sum()) > 1

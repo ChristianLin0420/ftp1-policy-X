@@ -68,6 +68,8 @@ class TokenLayout:
         gel_patch: Gel spatial patch size in pixels.
         num_gel_pads: Number of image-tactile pads (``N``), padded to a fixed maximum.
         lowdim_slots: Low-dimensional tactile tokens emitted per temporal step.
+        lowdim_channels: Values per low-dim unit. 48 covers the widest stream in the
+            release (uSkin, 4x4 taxels x 3 force axes); a 6-D wrench uses 6 of them.
         video_width: Residual width of the video expert.
         tactile_width: Residual width of the tactile expert.
     """
@@ -80,6 +82,7 @@ class TokenLayout:
     gel_patch: int = 16
     num_gel_pads: int = 2
     lowdim_slots: int = 12
+    lowdim_channels: int = 48
     video_width: int = 768
     tactile_width: int = 384
 

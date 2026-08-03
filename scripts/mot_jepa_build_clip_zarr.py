@@ -38,6 +38,7 @@ import zarr
 from zarr.codecs import BloscCodec
 from zarr.codecs import BloscShuffle
 
+from openpi.mot_jepa import tactile_parse as tp
 from openpi.mot_jepa.clip_dataset import discover_keys
 
 cv2.setNumThreads(0)
@@ -53,15 +54,8 @@ def _resize_batch(frames: np.ndarray, size: int) -> np.ndarray:
     return np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA) for frame in frames])
 
 
-def _normalize_gel(raw: np.ndarray) -> np.ndarray:
-    """Collapse the source pad axis and force 3 channels."""
-    if raw.ndim == 5:
-        raw = raw[:, 0]
-    if raw.ndim == 3:
-        raw = raw[..., None]
-    if raw.shape[-1] == 1:
-        raw = np.repeat(raw, 3, axis=-1)
-    return raw
+#: Widest low-dimensional unit in the release is uSkin at 4x4x3 = 48.
+DEFAULT_LOWDIM_WIDTH = 48
 
 
 def build_store(
@@ -72,14 +66,39 @@ def build_store(
     gel_size: int,
     num_frames: int,
     max_gel_pads: int,
+    lowdim_width: int = DEFAULT_LOWDIM_WIDTH,
+    max_lowdim_slots: int = 12,
     batch_frames: int = 512,
 ) -> dict:
-    """Rewrite one store at model resolution with clip-aligned chunks."""
+    """Rewrite one store at model resolution with clip-aligned chunks.
+
+    Every tactile stream is routed by :mod:`openpi.mot_jepa.tactile_parse`, which is what
+    makes all three declared types survive the conversion: image keys contribute **every**
+    pad (not just pad 0), channels-first images are transposed rather than reinterpreted as
+    extra pads, ``matrix`` taxel grids keep all of their channels instead of being read as a
+    scalar, and wide ``state`` wrenches keep all six components.
+    """
     source = zarr.open(source_path, mode="r")
     data = source["data"]
     keys = discover_keys(source)
+    specs = tp.specs_for_store(data)
     episode_ends = np.asarray(source["meta/episode_ends"][:], dtype=np.int64)
     total = int(episode_ends[-1])
+
+    gel_specs = [spec for spec in specs if spec.route == tp.GEL]
+    lowdim_specs = [spec for spec in specs if spec.route == tp.LOWDIM]
+
+    # Flatten specs into concrete output slots, honouring the caps.
+    gel_slots: list[tuple[tp.TactileSpec, int]] = []
+    for spec in gel_specs:
+        for unit in range(spec.num_units):
+            if len(gel_slots) < max_gel_pads:
+                gel_slots.append((spec, unit))
+    lowdim_slots: list[tuple[tp.TactileSpec, int]] = []
+    for spec in lowdim_specs:
+        for unit in range(spec.num_units):
+            if len(lowdim_slots) < max_lowdim_slots:
+                lowdim_slots.append((spec, unit))
 
     dest = zarr.open(str(dest_path), mode="w")
     dest_data = dest.create_group("data")
@@ -94,7 +113,7 @@ def build_store(
         dtype="uint8",
         compressors=[COMPRESSOR],
     )
-    num_pads = min(len(keys.gel), max_gel_pads)
+    num_pads = max(len(gel_slots), 1)
     gel_out = dest_data.create_array(
         "gel",
         shape=(total, num_pads, gel_size, gel_size, 3),
@@ -102,11 +121,11 @@ def build_store(
         dtype="uint8",
         compressors=[COMPRESSOR],
     )
-    num_lowdim = max(len(keys.lowdim), 1)
+    num_slots = max(len(lowdim_slots), 1)
     lowdim_out = dest_data.create_array(
         "lowdim",
-        shape=(total, num_lowdim, 1),
-        chunks=(num_frames * 64, num_lowdim, 1),
+        shape=(total, num_slots, lowdim_width),
+        chunks=(num_frames * 64, num_slots, lowdim_width),
         dtype="float32",
         compressors=[COMPRESSOR],
     )
@@ -115,26 +134,57 @@ def build_store(
     for begin in range(0, total, batch_frames):
         end = min(begin + batch_frames, total)
         video_out[begin:end] = _resize_batch(np.asarray(data[keys.rgb][begin:end]), video_size)
-        for pad, key in enumerate(keys.gel[:num_pads]):
-            gel_out[begin:end, pad] = _resize_batch(_normalize_gel(np.asarray(data[key][begin:end])), gel_size)
-        for slot, key in enumerate(keys.lowdim[:num_lowdim]):
-            raw = np.asarray(data[key][begin:end], dtype=np.float32).reshape(end - begin, -1)
-            lowdim_out[begin:end, slot, 0] = raw[:, 0]
+
+        cache: dict[str, np.ndarray] = {}
+        for slot, (spec, unit) in enumerate(gel_slots):
+            if spec.key not in cache:
+                cache[spec.key] = tp.read_gel(np.asarray(data[spec.key][begin:end]), spec)
+            gel_out[begin:end, slot] = _resize_batch(cache[spec.key][:, unit], gel_size)
+
+        cache.clear()
+        for slot, (spec, unit) in enumerate(lowdim_slots):
+            if spec.key not in cache:
+                cache[spec.key] = tp.read_lowdim(np.asarray(data[spec.key][begin:end]), spec)
+            width = min(spec.width, lowdim_width)
+            lowdim_out[begin:end, slot, :width] = cache[spec.key][:, unit, :width]
+
         print(f"    {end}/{total} frames ({end / total:.0%})", end="\r", flush=True)
 
     elapsed = time.time() - start_time
     print(f"    {total}/{total} frames in {elapsed:.0f}s")
+    truncated = [spec.key for spec, _ in lowdim_slots if spec.width > lowdim_width]
+    if truncated:
+        print(f"    WARNING truncated to {lowdim_width} channels: {sorted(set(truncated))}")
+    gel_wanted = sum(spec.num_units for spec in gel_specs)
+    low_wanted = sum(spec.num_units for spec in lowdim_specs)
+    if gel_wanted > len(gel_slots):
+        print(f"    WARNING dropped {gel_wanted - len(gel_slots)} gel pad(s): cap is {max_gel_pads}")
+    if low_wanted > len(lowdim_slots):
+        print(f"    WARNING dropped {low_wanted - len(lowdim_slots)} low-dim unit(s): cap is {max_lowdim_slots}")
     return {
         "source": source_path,
         "frames": total,
         "episodes": int(episode_ends.size),
         "video_size": video_size,
         "gel_size": gel_size,
-        "gel_pads": num_pads,
-        "lowdim_slots": num_lowdim,
+        "gel_pads": len(gel_slots),
+        "lowdim_slots": len(lowdim_slots),
+        "lowdim_width": lowdim_width,
         "source_rgb_key": keys.rgb,
-        "source_gel_keys": list(keys.gel[:num_pads]),
-        "source_lowdim_keys": list(keys.lowdim[:num_lowdim]),
+        "tactile_streams": [
+            {
+                "key": spec.key,
+                "type": spec.tactile_type,
+                "sensor": spec.sensor,
+                "route": spec.route,
+                "units": spec.num_units,
+                "unit_shape": list(spec.unit_shape),
+            }
+            for spec in specs
+        ],
+        "truncated_streams": sorted(set(truncated)),
+        "dropped_gel_units": gel_wanted - len(gel_slots),
+        "dropped_lowdim_units": low_wanted - len(lowdim_slots),
         "chunk_frames": num_frames,
         "seconds": round(elapsed, 1),
     }
@@ -148,6 +198,8 @@ def main() -> int:
     parser.add_argument("--gel-size", type=int, default=112)
     parser.add_argument("--num-frames", type=int, default=16, help="Clip length; sets the chunk size.")
     parser.add_argument("--max-gel-pads", type=int, default=2)
+    parser.add_argument("--lowdim-width", type=int, default=DEFAULT_LOWDIM_WIDTH)
+    parser.add_argument("--max-lowdim-slots", type=int, default=12)
     parser.add_argument("--domains", nargs="*", default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -178,6 +230,8 @@ def main() -> int:
             gel_size=args.gel_size,
             num_frames=args.num_frames,
             max_gel_pads=args.max_gel_pads,
+            lowdim_width=args.lowdim_width,
+            max_lowdim_slots=args.max_lowdim_slots,
         )
         entry["domain"] = domain
         entry["dest"] = str(dest)

@@ -38,7 +38,8 @@ class DataConfig:
     """Stride between enumerated clip starts. Raise it to shrink the index on huge corpora."""
     num_workers: int = 12
     prefetch_factor: int = 4
-    lowdim_channels: int = 1
+    lowdim_channels: int = 48
+    """Widest low-dim unit in the release is uSkin at 4x4x3; a 6-D wrench uses 6."""
 
 
 @dataclasses.dataclass(frozen=True)
