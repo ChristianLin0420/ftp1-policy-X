@@ -8,14 +8,20 @@
 # Sets DATA_GLOB to point at the staged copy.
 set -euo pipefail
 
-STAGE_SOURCE="${STAGE_SOURCE:?}"     # directory of *.zarr stores on Lustre
+STAGE_SOURCE="${STAGE_SOURCE:?}"     # directory of *.zarr stores, or of domain dirs
+
+# The clip tree is <root>/<domain>/*.zarr, but a single staged domain is <dir>/*.zarr.
+# Pick whichever actually matches so both a whole corpus and one domain can be staged.
+_glob_for() {
+  if compgen -G "$1/*.zarr" > /dev/null; then echo "$1/*.zarr"; else echo "$1/*/*.zarr"; fi
+}
 STAGE_ROOT="${STAGE_ROOT:-/raid/${USER}/mot_jepa}"
 NAME="$(basename "${STAGE_SOURCE}")"
 DEST="${STAGE_ROOT}/${NAME}"
 
 if [[ ! -d /raid ]]; then
   echo "[stage] no /raid on $(hostname); reading directly from ${STAGE_SOURCE}"
-  export DATA_GLOB="${STAGE_SOURCE}/*.zarr"
+  export DATA_GLOB="$(_glob_for "${STAGE_SOURCE}")"
   return 0 2>/dev/null || exit 0
 fi
 
@@ -36,4 +42,4 @@ else
   echo "[stage] $(hostname): done ($(du -sh "${DEST}" | cut -f1))"
 fi
 
-export DATA_GLOB="${DEST}/*.zarr"
+export DATA_GLOB="$(_glob_for "${DEST}")"

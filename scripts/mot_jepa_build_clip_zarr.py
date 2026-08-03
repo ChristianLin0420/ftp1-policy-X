@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shutil
 import sys
 import time
 
@@ -215,6 +216,7 @@ def main() -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = {"stores": [], "video_size": args.video_size, "gel_size": args.gel_size}
+    skipped: list[str] = []
 
     for domain, store in sources:
         dest = args.output / domain / store.name
@@ -223,16 +225,27 @@ def main() -> int:
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         print(f"[build] {domain}/{store.name} -> {dest}")
-        entry = build_store(
-            str(store),
-            dest,
-            video_size=args.video_size,
-            gel_size=args.gel_size,
-            num_frames=args.num_frames,
-            max_gel_pads=args.max_gel_pads,
-            lowdim_width=args.lowdim_width,
-            max_lowdim_slots=args.max_lowdim_slots,
-        )
+        try:
+            entry = build_store(
+                str(store),
+                dest,
+                video_size=args.video_size,
+                gel_size=args.gel_size,
+                num_frames=args.num_frames,
+                max_gel_pads=args.max_gel_pads,
+                lowdim_width=args.lowdim_width,
+                max_lowdim_slots=args.max_lowdim_slots,
+            )
+        except Exception as exc:
+            # One unusable store must not abort a whole domain. Three FreeTacMan stores
+            # (FragileCup, Stamp, Write) are tactile-only recordings with no camera array at
+            # all; aborting on the first of them cost 36 of 44 stores on the corpus's largest
+            # image-tactile domain. A video-tactile model cannot use a camera-less store, so
+            # skipping is the correct outcome -- it just has to be loud rather than fatal.
+            print(f"[SKIP] {domain}/{store.name}: {type(exc).__name__}: {exc}")
+            shutil.rmtree(dest, ignore_errors=True)
+            skipped.append(f"{domain}/{store.name}")
+            continue
         entry["domain"] = domain
         entry["dest"] = str(dest)
         manifest["stores"].append(entry)
@@ -252,6 +265,11 @@ def main() -> int:
             )
         )
     print(f"\nBuilt {len(manifest['stores'])} store(s); wrote per-domain _manifest.json")
+    if skipped:
+        print(f"Skipped {len(skipped)} unusable store(s): {skipped}")
+    if not manifest["stores"] and skipped:
+        print("ERROR: every store was skipped")
+        return 1
     return 0
 
 
