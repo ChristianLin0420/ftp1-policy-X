@@ -103,6 +103,9 @@ class ProbeSuite:
         #: ``None`` means "autocast iff CUDA". Tests force it on to exercise the mixed-dtype
         #: path on CPU, which is otherwise unreachable.
         self.use_autocast = use_autocast
+        #: Tensors from the most recent run, kept only when ``collect_panels=True`` so a
+        #: caller can render figures without paying for a second forward pass.
+        self.panels: dict[str, torch.Tensor] = {}
 
     @staticmethod
     def _pool(encoder_output, projectors) -> tuple[torch.Tensor, torch.Tensor]:
@@ -131,6 +134,7 @@ class ProbeSuite:
         *,
         layout: TokenLayout | None = None,
         projectors=None,
+        collect_panels: bool = False,
     ) -> dict:
         """Compute all probes on the next batch from ``loader_iter``.
 
@@ -165,6 +169,19 @@ class ProbeSuite:
                 encoded = student.backbone.encode_full(inputs)
                 video_vec, tactile_vec = self._pool(encoded, projectors)
             metrics.update(cross_modal_retrieval(video_vec, tactile_vec))
+
+            if collect_panels:
+                with amp():
+                    steps_v = projectors[0](encoded.sync_readout[0]) if projectors else encoded.sync_readout[0]
+                    steps_t = projectors[1](encoded.sync_readout[1]) if projectors else encoded.sync_readout[1]
+                self.panels = {
+                    "video_vec": video_vec.detach().float().cpu(),
+                    "tactile_vec": tactile_vec.detach().float().cpu(),
+                    "video_steps": steps_v[0].detach().float().cpu(),
+                    "tactile_steps": steps_t[0].detach().float().cpu(),
+                    "video_frames": batch["video"][0].cpu(),
+                    "gel_frames": batch["gel"][0].cpu(),
+                }
 
             # P2: identical positions, constant content. Retrieval must collapse to chance.
             control_inputs = ClipInputs(

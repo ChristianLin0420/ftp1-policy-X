@@ -37,6 +37,7 @@ os.environ.setdefault("USE_SWANLAB", "false")
 
 from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
+from openpi.mot_jepa import viz
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import load_domain_config
@@ -364,13 +365,28 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
             window_start = time.time()
 
         if global_step % cfg.probe_interval == 0:
+            want_panels = cfg.wandb_enabled and runtime.is_main_process()
             probe_metrics = probes.run(
-                student, teacher, loader_iter, device, layout=layout, projectors=loss_fn.projectors
+                student,
+                teacher,
+                loader_iter,
+                device,
+                layout=layout,
+                projectors=loss_fn.projectors,
+                collect_panels=want_panels,
             )
             if runtime.is_main_process():
                 logger.info("probes @%d: %s", global_step, probe_metrics)
                 if cfg.wandb_enabled:
                     wandb.log({f"probe/{k}": v for k, v in probe_metrics.items()}, step=global_step)
+                    try:
+                        panels = viz.training_panels(
+                            probes.panels, layout, masks.tgt_index[0].cpu(), masks.mode_enum.name
+                        )
+                        if panels:
+                            wandb.log({f"panel/{k}": v for k, v in panels.items()}, step=global_step)
+                    except Exception:  # a plot must never kill a training run
+                        logger.exception("panel rendering failed at step %d; continuing", global_step)
 
         if global_step % cfg.save_interval == 0 and runtime.is_main_process():
             runtime.save_checkpoint(

@@ -374,3 +374,22 @@ def ablation_bars(conditions: dict, *, target_gap: float = 0.10, path=None):
     ax.set_title("tactile ablation\npredicted ordering: real < zero <= shuffle <= noise")
     ax.spines[["top", "right"]].set_visible(False)
     return _finish(fig, path)
+
+
+def training_panels(panels: dict, layout: TokenLayout, target_index=None, mode_name: str = "") -> dict:
+    """Build the live W&B image panels from tensors the probe already computed.
+
+    Only the four figures that need pixels are rendered here. Everything that is naturally a
+    curve -- retrieval, rank, EMA drift, per-mode losses -- is logged as a scalar and drawn by
+    W&B natively, which stays interactive and costs nothing per step.
+    """
+    images = {}
+    if "video_vec" in panels:
+        images["similarity"] = similarity_heatmap(panels["video_vec"], panels["tactile_vec"])
+    if "video_steps" in panels:
+        images["sync_matrix"] = sync_matrix(panels["video_steps"], panels["tactile_steps"])
+    if "video_frames" in panels:
+        images["filmstrip"] = filmstrip(panels["video_frames"], panels["gel_frames"], num_frames=8)
+    if target_index is not None:
+        images["mask_panel"] = mask_panel(layout, target_index, mode_name)
+    return {key: value for key, value in images.items() if value is not None}

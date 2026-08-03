@@ -38,6 +38,10 @@ SUPPORTED_RGB_KEYS = (
 #: Tactile types that the JEPA image path can consume as gel tokens.
 IMAGE_TACTILE_TYPES = frozenset({"image"})
 
+#: Frame rates outside this band indicate corrupt timestamps, not an unusual capture rate.
+MIN_PLAUSIBLE_FPS = 1.0
+MAX_PLAUSIBLE_FPS = 240.0
+
 #: Placeholder instruction written by parsers for episodes with no real annotation.
 UNANNOTATED_INSTRUCTIONS = frozenset({"", "finish tasks.", "finish tasks"})
 
@@ -150,6 +154,16 @@ def _estimate_fps(timestamps: zarr.Array, episode_ends: np.ndarray) -> tuple[flo
         return float("nan"), "degenerate: all inter-frame deltas are zero"
 
     median_delta = float(np.median(positive))
+    implied_fps = 1.0 / median_delta if median_delta > 0 else 0.0
+    # Plausibility band. Some released stores have timestamps that parse cleanly but imply
+    # ~0.014 Hz -- 320k frames over "6,472 hours" -- which silently inflates the hours
+    # denominator. That alone drove an image-tactile fraction of 0.1% and a spurious R4
+    # FALSIFIER TRIPPED, when the exact frame-based fraction is above 50%. A rate outside a
+    # physically sensible band is not a measurement, it is corrupt metadata.
+    if not (MIN_PLAUSIBLE_FPS <= implied_fps <= MAX_PLAUSIBLE_FPS):
+        return float(
+            "nan"
+        ), f"implausible: implied {implied_fps:.4g} Hz outside [{MIN_PLAUSIBLE_FPS}, {MAX_PLAUSIBLE_FPS}]"
     if zero_fraction > 0.5:
         return float("nan"), (
             f"degenerate: {zero_fraction:.0%} of inter-frame deltas are zero (float32 epoch timestamps, ulp={ulp:g}s)"
@@ -252,7 +266,15 @@ def aggregate(surveys: list[StoreSurvey]) -> dict:
     for survey in surveys:
         entry = by_domain.setdefault(
             survey.domain,
-            {"stores": 0, "episodes": 0, "frames": 0, "hours": 0.0, "image_tactile_hours": 0.0, "sensors": set()},
+            {
+                "stores": 0,
+                "episodes": 0,
+                "frames": 0,
+                "hours": 0.0,
+                "image_tactile_hours": 0.0,
+                "image_tactile_frames": 0,
+                "sensors": set(),
+            },
         )
         entry["stores"] += 1
         entry["episodes"] += survey.num_episodes
@@ -261,22 +283,29 @@ def aggregate(surveys: list[StoreSurvey]) -> dict:
         entry["hours"] += hours
         if survey.has_image_tactile:
             entry["image_tactile_hours"] += hours
+            entry["image_tactile_frames"] += survey.num_frames
         entry["sensors"].update(stream.sensor for stream in survey.tactile)
 
     for entry in by_domain.values():
         entry["sensors"] = sorted(entry["sensors"])
-        entry["image_tactile_fraction"] = entry["image_tactile_hours"] / entry["hours"] if entry["hours"] else 0.0
+        entry["image_tactile_fraction"] = entry["image_tactile_frames"] / entry["frames"] if entry["frames"] else 0.0
 
     total_hours = sum(entry["hours"] for entry in by_domain.values())
     image_hours = sum(entry["image_tactile_hours"] for entry in by_domain.values())
+    total_frames = sum(entry["frames"] for entry in by_domain.values())
+    image_frames = sum(entry["image_tactile_frames"] for entry in by_domain.values())
     return {
         "domains": by_domain,
         "total_stores": len(surveys),
         "total_episodes": sum(entry["episodes"] for entry in by_domain.values()),
-        "total_frames": sum(entry["frames"] for entry in by_domain.values()),
+        "total_frames": total_frames,
         "total_hours": total_hours,
         "image_tactile_hours": image_hours,
-        "image_tactile_fraction": image_hours / total_hours if total_hours else 0.0,
+        "image_tactile_frames": image_frames,
+        # Frames are counted exactly; hours depend on timestamps that are not always
+        # trustworthy, so the gate reads frames.
+        "image_tactile_fraction": image_frames / total_frames if total_frames else 0.0,
+        "image_tactile_fraction_hours": image_hours / total_hours if total_hours else 0.0,
     }
 
 
@@ -322,7 +351,10 @@ def print_report(surveys: list[StoreSurvey], totals: dict, *, threshold: float) 
         f"\nTOTAL: {totals['total_episodes']} episodes, {totals['total_frames']} frames, "
         f"{totals['total_hours']:.2f} hours"
     )
-    print(f"Image-tactile hours: {totals['image_tactile_hours']:.2f} ({fraction:.1%} of corpus)")
+    print(
+        f"Image-tactile: {totals['image_tactile_frames']:,} / {totals['total_frames']:,} frames "
+        f"({fraction:.1%} of corpus) -- frames are exact; hours depend on timestamps"
+    )
 
     assumed = [survey for survey in surveys if survey.fps_assumed]
     if assumed:
