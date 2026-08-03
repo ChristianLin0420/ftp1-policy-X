@@ -1,0 +1,199 @@
+"""Training configuration, frozen per run.
+
+The config is written once to ``run_dir/run_config.json`` and re-read on every subsequent
+launch. That matters because a 4-hour walltime means a long run is a chain of ~40 requeued
+jobs: without pinning, editing the launcher on day three would silently change
+hyperparameters mid-run and the W&B history would be a splice of two different experiments.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import pathlib
+import typing
+
+import tyro
+
+from openpi.mot_jepa.layout import LAYOUT_BASE
+from openpi.mot_jepa.layout import LAYOUT_PILOT
+from openpi.mot_jepa.layout import TokenLayout
+from openpi.mot_jepa.losses import LossConfig
+from openpi.mot_jepa.masking import DEFAULT_MODE_PROBS
+from openpi.mot_jepa.mot_encoder import MoTEncoderConfig
+from openpi.mot_jepa.predictor import MoTPredictorConfig
+from openpi.mot_jepa.rope3d import Rope3DConfig
+
+
+@dataclasses.dataclass(frozen=True)
+class DataConfig:
+    """Where clips come from."""
+
+    domain_config: str = ""
+    """Path to an FTP-1 domain-config JSON (``dataset_zarr.py:2409-2427`` schema)."""
+    store_glob: str = ""
+    """Alternative to ``domain_config``: a glob matching ``*.zarr`` stores directly."""
+    strides: tuple[int, ...] = (1, 2)
+    index_step: int = 1
+    """Stride between enumerated clip starts. Raise it to shrink the index on huge corpora."""
+    num_workers: int = 12
+    prefetch_factor: int = 4
+    lowdim_channels: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class EmaConfig:
+    decay_start: float = 0.998
+    decay_end: float = 0.99999
+    warmup_steps: int = 30_000
+    sync_check_interval: int = 5_000
+    """How often ranks compare shadow checksums; a silent divergence is otherwise invisible."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MaskConfig:
+    mode_probs: tuple[float, ...] = DEFAULT_MODE_PROBS
+    video_mask_frac: float = 0.88
+    x_video_mask_frac: float = 0.75
+    tactile_window_steps: tuple[int, ...] = (2, 3, 4)
+    video_window_steps: tuple[int, ...] = (2, 3, 4)
+    min_targets_per_stream: int = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class MotJepaTrainConfig:
+    """One pretraining run."""
+
+    name: str = "mot_jepa_pilot"
+    exp_name: str = "dev"
+    project_name: str = "mot-jepa"
+    run_root: str = ".cache/mot_jepa/runs"
+
+    layout_preset: str = "pilot"
+    """``pilot`` or ``base``. Selects the token budget; see ``layout.py``."""
+    encoder: MoTEncoderConfig = dataclasses.field(default_factory=MoTEncoderConfig)
+    predictor: MoTPredictorConfig = dataclasses.field(default_factory=MoTPredictorConfig)
+    masking: MaskConfig = dataclasses.field(default_factory=MaskConfig)
+    loss: LossConfig = dataclasses.field(default_factory=LossConfig)
+    ema: EmaConfig = dataclasses.field(default_factory=EmaConfig)
+    data: DataConfig = dataclasses.field(default_factory=DataConfig)
+
+    seed: int = 42
+    local_batch_size: int = 8
+    num_train_steps: int = 200_000
+    lr_peak: float = 1.5e-3
+    lr_end: float = 1e-6
+    lr_warmup_steps: int = 8_000
+    weight_decay: float = 0.04
+    beta1: float = 0.9
+    beta2: float = 0.95
+    clip_grad_norm: float = 1.0
+
+    log_interval: int = 50
+    probe_interval: int = 2_000
+    save_interval: int = 500
+    """Deliberately frequent: a 4-hour job that is preempted loses everything since the last
+    checkpoint, and the save-on-signal path is a backstop rather than a guarantee."""
+    keep_last: int = 3
+    keep_period: int | None = 20_000
+    """Real retention. ``config.keep_period`` is a no-op in the FTP-1 PyTorch saver, which is
+    why a 20k-step run there retains every periodic checkpoint forever."""
+
+    gradient_checkpointing: bool = False
+    wandb_enabled: bool = True
+    compile_model: bool = False
+    find_unused_parameters: bool = True
+    """Required: mask mode ``T_HARD`` removes tactile entirely, so the student's tactile
+    encoder legitimately receives no gradient on ~10% of steps."""
+
+    @property
+    def layout(self) -> TokenLayout:
+        presets = {"pilot": LAYOUT_PILOT, "base": LAYOUT_BASE}
+        if self.layout_preset not in presets:
+            raise ValueError(f"unknown layout_preset={self.layout_preset!r}, expected one of {sorted(presets)}")
+        return presets[self.layout_preset]
+
+    @property
+    def run_dir(self) -> pathlib.Path:
+        return pathlib.Path(self.run_root) / self.name / self.exp_name
+
+    @property
+    def checkpoint_dir(self) -> pathlib.Path:
+        return self.run_dir / "checkpoints"
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> MotJepaTrainConfig:
+        return _from_dict(cls, json.loads(text))
+
+    def diff(self, other: MotJepaTrainConfig) -> dict[str, tuple[object, object]]:
+        """Field-by-field differences, used to warn loudly on a config drift after requeue."""
+        mine, theirs = dataclasses.asdict(self), dataclasses.asdict(other)
+        return {key: (mine[key], theirs[key]) for key in mine if mine[key] != theirs[key]}
+
+
+def _from_dict(cls: type, payload: dict) -> object:
+    """Rebuild a nested frozen dataclass, restoring tuples that JSON turned into lists.
+
+    Annotations are resolved with ``get_type_hints`` rather than read off ``field.type``:
+    this module uses ``from __future__ import annotations``, so ``field.type`` is the *string*
+    ``"DataConfig"``, and testing it with ``dataclasses.is_dataclass`` silently returns False.
+    That would leave every nested section as a raw dict and only surface much later as an
+    ``AttributeError`` deep in the trainer.
+    """
+    hints = typing.get_type_hints(cls)
+    kwargs = {}
+    for field in dataclasses.fields(cls):
+        if field.name not in payload:
+            continue
+        value = payload[field.name]
+        field_type = hints.get(field.name, field.type)
+        if dataclasses.is_dataclass(field_type) and isinstance(value, dict):
+            kwargs[field.name] = _from_dict(field_type, value)
+        elif isinstance(value, list):
+            kwargs[field.name] = tuple(value)
+        else:
+            kwargs[field.name] = value
+    return cls(**kwargs)
+
+
+_PILOT_ROPE = Rope3DConfig(head_dim=64, dim_t=32, dim_h=16, dim_w=16)
+
+#: Named presets. ``debug`` is CPU-runnable and used by the smoke path.
+CONFIGS: dict[str, MotJepaTrainConfig] = {
+    "mot_jepa_debug": MotJepaTrainConfig(
+        name="mot_jepa_debug",
+        layout_preset="pilot",
+        encoder=MoTEncoderConfig(depth=2, num_local_layers=1, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=1, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        num_train_steps=20,
+        local_batch_size=2,
+        lr_warmup_steps=2,
+        save_interval=10,
+        log_interval=1,
+        probe_interval=10,
+        wandb_enabled=False,
+        data=DataConfig(num_workers=0),
+    ),
+    "mot_jepa_pilot": MotJepaTrainConfig(
+        name="mot_jepa_pilot",
+        layout_preset="pilot",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        num_train_steps=50_000,
+        local_batch_size=16,
+    ),
+    "mot_jepa_base": MotJepaTrainConfig(
+        name="mot_jepa_base",
+        layout_preset="base",
+        num_train_steps=200_000,
+        local_batch_size=8,
+    ),
+}
+
+
+def cli() -> MotJepaTrainConfig:
+    """Mirrors the repository's tyro entrypoint style (``training/config.py:1335``)."""
+    return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in CONFIGS.items()})

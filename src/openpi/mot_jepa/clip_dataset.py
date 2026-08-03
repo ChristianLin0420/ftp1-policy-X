@@ -229,18 +229,26 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         return self._stores[store_idx], self._keys[store_idx]
 
     def _read_derived(self, entry: ClipIndexEntry, frames: np.ndarray) -> ClipSample:
-        """Fast path: arrays are already at model resolution and chunk-aligned to a clip."""
+        """Fast path: arrays are already at model resolution and chunk-aligned to a clip.
+
+        A derived store built for one layout can still be read by another (for example the
+        base-resolution store feeding a pilot run), in which case the resize is reinstated for
+        the mismatched stream only. Matching resolutions skip it entirely, which is the point.
+        """
         data = self._stores[entry.store_idx]["data"]
         video = np.asarray(data["video"][frames])
         gel_src = np.asarray(data["gel"][frames])
         lowdim_src = np.asarray(data["lowdim"][frames], dtype=np.float32)
+
+        video = _resize_frames(video, self.layout.video_size)
 
         gel = np.zeros(
             (self.layout.num_frames, self.layout.num_gel_pads, self.layout.gel_size, self.layout.gel_size, 3),
             dtype=np.uint8,
         )
         pads = min(gel_src.shape[1], self.layout.num_gel_pads)
-        gel[:, :pads] = gel_src[:, :pads]
+        for pad in range(pads):
+            gel[:, pad] = _resize_frames(gel_src[:, pad], self.layout.gel_size)
         gel_valid = torch.zeros(self.layout.num_gel_pads, dtype=torch.bool)
         gel_valid[:pads] = True
 
