@@ -198,3 +198,34 @@ uv run python scripts/mot_jepa_build_clip_zarr.py --source <staged> --output <cl
 EXP_NAME=pilot01 NODES=4 STAGE_SOURCE=<clips>/RDP bash scripts_exp_zarr/mot_jepa/submit.sh
 uv run python scripts/mot_jepa_analyze.py --checkpoint <ckpt>/<step> --data-glob '<clips>/*/*.zarr' --output reports/<name>
 ```
+
+### Isaac Sim closed-loop eval: VERIFIED WORKING on this cluster
+
+`scripts_exp_zarr/mot_jepa/isaac_probe.sbatch`, job 6442243, **PASS**:
+
+```json
+{"frame_shape": [240, 320, 4], "frame_dtype": "uint8",
+ "nonblack_fraction": 0.9996, "pixel_std": 57.7, "verdict": "PASS"}
+```
+
+Isaac Sim 4.5.0 starts headless with `enable_cameras` and the RTX renderer produces a real
+frame on an H100 inside `nvcr.io#nvidia/isaac-sim:4.5.0`. H100 having no RT cores is not a
+blocker — consistent with UniVTAC's own "A800 headless" workaround at `envs/_base_task.py:114`.
+
+Two things worth knowing:
+
+- **The `sudo apt-get` steps in `Installation_FTP1.md:105,120` are unnecessary in the
+  container**, which matters because there is no root on compute nodes. The probe found
+  `/usr/share/vulkan/icd.d/` **empty** and no `nvidia_icd.json`, yet rendering works:
+  `libnvidia-glcore` and `libnvoptix` are present and pyxis injects the driver, so Isaac
+  resolves it without the standard ICD file. Do not "fix" the missing ICD.
+- **Verify the frame, not the exit code.** Isaac runs with `--/app/fastShutdown=True`, which
+  can `_exit()` and discard buffered stdout. The first probe attempt exited 0 with every
+  decisive `print` missing from the log — trivially mistaken for a pass. The probe now writes
+  its verdict to `logs/result.json` and the batch script reads the verdict from that file.
+
+Eval Track B is therefore unblocked: fine-tune on `{lift_bottle, lift_can, insert_tube,
+put_bottle_in_shelf}` and evaluate held-out on `{grasp_classify, insert_hole, pull_out_key,
+insert_HDMI}`. Still to change in `UniVTAC/scripts/eval_ftp1.py`: `livestream = 2` at `:1092`
+should become headless, and the `--tactile_mode` ablation injects at `:530-548` using
+`openpi.mot_jepa.ablation`.

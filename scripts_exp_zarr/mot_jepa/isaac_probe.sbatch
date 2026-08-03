@@ -35,9 +35,27 @@ set -uo pipefail
 IMAGE="${IMAGE:-nvcr.io#nvidia/isaac-sim:4.5.0}"
 WORK="${SLURM_SUBMIT_DIR:-$PWD}"
 PROBE_PY="${WORK}/logs/_isaac_probe_${SLURM_JOB_ID}.py"
+RESULT_JSON="${WORK}/logs/_isaac_probe_${SLURM_JOB_ID}.json"
 
 cat > "${PROBE_PY}" <<'PYEOF'
+import json
 import sys
+
+# Results go to a FILE, not stdout. Isaac Sim runs with --/app/fastShutdown=True, which can
+# _exit() and discard buffered stdout -- an earlier run of this probe exited 0 with every
+# decisive print missing from the log, which would have been trivially mistaken for a pass.
+RESULT_PATH = "/probe/result.json"
+result = {"stage": "start"}
+
+
+def record(**kwargs):
+    result.update(kwargs)
+    with open(RESULT_PATH, "w") as handle:
+        json.dump(result, handle, indent=2)
+        handle.flush()
+
+
+record(stage="init")
 
 print("=== 1. Vulkan / GL userspace ===", flush=True)
 import glob
@@ -47,6 +65,13 @@ print("vulkan ICDs:", icds or "NONE")
 print("nvidia ICD present:", any("nvidia" in p.lower() for p in icds))
 print("libnvidia-glcore:", bool(glob.glob("/usr/lib/x86_64-linux-gnu/libnvidia-glcore*")))
 print("libnvoptix:", bool(glob.glob("/usr/lib/x86_64-linux-gnu/libnvoptix*")))
+record(
+    stage="userspace",
+    vulkan_icds=icds,
+    nvidia_icd=any("nvidia" in p.lower() for p in icds),
+    libnvidia_glcore=bool(glob.glob("/usr/lib/x86_64-linux-gnu/libnvidia-glcore*")),
+    libnvoptix=bool(glob.glob("/usr/lib/x86_64-linux-gnu/libnvoptix*")),
+)
 
 print("\n=== 2. SimulationApp headless ===", flush=True)
 from isaacsim import SimulationApp
@@ -74,27 +99,31 @@ try:
     for _ in range(40):
         world.step(render=True)
 
-    frame = annotator.get_data()
-    array = np.asarray(frame)
-    print("frame shape:", array.shape, "dtype:", array.dtype)
+    array = np.asarray(annotator.get_data())
+    record(stage="rendered", frame_shape=list(array.shape), frame_dtype=str(array.dtype))
     if array.size == 0:
-        print("RESULT: FAIL -- renderer returned an empty frame")
+        record(verdict="FAIL", reason="renderer returned an empty frame")
+        app.close()
         sys.exit(2)
     nonzero = float((array[..., :3] > 0).mean())
     spread = float(array[..., :3].std())
-    print(f"non-black pixel fraction: {nonzero:.3f}   pixel std: {spread:.2f}")
-    if nonzero > 0.10 and spread > 1.0:
-        print("RESULT: PASS -- RTX rendering works headless on this GPU inside the container")
-    else:
-        print("RESULT: FAIL -- frame is blank; the RTX path initialized but rendered nothing")
-        sys.exit(3)
+    passed = bool(nonzero > 0.10 and spread > 1.0)
+    record(
+        verdict="PASS" if passed else "FAIL",
+        nonblack_fraction=nonzero,
+        pixel_std=spread,
+        reason=None if passed else "frame is blank; the RTX path initialized but rendered nothing",
+    )
+    print(f"frame {array.shape} nonblack={nonzero:.3f} std={spread:.2f}", flush=True)
+    app.close()
+    sys.exit(0 if passed else 3)
 except Exception as exc:  # noqa: BLE001
     import traceback
+
     traceback.print_exc()
-    print(f"RESULT: FAIL -- {type(exc).__name__}: {exc}")
-    sys.exit(4)
-finally:
+    record(verdict="FAIL", reason=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
     app.close()
+    sys.exit(4)
 PYEOF
 
 echo "[$(date -Is)] isaac probe job=${SLURM_JOB_ID} image=${IMAGE} node=$(hostname)"
@@ -107,8 +136,15 @@ srun --container-image="${IMAGE}" \
 RC=$?
 
 echo "[$(date -Is)] probe exit rc=${RC}"
-case ${RC} in
-  0) echo "GATE: PASS -- build the closed-loop UniVTAC eval track on this container" ;;
-  *) echo "GATE: FAIL (rc=${RC}) -- stay on Track A offline probes; see the traceback above" ;;
+echo "=== result.json ==="
+cat "${WORK}/logs/result.json" 2>/dev/null || echo "(no result.json written)"
+
+# The exit code alone is not evidence: fastShutdown can exit 0 having rendered nothing, and
+# it discards buffered stdout. The verdict must come from the file.
+VERDICT=$(python3 -c "import json;print(json.load(open('${WORK}/logs/result.json'))['verdict'])" 2>/dev/null || echo MISSING)
+echo "[$(date -Is)] verdict=${VERDICT}"
+case "${VERDICT}" in
+  PASS) echo "GATE: PASS -- build the closed-loop UniVTAC eval track on this container"; exit 0 ;;
+  FAIL) echo "GATE: FAIL -- stay on Track A offline probes; see result.json"; exit 1 ;;
+  *)    echo "GATE: INCONCLUSIVE -- no verdict recorded; do not treat rc=${RC} as a pass"; exit 1 ;;
 esac
-exit ${RC}
