@@ -232,22 +232,58 @@ def state_mask(spec: StoreStateSpec) -> np.ndarray:
     return mask
 
 
-def drop_constant_columns(state: np.ndarray, mask: np.ndarray, *, tol: float = 1e-6) -> np.ndarray:
-    """Clear mask bits whose column never varies across the store.
+def sample_actions(
+    state: np.ndarray,
+    episode_ends: np.ndarray,
+    mask: np.ndarray,
+    *,
+    num_frames: int = 16,
+    tubelet: int = 2,
+    num_clips: int = 128,
+    seed: int = 0,
+) -> np.ndarray:
+    """``(n, num_steps - 1, 120)`` actions from clips that stay inside one episode.
 
-    The declared presence of a stream is not evidence that it recorded anything -- exactly
-    the lesson ``is_degenerate`` encodes for tactile, applied here to proprioception. A
-    *static* camera makes ``camera_ego_pose`` constant, so its relative head transform is the
-    identity in every frame: on RH20TCfg5Franka that is nine of nineteen live slots carrying
-    literally zero information, while the mask insists they are present.
+    Clip starts must respect ``episode_ends``: a window straddling a boundary would show a
+    jump that no action produced, which is exactly the spurious variation this is meant to
+    detect the absence of.
+    """
+    ends = np.asarray(episode_ends, dtype=np.int64)
+    starts = np.concatenate([[0], ends[:-1]])
+    span = (num_frames - 1) * 1
+    windows = [(lo, hi - span) for lo, hi in zip(starts, ends, strict=True) if hi - span > lo]
+    if not windows:
+        return np.zeros((0, num_frames // tubelet - 1, ACTION_DIM), dtype=np.float32)
 
-    Dead slots are worse than absent ones. They dilute every masked mean, they let the action
-    embedder spend capacity on a constant, and they make ``mask.sum()`` overstate how much
-    proprioception a domain actually contributes.
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(num_clips):
+        lo, hi = windows[rng.integers(len(windows))]
+        begin = int(rng.integers(lo, hi))
+        out.append(actions_from_state(state[begin : begin + num_frames : tubelet], mask))
+    return np.stack(out)
+
+
+def drop_constant_columns(actions: np.ndarray, mask: np.ndarray, *, tol: float = 1e-6) -> np.ndarray:
+    """Clear mask bits whose ACTION never varies.
+
+    Measured on the *action*, not the state, because the action is what the mask gates. The
+    distinction is not academic: RH20T repositions its camera between episodes but holds it
+    fixed within one, so ``camera_ego_pose`` has a state spread of ~3e-5 across the store --
+    above any sane tolerance -- while the within-clip relative head transform is identically
+    zero in all 128 sampled clips. Testing the state keeps nine dead slots that testing the
+    action removes.
+
+    The declared presence of a stream is not evidence that it recorded anything, which is the
+    lesson ``is_degenerate`` encodes for tactile. Dead slots are worse than absent ones: they
+    dilute every masked mean, let the action embedder spend capacity on a constant, and make
+    ``mask.sum()`` overstate how much proprioception a domain contributes.
     """
     mask = np.asarray(mask).reshape(-1).copy()
-    varies = state.std(axis=0) > tol
-    dead = (mask.astype(bool)) & (~varies)
+    if actions.size == 0:
+        return mask
+    flat = actions.reshape(-1, actions.shape[-1])
+    dead = mask.astype(bool) & (flat.std(axis=0) <= tol)
     if np.any(dead):
         logger.info("dropping %d constant slot(s) from the action mask: %s", int(dead.sum()), np.flatnonzero(dead))
     mask[dead] = 0

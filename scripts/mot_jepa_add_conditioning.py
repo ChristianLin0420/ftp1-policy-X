@@ -115,8 +115,8 @@ def add_conditioning(
     # Tighten against the data, not just the declared streams: a static camera leaves the
     # head block exactly constant, and nine dead slots marked "present" dilute every masked
     # mean and let the action embedder spend capacity on a constant.
-    sample = np.asarray(state_out[:: max(1, total // 4096)], dtype=np.float32)
-    mask = ap.drop_constant_columns(sample, ap.state_mask(spec))
+    mask = ap.state_mask(spec)
+    mask = ap.drop_constant_columns(ap.sample_actions(np.asarray(state_out[:]), episode_ends, mask), mask)
     mask_out = dest_meta.require_array("action_mask", shape=mask.shape, dtype="uint8")
     mask_out[:] = mask
 
@@ -146,11 +146,10 @@ def refresh_mask(dest_path: pathlib.Path) -> dict:
     dest = zarr.open(str(dest_path), mode="r+")
     if "state" not in set(dest["data"].array_keys()):
         return {"status": "skip", "reason": "no data/state"}
-    state = dest["data"]["state"]
-    stride = max(1, state.shape[0] // 4096)
-    sample = np.asarray(state[::stride], dtype=np.float32)
+    state = np.asarray(dest["data"]["state"][:], dtype=np.float32)
+    ends = np.asarray(dest["meta"]["episode_ends"][:], dtype=np.int64)
     before = np.asarray(dest["meta"]["action_mask"][:], dtype=np.uint8)
-    after = ap.drop_constant_columns(sample, before)
+    after = ap.drop_constant_columns(ap.sample_actions(state, ends, before), before)
     dest["meta"]["action_mask"][:] = after
     return {"status": "ok", "before": int(before.sum()), "after": int(after.sum())}
 

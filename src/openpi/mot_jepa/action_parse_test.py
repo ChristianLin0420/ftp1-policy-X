@@ -389,6 +389,9 @@ def test_constant_columns_are_dropped_from_the_mask():
     store, nine of nineteen live slots carrying zero information.
     """
     state = np.zeros((100, ap.ACTION_DIM), dtype=np.float32)
+    # A valid pose needs a real rotation block: an all-zero rot6d is degenerate, and
+    # relative_pose zeroes it, so the wrist would look constant for the wrong reason.
+    state[:, 0:9] = ap.IDENTITY_POSE9D
     state[:, 0:3] = np.random.default_rng(0).normal(size=(100, 3))  # a wrist that moves
     state[:, ap.HEAD_START : ap.HEAD_START + 9] = ap.IDENTITY_POSE9D  # a camera that does not
 
@@ -396,7 +399,8 @@ def test_constant_columns_are_dropped_from_the_mask():
     mask[0:9] = 1
     mask[ap.HEAD_START : ap.HEAD_START + 9] = 1
 
-    tightened = ap.drop_constant_columns(state, mask)
+    ends = np.array([100])
+    tightened = ap.drop_constant_columns(ap.sample_actions(state, ends, mask, num_clips=16), mask)
     assert tightened[0:3].all(), "the moving wrist position must survive"
     assert not tightened[ap.HEAD_START : ap.HEAD_START + 9].any(), "the static head must be dropped"
     assert tightened.sum() < mask.sum()
@@ -404,7 +408,45 @@ def test_constant_columns_are_dropped_from_the_mask():
 
 def test_dropping_constants_never_adds_a_slot():
     rng = np.random.default_rng(1)
-    state = rng.normal(size=(50, ap.ACTION_DIM)).astype(np.float32)
+    state = rng.normal(size=(200, ap.ACTION_DIM)).astype(np.float32)
     mask = (rng.random(ap.ACTION_DIM) > 0.5).astype(np.uint8)
-    tightened = ap.drop_constant_columns(state, mask)
-    assert np.all(tightened <= mask)
+    actions = ap.sample_actions(state, np.array([200]), mask, num_clips=16)
+    assert np.all(ap.drop_constant_columns(actions, mask) <= mask)
+
+
+def test_a_camera_moved_between_episodes_but_static_within_is_still_dropped():
+    """The distinction that made the first version of this fix wrong.
+
+    RH20T repositions its camera between episodes and holds it fixed within one, so the head
+    STATE has a spread of ~3e-5 across the store -- above any sane tolerance -- while the
+    within-clip relative head ACTION is identically zero. Testing the state keeps nine dead
+    slots; testing the action removes them.
+    """
+    head = slice(ap.HEAD_START, ap.HEAD_START + 9)
+    state = np.zeros((200, ap.ACTION_DIM), dtype=np.float32)
+    state[:, 0:9] = ap.IDENTITY_POSE9D
+    state[:, 0:3] = np.random.default_rng(2).normal(size=(200, 3))
+    # Two episodes, each with its own fixed camera pose.
+    state[:100, head] = ap.IDENTITY_POSE9D
+    state[100:, head] = ap.IDENTITY_POSE9D + np.array([0.4, -0.2, 0.1, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+    ends = np.array([100, 200])
+
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[0:9] = 1
+    mask[head] = 1
+
+    assert state[:, head].std(axis=0).max() > 1e-3, "the state does vary -- that is the trap"
+    tightened = ap.drop_constant_columns(ap.sample_actions(state, ends, mask, num_clips=32), mask)
+    assert not tightened[head].any(), "a within-episode-static camera must still be dropped"
+
+
+def test_sampled_clips_never_straddle_an_episode_boundary():
+    """A window crossing a boundary shows a jump no action produced."""
+    state = np.zeros((60, ap.ACTION_DIM), dtype=np.float32)
+    state[:, 0:9] = ap.IDENTITY_POSE9D
+    state[:, 0:3] = np.arange(60)[:, None]  # a hard jump would show up as a huge action
+    state[30:, 0:3] += 1000.0
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[0:9] = 1
+    actions = ap.sample_actions(state, np.array([30, 60]), mask, num_clips=64, seed=3)
+    assert float(np.abs(actions[..., 0:3]).max()) < 100.0, "a clip crossed an episode boundary"
