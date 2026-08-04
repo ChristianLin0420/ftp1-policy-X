@@ -7,6 +7,7 @@ import pytest
 import torch
 import zarr
 
+from openpi.mot_jepa import action_parse as ap
 from openpi.mot_jepa.clip_dataset import ClipIndex
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
@@ -267,3 +268,100 @@ def test_all_stores_unreadable_raises_rather_than_training_on_nothing(tmp_path):
     assert len(ClipIndex.build([str(broken)], num_frames=LAYOUT.num_frames, strides=(1,))) == 0
     with pytest.raises(ValueError, match="no usable clips"):
         MotJepaClipDataset([str(broken)], LAYOUT, strides=(1,))
+
+
+# --------------------------------------------------------------------------------------
+# Post-training conditioning (data/state, meta/action_mask, meta/instruction_id)
+# --------------------------------------------------------------------------------------
+
+
+def add_conditioning_arrays(path: str, episode_lengths: list[int]) -> None:
+    """What ``scripts/mot_jepa_add_conditioning.py`` appends to a derived store."""
+    root = zarr.open(path, mode="r+")
+    total = int(sum(episode_lengths))
+    state = np.tile(np.arange(total, dtype=np.float32)[:, None], (1, ap.ACTION_DIM))
+    root["data"].create_array("state", shape=state.shape, dtype="float32")
+    root["data"]["state"][:] = state
+
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[:10] = 1
+    root["meta"].create_array("action_mask", shape=mask.shape, dtype="uint8")
+    root["meta"]["action_mask"][:] = mask
+
+    ids = np.arange(len(episode_lengths), dtype=np.int32) * 7
+    root["meta"].create_array("instruction_id", shape=ids.shape, dtype="int32")
+    root["meta"]["instruction_id"][:] = ids
+
+
+def test_episode_index_identifies_the_clip_s_own_episode(tmp_path):
+    """The instruction lives per episode, so a wrong episode_idx pairs a clip with the wrong text."""
+    lengths = [10, 12, 9]
+    path = make_store(tmp_path / "eps.zarr", lengths)
+    index = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,))
+    ends = np.cumsum(lengths)
+    starts = np.concatenate([[0], ends[:-1]])
+    for position in range(len(index)):
+        entry = index[position]
+        lo, hi = starts[entry.episode_idx], ends[entry.episode_idx]
+        assert lo <= entry.start < hi, f"clip at {entry.start} tagged episode {entry.episode_idx} = [{lo},{hi})"
+
+
+def test_conditioning_is_off_by_default_and_costs_nothing(tmp_path):
+    """Pretraining has no use for proprioception and must not pay a zarr read for it.
+
+    ``instruction_id`` defaults to -1, not 0: zero is a real vocabulary entry, so defaulting
+    to it would silently pair every unlabelled clip with whichever instruction sorted first.
+    """
+    path = make_store(tmp_path / "plain.zarr", [20])
+    sample = MotJepaClipDataset([path], LAYOUT, strides=(1,))[0]
+    assert sample.state.shape == (LAYOUT.num_frames, ap.ACTION_DIM)
+    assert float(sample.state.abs().sum()) == 0.0
+    assert float(sample.action_mask.sum()) == 0.0
+    assert int(sample.instruction_id) == -1
+
+
+def test_conditioning_reads_the_clip_s_own_frames_and_episode(tmp_path):
+    lengths = [20, 20]
+    path = make_store(tmp_path / "cond.zarr", lengths)
+    add_conditioning_arrays(path, lengths)
+    dataset = MotJepaClipDataset([path], LAYOUT, strides=(1, 2), with_conditioning=True)
+
+    for position in range(len(dataset)):
+        entry = dataset.clip_index[position]
+        sample = dataset[position]
+        expected = entry.start + np.arange(LAYOUT.num_frames) * entry.stride
+        # state was painted with the frame index, so this checks the stride was honoured.
+        np.testing.assert_allclose(sample.state[:, 0].numpy(), expected)
+        assert int(sample.instruction_id) == entry.episode_idx * 7
+        assert float(sample.action_mask.sum()) == 10.0
+
+
+def test_a_store_without_conditioning_still_loads_when_it_is_requested(tmp_path):
+    """A half-migrated corpus must degrade to zeros, not crash a 32-rank job at step 0."""
+    plain = make_store(tmp_path / "plain.zarr", [20])
+    dataset = MotJepaClipDataset([plain], LAYOUT, strides=(1,), with_conditioning=True)
+    sample = dataset[0]
+    assert int(sample.instruction_id) == -1
+    assert float(sample.state.abs().sum()) == 0.0
+
+
+def test_collate_carries_the_conditioning_keys(tmp_path):
+    lengths = [20]
+    path = make_store(tmp_path / "c.zarr", lengths)
+    add_conditioning_arrays(path, lengths)
+    dataset = MotJepaClipDataset([path], LAYOUT, strides=(1,), with_conditioning=True)
+    batch = collate_clips([dataset[0], dataset[1]])
+    assert batch["state"].shape == (2, LAYOUT.num_frames, ap.ACTION_DIM)
+    assert batch["action_mask"].shape == (2, ap.ACTION_DIM)
+    assert batch["instruction_id"].shape == (2,)
+
+
+def test_an_old_three_column_index_upgrades_rather_than_mis_indexing(tmp_path):
+    path = make_store(tmp_path / "s.zarr", [20])
+    index = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,))
+    legacy = tmp_path / "legacy.npz"
+    np.savez(legacy, entries=index.entries[:, :3], store_paths=np.asarray([path], dtype=object))
+
+    upgraded = ClipIndex.load(legacy)
+    assert upgraded.entries.shape[1] == 4
+    assert upgraded[0].episode_idx == 0

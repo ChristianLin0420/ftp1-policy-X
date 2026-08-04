@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import zarr
 
+from openpi.mot_jepa import action_parse as ap
 from openpi.mot_jepa import tactile_parse as tp
 from openpi.mot_jepa.layout import TokenLayout
 
@@ -129,21 +130,25 @@ class ClipIndexEntry:
     store_idx: int
     start: int
     stride: int
+    episode_idx: int = 0
+    """Which episode this clip lies in. Free here -- ``build`` already walks episodes -- and
+    it is how a clip reaches its instruction, which is stored per episode rather than per
+    frame because it is constant within an episode in every domain of the release."""
 
 
 class ClipIndex:
     """Every clip start that fits entirely inside one episode."""
 
     def __init__(self, entries: np.ndarray, store_paths: list[str]) -> None:
-        self.entries = entries  # (N, 3) int64 = (store_idx, start, stride)
+        self.entries = entries  # (N, 4) int64 = (store_idx, start, stride, episode_idx)
         self.store_paths = store_paths
 
     def __len__(self) -> int:
         return int(self.entries.shape[0])
 
     def __getitem__(self, index: int) -> ClipIndexEntry:
-        store_idx, start, stride = (int(v) for v in self.entries[index])
-        return ClipIndexEntry(store_idx=store_idx, start=start, stride=stride)
+        store_idx, start, stride, episode_idx = (int(v) for v in self.entries[index])
+        return ClipIndexEntry(store_idx=store_idx, start=start, stride=stride, episode_idx=episode_idx)
 
     @classmethod
     def build(
@@ -179,7 +184,7 @@ class ClipIndex:
                 unreadable.append(path)
                 continue
             starts = np.concatenate([[0], ends[:-1]])
-            for episode_start, episode_end in zip(starts, ends, strict=True):
+            for episode_idx, (episode_start, episode_end) in enumerate(zip(starts, ends, strict=True)):
                 for stride in strides:
                     span = (num_frames - 1) * stride
                     last_start = episode_end - 1 - span
@@ -192,11 +197,12 @@ class ClipIndex:
                                 np.full(candidates.shape, store_idx, dtype=np.int64),
                                 candidates,
                                 np.full(candidates.shape, stride, dtype=np.int64),
+                                np.full(candidates.shape, episode_idx, dtype=np.int64),
                             ],
                             axis=1,
                         )
                     )
-        entries = np.concatenate(rows, axis=0) if rows else np.zeros((0, 3), dtype=np.int64)
+        entries = np.concatenate(rows, axis=0) if rows else np.zeros((0, 4), dtype=np.int64)
         if unreadable:
             logger.warning("%d of %d stores were unreadable and excluded", len(unreadable), len(store_paths))
         return cls(entries, store_paths)
@@ -207,7 +213,14 @@ class ClipIndex:
     @classmethod
     def load(cls, path: str | pathlib.Path) -> ClipIndex:
         payload = np.load(path, allow_pickle=True)
-        return cls(payload["entries"], [str(p) for p in payload["store_paths"]])
+        entries = payload["entries"]
+        if entries.shape[1] == 3:
+            # An index saved before episode_idx existed. Upgrading in place keeps a cached
+            # index usable rather than silently mis-indexing instructions, which would pair
+            # every clip with episode 0's text.
+            logger.warning("upgrading a 3-column clip index from %s; episode_idx will be 0", path)
+            entries = np.concatenate([entries, np.zeros((entries.shape[0], 1), dtype=np.int64)], axis=1)
+        return cls(entries, [str(p) for p in payload["store_paths"]])
 
 
 def _resize_frames(frames: np.ndarray, size: int) -> np.ndarray:
@@ -234,6 +247,13 @@ class ClipSample:
     store_idx: torch.Tensor  # () int64
     start: torch.Tensor  # () int64
     stride: torch.Tensor  # () int64
+    # Post-training conditioning. Always present so the batch dict has a stable key set --
+    # a shape that varied with the store would deadlock DDP's all-reduce -- but only filled
+    # when the dataset is built with ``with_conditioning=True``.
+    state: torch.Tensor  # (T, 120) float32
+    action_mask: torch.Tensor  # (120,) float32
+    instruction_id: torch.Tensor  # () int64
+    episode_idx: torch.Tensor  # () int64
 
 
 class MotJepaClipDataset(torch.utils.data.Dataset):
@@ -250,12 +270,16 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         clip_index: ClipIndex | None = None,
         lowdim_channels: int | None = None,
         prefer_rgb: str | None = None,
+        with_conditioning: bool = False,
     ) -> None:
         self.store_paths = list(store_paths)
         self.layout = layout
         self.domain_ids = domain_ids or [0] * len(store_paths)
         self.lowdim_channels = layout.lowdim_channels if lowdim_channels is None else lowdim_channels
         self.prefer_rgb = prefer_rgb
+        # Off by default: pretraining has no use for proprioception, and reading it would add
+        # a zarr access per clip for nothing.
+        self.with_conditioning = with_conditioning
         self.clip_index = clip_index or ClipIndex.build(
             self.store_paths, num_frames=layout.num_frames, strides=strides, step=index_step
         )
@@ -269,6 +293,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         self._keys: dict[int, StoreKeys] = {}
         self._derived: dict[int, bool] = {}
         self._spec_cache: dict[int, list[tp.TactileSpec]] = {}
+        self._conditioned: dict[int, bool] = {}
 
     def __len__(self) -> int:
         return len(self.clip_index)
@@ -282,7 +307,36 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             specs = [] if self._derived[store_idx] else tp.specs_for_store(group["data"])
             self._spec_cache[store_idx] = specs
             self._warn_on_overflow(store_idx, specs)
+            has_state = "state" in set(group["data"].array_keys())
+            self._conditioned[store_idx] = has_state
+            if self.with_conditioning and not has_state:
+                logger.warning(
+                    "%s has no data/state; run scripts/mot_jepa_add_conditioning.py. "
+                    "Its clips will carry zeros and instruction_id -1",
+                    self.store_paths[store_idx],
+                )
         return self._stores[store_idx], self._keys[store_idx]
+
+    def _conditioning(self, entry: ClipIndexEntry, frames: np.ndarray) -> dict[str, torch.Tensor]:
+        """State, action mask and instruction id for one clip.
+
+        Absent conditioning yields zeros and ``instruction_id = -1`` rather than ``0``: zero
+        is a real vocabulary entry, so defaulting to it would quietly pair unlabelled clips
+        with whichever instruction sorted first.
+        """
+        out = {
+            "state": torch.zeros(self.layout.num_frames, ap.ACTION_DIM, dtype=torch.float32),
+            "action_mask": torch.zeros(ap.ACTION_DIM, dtype=torch.float32),
+            "instruction_id": torch.tensor(-1, dtype=torch.int64),
+            "episode_idx": torch.tensor(entry.episode_idx, dtype=torch.int64),
+        }
+        if not (self.with_conditioning and self._conditioned[entry.store_idx]):
+            return out
+        group = self._stores[entry.store_idx]
+        out["state"] = torch.from_numpy(np.asarray(group["data"]["state"][frames], dtype=np.float32))
+        out["action_mask"] = torch.from_numpy(np.asarray(group["meta"]["action_mask"][:], dtype=np.float32))
+        out["instruction_id"] = torch.tensor(int(group["meta"]["instruction_id"][entry.episode_idx]), dtype=torch.int64)
+        return out
 
     def _specs(self, store_idx: int) -> list[tp.TactileSpec]:
         return self._spec_cache[store_idx]
@@ -354,6 +408,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             store_idx=torch.tensor(entry.store_idx, dtype=torch.int64),
             start=torch.tensor(entry.start, dtype=torch.int64),
             stride=torch.tensor(entry.stride, dtype=torch.int64),
+            **self._conditioning(entry, frames),
         )
 
     def __getitem__(self, index: int) -> ClipSample:
@@ -407,6 +462,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             store_idx=torch.tensor(entry.store_idx, dtype=torch.int64),
             start=torch.tensor(entry.start, dtype=torch.int64),
             stride=torch.tensor(entry.stride, dtype=torch.int64),
+            **self._conditioning(entry, frames),
         )
 
 

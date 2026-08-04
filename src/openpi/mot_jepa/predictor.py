@@ -90,6 +90,11 @@ class MoTPredictor(nn.Module):
         self.mode_embed = nn.Embedding(len(MaskMode), config.width)
         nn.init.zeros_(self.mode_embed.weight)
 
+        # Tubelet step of every global token index, used to place per-step conditioning on
+        # the mask tokens. Non-persistent, like the RoPE tables: derived from the layout, so
+        # it neither enters a checkpoint nor goes stale.
+        self.register_buffer("token_step", layout.coords[:, 0].contiguous(), persistent=False)
+
         self._gradient_checkpointing = False
 
     def set_gradient_checkpointing(self, *, enabled: bool) -> None:
@@ -115,6 +120,7 @@ class MoTPredictor(nn.Module):
         context_index: list[torch.Tensor],
         target_index: list[torch.Tensor],
         mode: torch.Tensor,
+        cond: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """Predict target embeddings.
 
@@ -123,12 +129,19 @@ class MoTPredictor(nn.Module):
             context_index: Per-expert ``(B, L_ctx_e)`` global token indices.
             target_index: Per-expert ``(B, L_tgt_e)`` global token indices.
             mode: Scalar :class:`MaskMode` value for this batch.
+            cond: Optional ``(B, num_steps, width)`` per-timestep conditioning, added to each
+                mask token at *that token's own* tubelet step. Used by action post-training
+                so the action applied between steps *t* and *t+1* reaches exactly the tokens
+                it explains. ``None`` reproduces pretraining bit-for-bit, and pretraining
+                never passes it.
 
         Returns:
             Per-expert ``(B, L_tgt_e, width_e)`` predictions in encoder/teacher space.
         """
         if not len(context) == len(context_index) == len(target_index) == NUM_EXPERTS:
             raise ValueError("context, context_index and target_index must each have one entry per expert")
+        if cond is not None and cond.shape[1] != self.layout.num_steps:
+            raise ValueError(f"cond must be (B, {self.layout.num_steps}, width), got {tuple(cond.shape)}")
 
         mode_vector = self.mode_embed(mode.reshape(()).to(torch.long))
 
@@ -138,6 +151,9 @@ class MoTPredictor(nn.Module):
             num_targets = target_index[expert].shape[1]
             batch = ctx.shape[0]
             masks = self.mask_token[expert].expand(batch, num_targets, -1) + mode_vector
+            if cond is not None:
+                steps = self.token_step[target_index[expert]]  # (B, L_tgt_e)
+                masks = masks + torch.gather(cond, 1, steps[..., None].expand(-1, -1, cond.shape[-1]))
             xs.append(torch.cat([ctx, masks], dim=1))
             joint_index = torch.cat([context_index[expert], target_index[expert]], dim=1)
             rope.append(self.rope.gather(joint_index))
