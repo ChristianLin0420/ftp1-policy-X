@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
+from openpi.mot_jepa.config import _from_dict
 from openpi.mot_jepa.ema import EmaTeacher
 from openpi.mot_jepa.layout import StreamId
 from openpi.mot_jepa.losses import LossConfig
 from openpi.mot_jepa.losses import MotJepaLoss
 from openpi.mot_jepa.losses import _center_by_slot
+from openpi.mot_jepa.losses import jepa_direction_loss
 from openpi.mot_jepa.losses import jepa_regression_loss
+from openpi.mot_jepa.losses import latent_loss
 from openpi.mot_jepa.losses import normalize_targets
 from openpi.mot_jepa.losses import sync_loss_level_a
 from openpi.mot_jepa.losses import sync_loss_level_b
@@ -209,3 +214,77 @@ def test_target_gathering_covers_every_stream():
     for stream in (StreamId.VIDEO, StreamId.GEL, StreamId.LOWDIM):
         lo, hi = (int(v) for v in masks.tgt_bounds[int(stream)])
         assert hi > lo
+
+
+# --------------------------------------------------------------------------------------
+# Selectable latent objective
+# --------------------------------------------------------------------------------------
+
+
+def test_direction_loss_is_zero_on_a_perfect_prediction():
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(4, 7, 32))
+    assert float(jepa_direction_loss(target.clone(), target)) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_direction_loss_penalises_an_inverted_prediction():
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(4, 7, 32))
+    # Anti-parallel but same norm: direction term is 2, Huber term is 0.
+    assert float(jepa_direction_loss(-target, target)) == pytest.approx(2.0, abs=1e-4)
+
+
+def test_direction_loss_ignores_prediction_scale_but_not_direction():
+    """Scale is uninformative -- LayerNorm fixes every target norm to sqrt(D) -- so only the
+    Huber anchor should react to it, and the cosine part should not."""
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(4, 7, 32))
+    plain = jepa_direction_loss(target * 3.0, target, beta=0.0)
+    assert float(plain) == pytest.approx(0.0, abs=1e-5)
+    anchored = jepa_direction_loss(target * 3.0, target, beta=1.0)
+    assert float(anchored) > 1.0, "the Huber anchor must react to a 3x norm"
+
+
+def test_direction_loss_is_immune_to_a_constant_shift():
+    """The target is centred by LayerNorm; a DC offset on the prediction carries no signal and
+    would otherwise depress the cosine purely by inflating its norm."""
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(4, 7, 32))
+    shifted = target + 5.0
+    assert float(jepa_direction_loss(shifted, target, beta=0.0)) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_direction_loss_honours_the_valid_mask():
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(4, 6, 16))
+    prediction = target.clone()
+    prediction[:, 3:] = -prediction[:, 3:]  # corrupt the second half
+    valid = torch.zeros(4, 6, dtype=torch.bool)
+    valid[:, :3] = True
+    assert float(jepa_direction_loss(prediction, target, valid)) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_empty_selection_returns_zero_for_both_objectives():
+    empty = torch.zeros(2, 0, 8)
+    assert float(jepa_direction_loss(empty, empty)) == 0.0
+    assert float(jepa_regression_loss(empty, empty)) == 0.0
+
+
+def test_latent_loss_dispatches_and_refuses_an_unknown_name():
+    torch.manual_seed(0)
+    target = normalize_targets(torch.randn(2, 5, 16))
+    prediction = torch.randn(2, 5, 16)
+    assert torch.equal(latent_loss("l1", prediction, target), jepa_regression_loss(prediction, target))
+    assert torch.equal(latent_loss("direction", prediction, target), jepa_direction_loss(prediction, target))
+    with pytest.raises(ValueError, match="unknown objective"):
+        latent_loss("cosine", prediction, target)
+
+
+def test_a_frozen_config_without_the_new_keys_rebuilds_as_l1():
+    """probe2 is mid-flight with a run_config.json predating these fields. A requeue must
+    reconstruct exactly the behaviour it has been training with, not silently switch objective.
+    """
+    frozen = json.dumps({"weight_video": 1.0, "weight_tactile": 1.0})
+    rebuilt = _from_dict(LossConfig, json.loads(frozen))
+    assert rebuilt.video_objective == "l1"
+    assert rebuilt.gel_objective == "l1"

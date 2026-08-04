@@ -16,12 +16,15 @@ import torch
 from openpi.mot_jepa.ema import EmaTeacher
 from openpi.mot_jepa.losses import LossConfig
 from openpi.mot_jepa.losses import MotJepaLoss
+from openpi.mot_jepa.losses import normalize_targets
 from openpi.mot_jepa.model import MotJepaStudent
 from openpi.mot_jepa.mot_encoder import MoTEncoderConfig
 from openpi.mot_jepa.mot_encoder_test import TINY_LAYOUT
 from openpi.mot_jepa.mot_encoder_test import TINY_ROPE
 from openpi.mot_jepa.predictor import MoTPredictorConfig
 from openpi.mot_jepa.probes import ProbeSuite
+from openpi.mot_jepa.probes import _between_clip_dispersion
+from openpi.mot_jepa.probes import _permute_time
 from openpi.mot_jepa.probes import cross_modal_retrieval
 from openpi.mot_jepa.probes import donor_ratio
 from openpi.mot_jepa.probes import rankme
@@ -68,7 +71,7 @@ def test_probe_suite_runs_under_both_precisions(use_autocast):
         "donor_ratio",
         "rankme_video",
         "rankme_tactile",
-        "teacher_target_std",
+        "teacher_dispersion",
     }
     assert expected <= set(metrics)
     assert all(isinstance(value, float) for value in metrics.values())
@@ -123,3 +126,73 @@ def test_rankme_is_low_for_a_collapsed_matrix_and_high_for_a_full_rank_one():
 def test_rankme_handles_degenerate_input():
     assert rankme(torch.zeros(0, 4)) != rankme(torch.zeros(0, 4)) or True  # must not raise
     assert rankme(torch.randn(4)) != rankme(torch.randn(4)) or True
+
+
+# --------------------------------------------------------------------------------------
+# Repaired probes
+# --------------------------------------------------------------------------------------
+
+
+def test_time_permutation_preserves_marginals_exactly():
+    """That preservation is the whole point: it isolates timing from content.
+
+    The clip-mean control changes the marginals as well, so retrieval surviving it is
+    ambiguous. Retrieval surviving THIS is unambiguous -- nothing but the ordering changed.
+    """
+    torch.manual_seed(0)
+    clip = torch.randn(3, 8, 2, 3, 4, 4)
+    shuffled = _permute_time(clip, seed=0)
+
+    torch.testing.assert_close(clip.mean(dim=1), shuffled.mean(dim=1))
+    torch.testing.assert_close(clip.std(dim=1), shuffled.std(dim=1))
+    # Same multiset of frames per clip, in a different order.
+    torch.testing.assert_close(clip.sort(dim=1).values, shuffled.sort(dim=1).values)
+    assert not torch.equal(clip, shuffled), "the ordering must actually change"
+
+
+def test_time_permutation_is_stable_across_calls():
+    """A control that reshuffles every step measures its own noise, not the model."""
+    torch.manual_seed(0)
+    clip = torch.randn(2, 8, 4)
+    assert torch.equal(_permute_time(clip, seed=0), _permute_time(clip, seed=0))
+
+
+def test_no_within_token_std_can_detect_collapse():
+    """Why the collapse detector had to change shape, not just move.
+
+    MoTEncoder ends in a learned LayerNorm, so anything measured *inside* a token is
+    re-standardised on the way out and reports the norm's gain. Even the parameter-free
+    normalize_targets only attenuates once the per-token std nears its 1e-5 eps: a
+    hundred-fold shrink (5.0 -> 0.05) moves it 0.2%. The live run read 0.9999931 -> 0.9999913
+    across 14k steps -- 2e-6 of movement.
+    """
+    healthy = torch.randn(4, 16, 32) * 5.0
+    shrinking = torch.randn(4, 16, 32) * 0.05  # 100x smaller, far above the eps floor
+    assert float(normalize_targets(healthy).std()) == pytest.approx(1.0, abs=5e-3)
+    assert float(normalize_targets(shrinking).std()) == pytest.approx(1.0, abs=5e-3)
+
+
+def test_between_clip_dispersion_detects_collapse_that_std_cannot():
+    """The failure worth catching is every clip mapping to the same representation."""
+    torch.manual_seed(0)
+    healthy = torch.randn(8, 16, 32)
+    # Collapsed: identical per-clip content, with only within-clip token noise left.
+    collapsed = torch.randn(1, 16, 32).expand(8, -1, -1) + 1e-4 * torch.randn(8, 16, 32)
+
+    assert _between_clip_dispersion(healthy) > 0.1
+    assert _between_clip_dispersion(collapsed) < 1e-3
+
+    # And the point: a within-token std is identical for both, so it sees nothing.
+    assert float(normalize_targets(healthy).std()) == pytest.approx(float(normalize_targets(collapsed).std()), abs=1e-2)
+
+
+def test_donor_ratio_is_one_when_the_prediction_ignores_the_clip():
+    """The documented semantics: 1.0 means the prediction is as close to another clip's
+    target as to its own."""
+    torch.manual_seed(0)
+    target = torch.randn(8, 5, 16)
+    constant = target.mean(dim=0, keepdim=True).expand_as(target)
+    assert donor_ratio(constant, target) == pytest.approx(1.0, abs=0.15)
+    # Near-perfect rather than exact: an exact match makes true_error zero, which the
+    # div-by-zero guard reports as NaN by design.
+    assert donor_ratio(target + 1e-3 * torch.randn_like(target), target) > 5.0

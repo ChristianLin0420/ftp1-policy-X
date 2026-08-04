@@ -91,6 +91,49 @@ def _flatten_clip_mean(tensor: torch.Tensor, time_dim: int = 1) -> torch.Tensor:
     return tensor.mean(dim=time_dim, keepdim=True).expand_as(tensor).contiguous()
 
 
+def _permute_time(tensor: torch.Tensor, *, seed: int, time_dim: int = 1) -> torch.Tensor:
+    """Shuffle frames within each clip, leaving the multiset of frames untouched.
+
+    The marginal statistics of the clip are preserved *exactly* -- same frames, same mean,
+    same variance, same histogram -- and only the ordering is destroyed. That is the contrast
+    the clip-mean control cannot draw, and it is the one the thesis needs: the FTP-1 ablation
+    found ``shuffle ~ real``, meaning the policy read tactile marginals rather than
+    correspondence, and this control asks the same question of the encoder.
+
+    A fixed permutation per call (not per sample) so the number is comparable across steps.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    order = torch.randperm(tensor.shape[time_dim], generator=generator).to(tensor.device)
+    return tensor.index_select(time_dim, order).contiguous()
+
+
+def _between_clip_dispersion(tokens: torch.Tensor) -> float:
+    """How much clips differ from each other, per channel. Collapse drives this to zero.
+
+    Deliberately a *between-sample* statistic. Every within-token measure is blind here: the
+    encoder ends in a learned LayerNorm, so the std inside a token reports the norm's gain, not
+    the representation. Averaging tokens per clip first and then taking the spread across the
+    batch is untouched by that, because LayerNorm normalizes across channels rather than across
+    samples.
+    """
+    if tokens.shape[0] < 2:
+        return float("nan")
+    per_clip = tokens.float().mean(dim=1)
+    return float(per_clip.std(dim=0).mean())
+
+
+def _gather_targets(tokens: torch.Tensor, masks, layout: TokenLayout, expert: int) -> torch.Tensor:
+    """Slice a teacher's full-clip output down to the masked target positions.
+
+    Mirrors ``scripts/mot_jepa_train.gather_targets``; duplicated here rather than imported
+    because ``probes`` must not depend on the training entrypoint.
+    """
+    offset = 0 if expert == 0 else layout.num_video_tokens
+    lo, hi = (int(v) for v in masks.tgt_expert_bounds[expert])
+    index = (masks.tgt_index[:, lo:hi] - offset).to(tokens.device)
+    return tokens.gather(1, index[..., None].expand(-1, -1, tokens.shape[-1]))
+
+
 class ProbeSuite:
     """Runs the four probes on a held-out batch."""
 
@@ -134,6 +177,7 @@ class ProbeSuite:
         *,
         layout: TokenLayout | None = None,
         projectors=None,
+        masks=None,
         collect_panels: bool = False,
     ) -> dict:
         """Compute all probes on the next batch from ``loader_iter``.
@@ -202,15 +246,53 @@ class ProbeSuite:
             # The headline is the gap, not the raw number.
             metrics["retrieval_gap"] = metrics.get("retrieval_top1", float("nan")) - metrics["shortcut_top1"]
 
+            # P2b: the control that actually tests BINDING. Permuting tactile along time within
+            # each clip preserves that clip's marginal statistics *exactly* and destroys only
+            # the timing, so retrieval that survives it is reading marginals -- which is the
+            # `shuffle == real` failure this design exists to defeat. The clip-mean control
+            # above cannot draw that distinction: it changes the marginals too, and each clip's
+            # mean still differs, so across-sample retrieval can legitimately survive it.
+            shuffle_inputs = ClipInputs(
+                video=inputs.video,
+                gel=_permute_time(inputs.gel, seed=0),
+                lowdim=_permute_time(inputs.lowdim, seed=0),
+            )
+            with amp():
+                shuffled = student.backbone.encode_full(shuffle_inputs)
+                shuffle_video, shuffle_tactile = self._pool(shuffled, projectors)
+            shuffle_metrics = cross_modal_retrieval(shuffle_video, shuffle_tactile, ks=(1,))
+            metrics["timeshuffle_top1"] = shuffle_metrics["retrieval_top1"]
+            metrics["timeshuffle_gap"] = metrics.get("retrieval_top1", float("nan")) - metrics["timeshuffle_top1"]
+
             with amp():
                 teacher_out = teacher.module.encode_full(inputs)
-            tactile_tokens = normalize_targets(teacher_out.tokens[1])
-            student_tactile = normalize_targets(encoded.tokens[1])
-            metrics["donor_ratio"] = donor_ratio(student_tactile, tactile_tokens)
+
+            # P3 measured on the PREDICTOR, as documented. Comparing the student's own encoding
+            # to the EMA teacher's encoding of the same clip -- which is what this used to do --
+            # asks whether an EMA pair agrees with itself. It does, by construction, so it read
+            # 10.7 and rising while saying nothing about the JEPA path.
+            metrics["donor_ratio"] = float("nan")
+            metrics["donor_ratio_video"] = float("nan")
+            if masks is not None:
+                with amp():
+                    out = student(inputs, masks)
+                targets = [
+                    normalize_targets(_gather_targets(tokens, masks, layout, expert))
+                    for expert, tokens in enumerate(teacher_out.tokens)
+                ]
+                metrics["donor_ratio"] = donor_ratio(out.predictions[1].to(torch.float32), targets[1])
+                metrics["donor_ratio_video"] = donor_ratio(out.predictions[0].to(torch.float32), targets[0])
 
             metrics["rankme_video"] = rankme(encoded.tokens[0].flatten(0, 1))
             metrics["rankme_tactile"] = rankme(encoded.tokens[1].flatten(0, 1))
-            metrics["teacher_target_std"] = float(tactile_tokens.std())
+            # Collapse here means every CLIP mapping to the same representation, which is a
+            # between-sample property. The old `teacher_target_std` measured the std *within* a
+            # token, and no placement of that measurement can work: MoTEncoder ends in a learned
+            # LayerNorm (`mot_encoder.py:261`), so its output std is ~||gamma|| regardless of
+            # what the residual stream does. It read 0.9999931 for 14k steps because it was
+            # reporting the norm's gain, not the representation.
+            metrics["teacher_dispersion"] = _between_clip_dispersion(teacher_out.tokens[1])
+            metrics["student_dispersion"] = _between_clip_dispersion(encoded.tokens[1])
         except StopIteration:  # pragma: no cover - infinite sampler makes this unreachable
             return metrics
         finally:

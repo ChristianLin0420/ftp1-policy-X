@@ -430,6 +430,7 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
                 device,
                 layout=layout,
                 projectors=loss_fn.projectors,
+                masks=masks,
                 collect_panels=want_panels,
             )
             if runtime.is_main_process():

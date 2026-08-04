@@ -56,6 +56,17 @@ class LossConfig:
     lowdim_ema_momentum: float = 0.99
     gather_negatives: bool = True
 
+    video_objective: str = "l1"
+    gel_objective: str = "l1"
+    """``l1`` or ``direction``. Per stream rather than one global knob: MoT shares a single
+    attention, so switching only the tactile term also shifts that expert's gradient scale
+    relative to video. Keeping them separable lets that be ablated instead of confounded.
+
+    The low-dimensional term is deliberately not selectable -- see :func:`jepa_direction_loss`.
+    """
+    direction_beta: float = 0.25
+    direction_delta: float = 1.0
+
 
 def normalize_targets(x: torch.Tensor) -> torch.Tensor:
     """Parameter-free LayerNorm over the feature axis, in fp32.
@@ -74,10 +85,80 @@ def jepa_regression_loss(
     if prediction.numel() == 0:
         return prediction.new_zeros(())
     error = (prediction.to(torch.float32) - target.detach()).abs().mean(dim=-1)
+    return _reduce(error, valid)
+
+
+def _reduce(error: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
     if valid is None:
         return error.mean()
     weights = valid.to(error.dtype)
     return (error * weights).sum() / weights.sum().clamp(min=1.0)
+
+
+def jepa_direction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor | None = None,
+    *,
+    beta: float = 0.25,
+    delta: float = 1.0,
+) -> torch.Tensor:
+    """``(1 - cos) + beta * huber(||pred|| - ||target||)``, direction first.
+
+    ``normalize_targets`` is *parameter-free* LayerNorm, so every target has unit variance over
+    its ``D`` channels and therefore ``||z*|| = sqrt(D)`` exactly. The target magnitude carries
+    no information at all, yet the L1 form spends part of its gradient budget matching it --
+    the tactile predictor has to learn to emit vectors of norm ~19.6 before direction matters.
+    This objective optimizes only the informative part and anchors the norm cheaply.
+
+    Two details that are not cosmetic:
+
+    **The prediction is centered before the cosine.** Cosine is scale-invariant but *not*
+    shift-invariant, and the target is centered by LayerNorm. Any component of the prediction
+    along the all-ones direction is orthogonal to the target, contributes nothing to the
+    numerator, and inflates the denominator -- it strictly lowers the cosine. The model would
+    learn to center itself; doing it here is free and faster.
+
+    **The Huber term is load-bearing, not decoration.** ``d(cos)/d(pred)`` scales as
+    ``1/||pred||`` and diverges as predictions shrink, so an unanchored direction loss is
+    unstable near zero. Because ``||z*||`` is a known constant this anchor is nearly free
+    supervision.
+
+    Not offered for the low-dimensional stream: that term is centered per slot, variance-gated
+    and self-normalized (``_center_by_slot`` and the ``lowdim_scale`` buffer), so its target has
+    no fixed norm and the premise above does not hold.
+    """
+    if prediction.numel() == 0:
+        return prediction.new_zeros(())
+    prediction = prediction.to(torch.float32)
+    target = target.detach()
+
+    centered = prediction - prediction.mean(dim=-1, keepdim=True)
+    cosine = F.cosine_similarity(centered, target, dim=-1, eps=1e-6)
+    norm_gap = centered.norm(dim=-1) - target.norm(dim=-1)
+    huber = F.huber_loss(norm_gap, torch.zeros_like(norm_gap), reduction="none", delta=delta)
+    return _reduce((1.0 - cosine) + beta * huber, valid)
+
+
+#: Dispatch table. ``l1`` is the default everywhere, so an existing frozen config -- which has
+#: no objective key at all -- rebuilds to exactly the behaviour it was trained with.
+LATENT_OBJECTIVES = {"l1": jepa_regression_loss, "direction": jepa_direction_loss}
+
+
+def latent_loss(
+    objective: str,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor | None = None,
+    *,
+    beta: float = 0.25,
+    delta: float = 1.0,
+) -> torch.Tensor:
+    if objective not in LATENT_OBJECTIVES:
+        raise ValueError(f"unknown objective {objective!r}, expected one of {sorted(LATENT_OBJECTIVES)}")
+    if objective == "l1":
+        return jepa_regression_loss(prediction, target, valid)
+    return jepa_direction_loss(prediction, target, valid, beta=beta, delta=delta)
 
 
 class AllGatherWithGrad(torch.autograd.Function):
@@ -260,8 +341,20 @@ class MotJepaLoss(nn.Module):
         gel_pred, lowdim_pred = self._split_tactile(tactile_pred, masks)
         gel_tgt, lowdim_tgt = self._split_tactile(tactile_tgt, masks)
 
-        loss_video = jepa_regression_loss(video_pred, video_tgt)
-        loss_gel = jepa_regression_loss(gel_pred, gel_tgt)
+        loss_video = latent_loss(
+            self.config.video_objective,
+            video_pred,
+            video_tgt,
+            beta=self.config.direction_beta,
+            delta=self.config.direction_delta,
+        )
+        loss_gel = latent_loss(
+            self.config.gel_objective,
+            gel_pred,
+            gel_tgt,
+            beta=self.config.direction_beta,
+            delta=self.config.direction_delta,
+        )
 
         # -- low-dim: centered, variance-gated, self-normalized ------------------------
         if lowdim_pred.shape[1] > 0:
