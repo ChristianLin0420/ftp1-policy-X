@@ -92,6 +92,11 @@ class MotJepaTrainConfig:
 
     log_interval: int = 50
     probe_interval: int = 2_000
+    probe_batches: int = 16
+    """Retrieval candidates = probe_batches * local_batch_size. At 1 the pool is one batch and
+    every derived gap is quantised to 1/16, which is coarser than the effect being measured:
+    a timeshuffle_gap series of 0.0625, 0.125, 0.0 is one clip, two clips, zero clips. The
+    design specified 256 candidates. Each extra batch is one forward at the probe interval."""
     save_interval: int = 500
     """Deliberately frequent: a 4-hour job that is preempted loses everything since the last
     checkpoint, and the save-on-signal path is a backstop rather than a guarantee."""

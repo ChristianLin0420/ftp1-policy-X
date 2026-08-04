@@ -336,7 +336,7 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
         video_window_steps=cfg.masking.video_window_steps,
         min_targets_per_stream=cfg.masking.min_targets_per_stream,
     )
-    probes = ProbeSuite(layout)
+    probes = ProbeSuite(layout, max_batches=cfg.probe_batches)
     monitor = runtime.PreemptionMonitor(run_dir / "PREEMPT_REQUEST", device)
 
     records: list[dict[str, float]] = []

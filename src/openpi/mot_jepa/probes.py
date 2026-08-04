@@ -149,6 +149,8 @@ class ProbeSuite:
         #: Tensors from the most recent run, kept only when ``collect_panels=True`` so a
         #: caller can render figures without paying for a second forward pass.
         self.panels: dict[str, torch.Tensor] = {}
+        self._last_batch = None
+        self._last_inputs = None
 
     @staticmethod
     def _pool(encoder_output, projectors) -> tuple[torch.Tensor, torch.Tensor]:
@@ -166,6 +168,58 @@ class ProbeSuite:
             video = projectors[0](video)
             tactile = projectors[1](tactile)
         return video.mean(dim=1), tactile.mean(dim=1)
+
+    def _accumulate(self, student, loader_iter, device, projectors, amp, video_vec, tactile_vec) -> dict:
+        """Grow the retrieval candidate pool past one batch, for all three conditions at once.
+
+        Real, clip-mean and time-shuffled are encoded from the *same* clips so the three
+        retrieval numbers are directly comparable; computing them on different draws would put
+        sampling noise straight into the gap that is supposed to carry the result.
+
+        Extra batches are consumed from the training iterator, exactly like the first one, and
+        are never trained on -- this runs under ``no_grad`` after the optimizer step.
+        """
+        pools = {
+            "video": [video_vec],
+            "tactile": [tactile_vec],
+            "mean_video": [],
+            "mean_tactile": [],
+            "shuf_video": [],
+            "shuf_tactile": [],
+        }
+
+        def add(prefix: str, clip: ClipInputs) -> None:
+            with amp():
+                out = student.backbone.encode_full(clip)
+                a, b = self._pool(out, projectors)
+            pools[f"{prefix}video"].append(a)
+            pools[f"{prefix}tactile"].append(b)
+
+        first = True
+        for _ in range(max(self.max_batches, 1)):
+            if first:
+                batch = self._last_batch
+                first = False
+            else:
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:  # pragma: no cover - the sampler is infinite
+                    break
+                inputs = ClipInputs(
+                    video=batch["video"].to(device).float().div_(127.5).sub_(1.0),
+                    gel=batch["gel"].to(device).float().div_(127.5).sub_(1.0),
+                    lowdim=batch["lowdim"].to(device).float(),
+                )
+                add("", inputs)
+                self._last_inputs = inputs
+            inputs = self._last_inputs
+            add("mean_", ClipInputs(inputs.video, _flatten_clip_mean(inputs.gel), _flatten_clip_mean(inputs.lowdim)))
+            add(
+                "shuf_",
+                ClipInputs(inputs.video, _permute_time(inputs.gel, seed=0), _permute_time(inputs.lowdim, seed=0)),
+            )
+
+        return {key: torch.cat(value, dim=0) for key, value in pools.items()}
 
     @torch.no_grad()
     def run(
@@ -197,6 +251,7 @@ class ProbeSuite:
                 gel=batch["gel"].to(device).float().div_(127.5).sub_(1.0),
                 lowdim=batch["lowdim"].to(device).float(),
             )
+            self._last_batch, self._last_inputs = batch, inputs
 
             # Every forward AND every projection must sit inside autocast. `encode_full`
             # under autocast returns bf16 readouts while the projector weights stay fp32, so
@@ -212,7 +267,15 @@ class ProbeSuite:
             with amp():
                 encoded = student.backbone.encode_full(inputs)
                 video_vec, tactile_vec = self._pool(encoded, projectors)
-            metrics.update(cross_modal_retrieval(video_vec, tactile_vec))
+
+            # Retrieval over MANY batches, not one. With a local batch of 16 the candidate pool
+            # is 16 and every derived gap is quantised to 1/16 = 0.0625 -- so a
+            # timeshuffle_gap series of 0.0625, 0.125, 0.0 is one clip, two clips, zero clips,
+            # which is sampling noise rather than a measurement. The design called for 256
+            # candidates for exactly this reason. Extra batches cost one forward each at a
+            # 2000-step interval, which is nothing.
+            pools = self._accumulate(student, loader_iter, device, projectors, amp, video_vec, tactile_vec)
+            metrics.update(cross_modal_retrieval(pools["video"], pools["tactile"]))
 
             if collect_panels:
                 with amp():
@@ -228,15 +291,7 @@ class ProbeSuite:
                 }
 
             # P2: identical positions, constant content. Retrieval must collapse to chance.
-            control_inputs = ClipInputs(
-                video=inputs.video,
-                gel=_flatten_clip_mean(inputs.gel),
-                lowdim=_flatten_clip_mean(inputs.lowdim),
-            )
-            with amp():
-                control = student.backbone.encode_full(control_inputs)
-                control_video, control_tactile = self._pool(control, projectors)
-            control_metrics = cross_modal_retrieval(control_video, control_tactile, ks=(1,))
+            control_metrics = cross_modal_retrieval(pools["mean_video"], pools["mean_tactile"], ks=(1,))
             metrics["shortcut_top1"] = control_metrics["retrieval_top1"]
             chance = control_metrics["retrieval_chance"]
             metrics["shortcut_ratio_to_chance"] = (
@@ -252,15 +307,7 @@ class ProbeSuite:
             # `shuffle == real` failure this design exists to defeat. The clip-mean control
             # above cannot draw that distinction: it changes the marginals too, and each clip's
             # mean still differs, so across-sample retrieval can legitimately survive it.
-            shuffle_inputs = ClipInputs(
-                video=inputs.video,
-                gel=_permute_time(inputs.gel, seed=0),
-                lowdim=_permute_time(inputs.lowdim, seed=0),
-            )
-            with amp():
-                shuffled = student.backbone.encode_full(shuffle_inputs)
-                shuffle_video, shuffle_tactile = self._pool(shuffled, projectors)
-            shuffle_metrics = cross_modal_retrieval(shuffle_video, shuffle_tactile, ks=(1,))
+            shuffle_metrics = cross_modal_retrieval(pools["shuf_video"], pools["shuf_tactile"], ks=(1,))
             metrics["timeshuffle_top1"] = shuffle_metrics["retrieval_top1"]
             metrics["timeshuffle_gap"] = metrics.get("retrieval_top1", float("nan")) - metrics["timeshuffle_top1"]
 
