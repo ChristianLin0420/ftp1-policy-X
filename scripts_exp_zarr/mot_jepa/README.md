@@ -104,3 +104,43 @@ stage_to_raid.sh          sourced (it exports DATA_GLOB); sentinel makes node re
 signal_probe.sbatch       smoke ladder step (a)
 sync_wandb.sh             offline -> online from a login node
 ```
+
+## Stage 4 gate result — the action does not move the latent (2026-08-04)
+
+`scripts/mot_jepa_action_probe.py`, backbone pilot02 step 18500, ridge fit of the per-tubelet
+latent delta on `[action | state]`, held-out R²:
+
+| domain | clips | R² video | R² tactile |
+|---|---:|---:|---:|
+| sharpa | 4291 | -0.015 | -0.016 |
+| VisuoTactile_D-WHEEL | 2730 | -0.009 | -0.008 |
+| FreeTacMan | 924 | -0.319 | -0.511 |
+| **POOLED** | **10080** | **-0.219** | **-0.242** |
+
+Best over domains with >=500 held-out clips: **-0.0075**. Negative R² means the fit generalises
+worse than predicting the mean — no signal, not a weak one. Domains with tens of clips report
+spectacular negatives (Unit_Bimanual -1267) that are small-sample artefacts and should be
+ignored.
+
+**This explains the whole Stage 4 result.** `action_donor_ratio` sat at ~1.00 across loss
+weights a decade apart, horizons of one and four tubelets, and with donor actions verified as
+near-orthogonal counterfactuals. That was never a conditioning-path defect: there is no
+information in the action about how the latent evolves over one tubelet, so no predictor —
+block-causal, autoregressive, or otherwise — can condition on it. **The V-JEPA 2-AC rebuild was
+not started on the strength of this.**
+
+**What it does not say.** The probe is linear, so a non-linear relationship could exist; but
+asking a predictor to condition on something a linear probe finds no trace of is a poor bet when
+R² is below zero. And it measures one tubelet — two frames, roughly 70 ms at an assumed 30 fps.
+That is the most likely rescue and the obvious next measurement:
+
+```
+# whole-clip horizon instead of per-tubelet: predict z_7 - z_0 from the composed action
+uv run python scripts/mot_jepa_action_probe.py --pretrained_run <snap> --clips '<clips>/*/*.zarr'
+```
+
+If R² stays at zero over a ~0.5 s horizon, Stage 4 is dead on this corpus and the conclusion is
+about the data, not the design. If it rises, the AC framework should be built over long clips
+rather than eight tubelets. V-JEPA 2-AC trained on Droid — one embodiment, fixed camera,
+deliberate manipulation; this corpus is 15 embodiments, several egocentric and moving, sampled
+two frames at a time.

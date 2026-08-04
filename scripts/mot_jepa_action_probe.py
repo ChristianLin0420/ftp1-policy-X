@@ -119,12 +119,15 @@ def collect(backbone, loader, layout, device, max_batches: int) -> dict[int, tup
         with torch.autocast(device.type, torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(ClipInputs(video=video, gel=gel, lowdim=lowdim))
 
-        # Pool the TACTILE expert per tubelet step -- that is the stream a world model has to
-        # roll forward, and the one Stage 4's loss is dominated by.
-        tactile = encoded.tokens[1].float()
+        # BOTH experts. Measuring only tactile would answer half the question: Stage 4's loss
+        # covers both, and the arm is *visible*, so the video latent may well respond to motion
+        # that the tactile latent does not.
         steps = layout.num_steps
-        per_step = tactile.reshape(tactile.shape[0], steps, -1, tactile.shape[-1]).mean(dim=2)
-        delta = (per_step[:, 1:] - per_step[:, :-1]).cpu().numpy()
+        deltas = []
+        for tokens in encoded.tokens:
+            x = tokens.float()
+            per_step = x.reshape(x.shape[0], steps, -1, x.shape[-1]).mean(dim=2)
+            deltas.append((per_step[:, 1:] - per_step[:, :-1]).cpu().numpy())
 
         action = batch["action"][:, :-1].numpy()
         state = batch["state"][:, :: layout.tubelet_t][:, :-1].numpy()
@@ -132,7 +135,7 @@ def collect(backbone, loader, layout, device, max_batches: int) -> dict[int, tup
 
         for row, domain in enumerate(batch["domain_id"].tolist()):
             out[domain][0].append(features[row])
-            out[domain][1].append(delta[row])
+            out[domain][1].append((deltas[0][row], deltas[1][row]))
     return out
 
 
@@ -164,22 +167,31 @@ def main() -> int:
     )
     collected = collect(backbone, loader, cfg.layout, device, args.batches_per_domain * len(names))
 
-    print(f"\n{'domain':24s} {'clips':>7s} {'R^2 (held out)':>15s}")
-    rows, all_x, all_y = [], [], []
+    print(f"\n{'domain':24s} {'clips':>7s} {'R^2 video':>12s} {'R^2 tactile':>12s}")
+    rows, all_x, all_v, all_t = [], [], [], []
     for domain in sorted(collected):
         features = np.concatenate(collected[domain][0], axis=0)
-        targets = np.concatenate(collected[domain][1], axis=0)
-        score, count = r_squared(features, targets)
-        rows.append((names[domain], score))
+        video = np.concatenate([d[0] for d in collected[domain][1]], axis=0)
+        tactile = np.concatenate([d[1] for d in collected[domain][1]], axis=0)
+        score_v, count = r_squared(features, video)
+        score_t, _ = r_squared(features, tactile)
+        rows.append((names[domain], score_v, score_t, count))
         all_x.append(features)
-        all_y.append(targets)
-        print(f"{names[domain]:24s} {count:7d} {score:15.4f}")
+        all_v.append(video)
+        all_t.append(tactile)
+        print(f"{names[domain]:24s} {count:7d} {score_v:12.4f} {score_t:12.4f}")
 
-    pooled, pooled_n = r_squared(np.concatenate(all_x), np.concatenate(all_y))
-    print(f"\n{'POOLED':24s} {pooled_n:7d} {pooled:15.4f}")
+    x = np.concatenate(all_x)
+    pooled_v, pooled_n = r_squared(x, np.concatenate(all_v))
+    pooled_t, _ = r_squared(x, np.concatenate(all_t))
+    print(f"\n{'POOLED':24s} {pooled_n:7d} {pooled_v:12.4f} {pooled_t:12.4f}")
 
-    best = max((s for _, s in rows if np.isfinite(s)), default=float("nan"))
-    print(f"\nbackbone step {step}; best single domain R^2 = {best:.4f}")
+    # Only domains with enough held-out clips to mean anything: a 14-clip domain produces
+    # spectacular negative numbers that are small-sample artefacts, not evidence.
+    solid = [(n, v, t) for n, v, t, c in rows if c >= 500 and np.isfinite(v) and np.isfinite(t)]
+    best = max((max(v, t) for _, v, t in solid), default=float("nan"))
+    print(f"\nbackbone step {step}; best R^2 over domains with >=500 clips = {best:.4f}")
+    print(f"  ({len(solid)} of {len(rows)} domains cleared that bar)")
     print(
         "\nverdict: "
         + (
