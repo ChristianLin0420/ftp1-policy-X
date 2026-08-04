@@ -28,7 +28,10 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # one disjoint W&B run per job. The trainer also asserts on this.
 export USE_SWANLAB=false
 export WANDB_DIR="${RUN_DIR}/wandb"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+# Online by default: verified from a compute node that api.wandb.ai is reachable
+# (HTTP response in 0.11s, no proxy needed), so there is no reason to defer syncing.
+# Override with WANDB_MODE=offline if the network is down; sync_wandb.sh still works.
+export WANDB_MODE="${WANDB_MODE:-online}"
 mkdir -p "${WANDB_DIR}"
 
 # Report the AFFINITY count, not `nproc`: nproc honours OMP_NUM_THREADS (set to 8 just

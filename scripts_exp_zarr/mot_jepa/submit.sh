@@ -39,7 +39,7 @@ export REPO_ROOT RUN_DIR CONFIG_NAME
 export DATA_GLOB="${DATA_GLOB:-}"
 export STAGE_SOURCE="${STAGE_SOURCE:-}"
 export EXTRA_ARGS="${EXTRA_ARGS:-}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 echo "repo      ${REPO_ROOT}"
 echo "config    ${CONFIG_NAME}"

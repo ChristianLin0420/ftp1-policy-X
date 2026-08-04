@@ -92,7 +92,7 @@ not enter an infinite loop burning 4 GPU-hours per attempt. Three things stop th
 | Hyperparameters pinned | `run_config.json`, written once with `O_CREAT\|O_EXCL`, re-read every launch; drift is logged, the frozen value wins |
 | Same data order after resume | The sampler is a pure function of `global_step` |
 | LR and EMA decay after resume | Both are stateless closures over `global_step`; nothing extra is stored |
-| No internet on compute nodes | `WANDB_MODE=offline`, then `sync_wandb.sh <run_dir>` from a login node |
+| W&B mode | **online** by default -- compute nodes here reach api.wandb.ai directly. Set `WANDB_MODE=offline` and use `sync_wandb.sh <run_dir>` if the network is down. |
 
 ## Files
 

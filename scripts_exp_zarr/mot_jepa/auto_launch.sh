@@ -64,7 +64,7 @@ mkdir -p logs
 
 export REPO_ROOT RUN_ROOT CONFIG_NAME EXP_NAME NODES
 export DATA_GLOB="${CLIPS_ROOT}/*/*.zarr"
-export WANDB_MODE=offline
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 OUT=$(bash scripts_exp_zarr/mot_jepa/submit.sh 2>&1)
 echo "${OUT}" | tee -a "${REPORT}"
