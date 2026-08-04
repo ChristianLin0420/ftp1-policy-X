@@ -172,7 +172,39 @@ def load_instruction_table(path: str, device: torch.device) -> torch.Tensor:
 # ======================================================================================
 
 
-def load_frozen_backbone(cfg: config_module.MotJepaPosttrainConfig, device: torch.device) -> MotJepaStudent:
+def _pin_backbone_step(checkpoint_dir: pathlib.Path, run_dir: pathlib.Path) -> int | None:
+    """Resolve "latest" ONCE and record it, so a requeue cannot swap the backbone.
+
+    A post-training run is a chain of ~40 requeued jobs, and the pretraining run it freezes
+    may still be writing checkpoints. Re-resolving "latest" on every attempt would silently
+    change the frozen backbone partway through the chain, splicing two different experiments
+    into one W&B history -- the same hazard ``resolve_run_config`` exists to prevent for
+    hyperparameters. Pinning at launch with ``--pretrained_step`` is preferred; this is the
+    backstop for when it is omitted.
+    """
+    pin = run_dir / "backbone_step.txt"
+    if pin.exists():
+        step = int(pin.read_text().strip())
+        logger.info("reusing pinned backbone step %d from %s", step, pin)
+        return step
+    step = runtime.find_latest_step(checkpoint_dir)
+    if step is None:
+        return None
+    if runtime.is_main_process():
+        staging = pin.with_suffix(f".{os.getpid()}.tmp")
+        staging.write_text(str(step))
+        os.replace(staging, pin)
+    logger.warning(
+        "pretrained_step was not set; pinning the backbone at step %d for the whole run. "
+        "Pass --pretrained_step explicitly to make this reproducible from the launcher.",
+        step,
+    )
+    return step
+
+
+def load_frozen_backbone(
+    cfg: config_module.MotJepaPosttrainConfig, device: torch.device, run_dir: pathlib.Path
+) -> MotJepaStudent:
     """Rebuild the pretrained student and freeze its backbone.
 
     The **teacher** shadow is loaded, not the student: the EMA is the artifact pretraining was
@@ -189,7 +221,7 @@ def load_frozen_backbone(cfg: config_module.MotJepaPosttrainConfig, device: torc
         logger.warning("no pretrained_run set; the backbone is RANDOM. Debug only.")
     else:
         checkpoint_dir = pathlib.Path(cfg.pretrained_run) / "checkpoints"
-        step = cfg.pretrained_step or runtime.find_latest_step(checkpoint_dir)
+        step = cfg.pretrained_step or _pin_backbone_step(checkpoint_dir, run_dir)
         if step is None:
             raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
         shadow = torch.load(checkpoint_dir / str(step) / "teacher_ema.pt", map_location="cpu", weights_only=True)
@@ -370,7 +402,7 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
     )
 
-    frozen = load_frozen_backbone(cfg, device)
+    frozen = load_frozen_backbone(cfg, device, run_dir)
     backbone = frozen.backbone
 
     if cfg.stage == STAGE_INSTRUCTION:
