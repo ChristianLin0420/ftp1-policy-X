@@ -50,6 +50,7 @@ from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
+from openpi.mot_jepa.model import ClipInputs
 from openpi.mot_jepa.model import MotJepaStudent
 
 logger = logging.getLogger("mot_jepa.action_probe")
@@ -114,8 +115,6 @@ def collect(backbone, loader, layout, device, max_batches: int) -> dict[int, tup
         video = batch["video"].to(device).float().div_(127.5).sub_(1.0)
         gel = batch["gel"].to(device).float().div_(127.5).sub_(1.0)
         lowdim = batch["lowdim"].to(device).float()
-
-        from openpi.mot_jepa.model import ClipInputs
 
         with torch.autocast(device.type, torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(ClipInputs(video=video, gel=gel, lowdim=lowdim))
@@ -184,8 +183,7 @@ def main() -> int:
     print(
         "\nverdict: "
         + (
-            "the latent does respond to the action -- an action-conditioned predictor has "
-            "something to learn from."
+            "the latent does respond to the action -- an action-conditioned predictor has something to learn from."
             if best > 0.05
             else "the latent barely moves with the action at this timescale. No predictor "
             "architecture can condition on information that is not there; Stage 4 needs a "
