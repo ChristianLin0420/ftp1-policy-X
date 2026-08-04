@@ -12,6 +12,26 @@ same frozen weights under ``no_grad``.
 Everything about surviving a 4-hour walltime is inherited unchanged from ``runtime.py``: the
 frozen config, the fixed W&B run id, the preemption flag and the requeue chain.
 
+**How to read Stage 3.** Not by ``instruction_top1``, which saturates near 1.0 within a few
+hundred steps and means nothing: instruction and task are bijective in this corpus, so on
+seen tasks "recognise the store" and "understand the instruction" are the same behaviour.
+Read ``heldout_ratio_to_chance`` against a second run with ``stage3.surrogate_text``, which
+is identical except that the instruction table is random. Both arms clear chance -- the
+held-out gallery spans ten domains, so recognising the domain is worth roughly 1.5x for free
+-- and the language contribution is what remains after dividing that out. A measured example
+on a step-18500 backbone::
+
+    step     real   surrogate
+       1     1.62        1.50     <- indistinguishable before training: the correct null
+     251     4.88        1.25
+     501     7.00        1.62
+     751     6.62        1.12
+    1001     6.25        1.12
+
+Every one of those properties was invisible under an earlier version of this metric that
+resampled its evaluation clips: the same comparison read 2.54 +/- 1.46 against 1.67 +/- 1.04,
+p ~ 0.2. The measurement was destroying the effect, not the model failing to produce it.
+
 Usage::
 
     torchrun ... scripts/mot_jepa_posttrain.py mot_jepa_stage3 \
