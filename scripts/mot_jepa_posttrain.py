@@ -257,7 +257,19 @@ def load_frozen_backbone(
         step = cfg.pretrained_step or _pin_backbone_step(checkpoint_dir, run_dir)
         if step is None:
             raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
-        shadow = torch.load(checkpoint_dir / str(step) / "teacher_ema.pt", map_location="cpu", weights_only=True)
+        source = checkpoint_dir / str(step) / "teacher_ema.pt"
+        if not source.exists():
+            # A *live* pretraining run prunes its own history: keep_last=3 plus every
+            # keep_period. Pinning to a step it has since deleted fails here, minutes after
+            # the same step loaded fine. Snapshot the backbone somewhere the source run
+            # cannot reach before depending on it.
+            available = sorted((int(p.name) for p in checkpoint_dir.iterdir() if p.name.isdigit()), reverse=True)
+            raise FileNotFoundError(
+                f"{source} is missing. The source run has probably pruned it -- it retains only "
+                f"keep_last plus every keep_period. Available now: {available[:6]}. Copy the "
+                f"checkpoint to a stable directory and point --pretrained_run at that instead."
+            )
+        shadow = torch.load(source, map_location="cpu", weights_only=True)
         params = list(student.backbone.parameters())
         if len(shadow) != len(params):
             raise RuntimeError(
