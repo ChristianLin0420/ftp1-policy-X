@@ -331,38 +331,69 @@ def surrogate_table(num_tasks: int, text_dim: int, device: torch.device) -> torc
     return torch.randn(num_tasks, text_dim, generator=generator).to(device)
 
 
+def build_task_gallery(dataset, task_of_store: np.ndarray, table: torch.Tensor, device: torch.device):
+    """One prototype embedding per held-out task, plus the task id of each gallery row.
+
+    A prototype is the L2-normalized mean of that task's paraphrase embeddings, so retrieval
+    is against *the task*, not against whichever wording a particular episode happened to use.
+    """
+    by_task: dict[int, list[int]] = collections.defaultdict(list)
+    for store_index, path in enumerate(dataset.store_paths):
+        try:
+            ids = np.asarray(zarr.open(path, mode="r")["meta/instruction_id"][:])
+        except Exception:
+            continue
+        by_task[int(task_of_store[store_index])].extend(int(i) for i in ids)
+
+    task_order = sorted(by_task)
+    prototypes = torch.stack(
+        [torch.nn.functional.normalize(table[sorted(set(by_task[t]))].float().mean(0), dim=-1) for t in task_order]
+    ).to(device)
+    return prototypes, torch.tensor(task_order, dtype=torch.int64, device=device)
+
+
 @torch.no_grad()
-def heldout_retrieval(stage, backbone, loader_iter, table, task_of_store, device, *, batches: int = 4) -> dict:
-    """Retrieval against instructions for tasks the head has never trained on.
+def heldout_retrieval(
+    stage, backbone, loader_iter, gallery, gallery_tasks, task_of_store, device, *, batches: int = 8
+) -> dict:
+    """Retrieval against a gallery of EVERY held-out task, not just the ones in this batch.
 
     This is Stage 3's real falsifier. Within this corpus instruction and task are bijective --
     each task is a distinct store with its own objects and lighting -- so on *seen* tasks
     "recognise the store and emit its vector" and "understand the instruction" are
     behaviourally identical, and no within-batch control can tell them apart. On unseen tasks
     a lookup has nothing to look up.
+
+    Scoring against the full gallery matters. Eval batches are domain-pure, so the tasks that
+    happen to co-occur in one batch number only three or four and chance sits near 0.35 -- a
+    ratio measured that way is mostly noise. Against every held-out task the pool is ~50 and
+    chance is ~0.02, which is what makes the number worth reading.
     """
     core = stage.module if hasattr(stage, "module") else stage
     was_training = core.training
     core.eval()
-    top1, chance, tasks = [], [], []
+
+    projected_gallery = torch.nn.functional.normalize(core.head.text_proj(gallery).float(), dim=-1)
+    correct = total = 0
     for _ in range(batches):
         batch = next(loader_iter)
         inputs = to_inputs(batch, device)
         with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(inputs)
-            labels = task_of_store[batch["store_idx"]].to(device)
-            _, metrics = core(encoded, table[batch["instruction_id"].clamp(min=0).to(device)], labels)
-        top1.append(metrics["instruction_top1"])
-        chance.append(metrics["instruction_chance"])
-        tasks.append(metrics["distinct_tasks"])
+            clip = torch.nn.functional.normalize(core.head.clip_proj(pool_experts(encoded)).float(), dim=-1)
+        predicted = gallery_tasks[(clip @ projected_gallery.t()).argmax(dim=-1)]
+        correct += int((predicted == task_of_store[batch["store_idx"]].to(device)).sum())
+        total += predicted.numel()
     core.train(was_training)
-    mean_top1, mean_chance = float(np.mean(top1)), float(np.mean(chance))
+
+    mean_top1 = correct / max(total, 1)
+    mean_chance = 1.0 / max(gallery_tasks.numel(), 1)
     return {
         "heldout_top1": mean_top1,
         "heldout_chance": mean_chance,
         "heldout_gap": mean_top1 - mean_chance,
         "heldout_ratio_to_chance": mean_top1 / max(mean_chance, 1e-9),
-        "heldout_distinct_tasks": float(np.mean(tasks)),
+        "heldout_gallery_tasks": float(gallery_tasks.numel()),
     }
 
 
@@ -512,6 +543,10 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
         )
         eval_iter = iter(make_loader(eval_dataset, eval_sampler))
         eval_task_of_store_t = torch.from_numpy(eval_task_of_store)
+        gallery, gallery_tasks = build_task_gallery(eval_dataset, eval_task_of_store, table, device)
+        logger.info(
+            "held-out gallery: %d task prototypes (chance %.4f)", gallery_tasks.numel(), 1 / gallery_tasks.numel()
+        )
     else:
         stage = ActionStage(cfg).to(device)
         table = None
@@ -578,7 +613,9 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
                 loss, extras = model(encoded, text, labels)
             if global_step % cfg.stage3.eval_interval == 0:
-                sparse = heldout_retrieval(stage, backbone, eval_iter, table, eval_task_of_store_t, device)
+                sparse = heldout_retrieval(
+                    stage, backbone, eval_iter, gallery, gallery_tasks, eval_task_of_store_t, device
+                )
 
         else:
             masks = build_rollout_masks(layout, split_step=cfg.stage4.split_step, batch_size=cfg.local_batch_size).to(
