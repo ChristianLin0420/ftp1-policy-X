@@ -361,9 +361,29 @@ def build_task_gallery(dataset, task_of_store: np.ndarray, table: torch.Tensor, 
     return prototypes, torch.tensor(task_order, dtype=torch.int64, device=device)
 
 
+def fixed_eval_indices(dataset, task_of_store: np.ndarray, *, per_task: int = 8) -> list[int]:
+    """A fixed, task-balanced set of clip indices, chosen once and reused at every eval.
+
+    Drawing a fresh batch each time makes the metric track *which domain got sampled* rather
+    than the model: eval batches are domain-pure, so consecutive evaluations of one run swung
+    4.5x -> 4.3x -> 1.0x with the weights barely moving. Evenly spaced picks per task, same
+    clips every time, so a change in the number is a change in the head.
+    """
+    by_task: dict[int, list[int]] = collections.defaultdict(list)
+    for row, entry in enumerate(dataset.clip_index.entries):
+        by_task[int(task_of_store[int(entry[0])])].append(row)
+
+    chosen: list[int] = []
+    for task in sorted(by_task):
+        rows = by_task[task]
+        take = min(per_task, len(rows))
+        chosen.extend(rows[i] for i in np.linspace(0, len(rows) - 1, take).astype(int))
+    return chosen
+
+
 @torch.no_grad()
 def heldout_retrieval(
-    stage, backbone, loader_iter, gallery, gallery_tasks, task_of_store, device, *, batches: int = 8
+    stage, backbone, loader, gallery, gallery_tasks, task_of_store, device, *, batches: int | None = None
 ) -> dict:
     """Retrieval against a gallery of EVERY held-out task, not just the ones in this batch.
 
@@ -384,8 +404,9 @@ def heldout_retrieval(
 
     projected_gallery = torch.nn.functional.normalize(core.head.text_proj(gallery).float(), dim=-1)
     correct = total = 0
-    for _ in range(batches):
-        batch = next(loader_iter)
+    for seen, batch in enumerate(loader):
+        if batches is not None and seen >= batches:
+            break
         inputs = to_inputs(batch, device)
         with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(inputs)
@@ -541,16 +562,16 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             logger.warning("SURROGATE TEXT: instructions replaced by random per-task vectors")
             table = surrogate_table(table.shape[0], cfg.stage3.text_dim, device)
 
-        eval_dataset, eval_domain_of_sample, eval_task_of_store = build_dataset(cfg, partition="heldout")
-        eval_sampler = InfiniteBatchSampler(
-            len(eval_dataset),
-            cfg.local_batch_size,
-            rank=rank,
-            world_size=world_size,
-            seed=cfg.seed + 7919,
-            domain_of_sample=eval_domain_of_sample,
+        eval_dataset, _, eval_task_of_store = build_dataset(cfg, partition="heldout")
+        eval_indices = fixed_eval_indices(eval_dataset, eval_task_of_store)
+        eval_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(eval_dataset, eval_indices),
+            batch_size=cfg.local_batch_size,
+            shuffle=False,
+            num_workers=cfg.data.num_workers,
+            collate_fn=collate_clips,
+            pin_memory=torch.cuda.is_available(),
         )
-        eval_iter = iter(make_loader(eval_dataset, eval_sampler))
         eval_task_of_store_t = torch.from_numpy(eval_task_of_store)
         gallery, gallery_tasks = build_task_gallery(eval_dataset, eval_task_of_store, table, device)
         logger.info(
@@ -623,7 +644,7 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
                 loss, extras = model(encoded, text, labels)
             if global_step % cfg.stage3.eval_interval == 0:
                 sparse = heldout_retrieval(
-                    stage, backbone, eval_iter, gallery, gallery_tasks, eval_task_of_store_t, device
+                    stage, backbone, eval_loader, gallery, gallery_tasks, eval_task_of_store_t, device
                 )
 
         else:
