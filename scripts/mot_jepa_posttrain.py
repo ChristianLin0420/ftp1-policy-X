@@ -319,16 +319,25 @@ class InstructionStage(torch.nn.Module):
         }
 
 
-def surrogate_table(num_tasks: int, text_dim: int, device: torch.device) -> torch.Tensor:
-    """One fixed random vector per task, carrying no language at all.
+def surrogate_table(vocabulary_size: int, text_dim: int, device: torch.device) -> torch.Tensor:
+    """One fixed random vector per INSTRUCTION, carrying no language at all.
+
+    Per instruction rather than per task, so it destroys paraphrase grouping as well as
+    semantics: a task's prototype becomes the mean of unrelated random vectors. That makes it
+    a strictly harder control than a per-task surrogate would be.
 
     This is the **control arm**, used for a whole run via ``stage3.surrogate_text`` -- not as
     an inline probe. An inline version would feed random vectors through a ``text_proj``
     fitted to SigLIP's space and sit at chance no matter what the head learned, so it tests
     only that the text input is used at all, never that *language* is.
+
+    Read the control against the real arm as a RATIO, not by whether either clears chance.
+    Both do: the held-out gallery spans ten domains, so recognising the domain narrows fifty
+    candidates to about five without understanding anything, and that shortcut is available to
+    both arms equally. The language contribution is what remains after dividing it out.
     """
     generator = torch.Generator(device="cpu").manual_seed(0)
-    return torch.randn(num_tasks, text_dim, generator=generator).to(device)
+    return torch.randn(vocabulary_size, text_dim, generator=generator).to(device)
 
 
 def build_task_gallery(dataset, task_of_store: np.ndarray, table: torch.Tensor, device: torch.device):
