@@ -74,6 +74,8 @@ STAGE_ACTION = "action"
 
 def build_dataset(
     cfg: config_module.MotJepaPosttrainConfig,
+    *,
+    partition: str = "all",
 ) -> tuple[MotJepaClipDataset, np.ndarray, np.ndarray]:
     """Dataset plus per-store domain and task ids.
 
@@ -125,7 +127,23 @@ def build_dataset(
         stores = [stores[i] for i in keep]
         domain_ids = [domain_ids[i] for i in keep]
         task_ids = [task_ids[i] for i in keep]
-    logger.info("using %d stores / %d tasks across %d domains", len(stores), len(set(task_ids)), len(set(domain_ids)))
+
+    if partition != "all" and cfg.stage3.holdout_frac > 0:
+        heldout = split_tasks(task_ids, cfg.stage3.holdout_frac)
+        want = heldout if partition == "heldout" else ~heldout
+        keep = [i for i in range(len(stores)) if want[i]]
+        stores = [stores[i] for i in keep]
+        domain_ids = [domain_ids[i] for i in keep]
+        task_ids = [task_ids[i] for i in keep]
+        if not stores:
+            raise ValueError(f"the {partition!r} partition is empty; lower stage3.holdout_frac")
+    logger.info(
+        "%s: %d stores / %d tasks across %d domains",
+        partition,
+        len(stores),
+        len(set(task_ids)),
+        len(set(domain_ids)),
+    )
 
     dataset = MotJepaClipDataset(
         stores,
@@ -139,6 +157,21 @@ def build_dataset(
     entries = dataset.clip_index.entries
     domain_of_sample = np.asarray(domain_ids, dtype=np.int64)[entries[:, 0]]
     return dataset, domain_of_sample, np.asarray(task_ids, dtype=np.int64)
+
+
+def split_tasks(task_ids: list[int], holdout_frac: float) -> np.ndarray:
+    """Deterministic per-TASK train/eval split, returned as a boolean "is held out" mask.
+
+    Split by task rather than by clip or by store: holding out clips of a task the head also
+    trains on measures memorisation, not generalisation. Deterministic in the task id so every
+    rank and every requeue agree without communicating.
+    """
+    unique = sorted(set(task_ids))
+    rng = np.random.default_rng(0)
+    order = rng.permutation(len(unique))
+    cutoff = round(len(unique) * holdout_frac)
+    heldout = {unique[i] for i in order[:cutoff]}
+    return np.asarray([task in heldout for task in task_ids], dtype=bool)
 
 
 def task_ids_for_stores(stores: list[str]) -> list[int]:
@@ -274,27 +307,51 @@ class InstructionStage(torch.nn.Module):
         }
 
 
-def surrogate_table(num_stores: int, text_dim: int, device: torch.device) -> torch.Tensor:
-    """One fixed random vector per store, carrying no language at all.
+def surrogate_table(num_tasks: int, text_dim: int, device: torch.device) -> torch.Tensor:
+    """One fixed random vector per task, carrying no language at all.
 
-    Built once, from a fixed seed, so every rank and every step sees the same table -- a
-    control that varied per step would be measuring noise rather than the head.
+    This is the **control arm**, used for a whole run via ``stage3.surrogate_text`` -- not as
+    an inline probe. An inline version would feed random vectors through a ``text_proj``
+    fitted to SigLIP's space and sit at chance no matter what the head learned, so it tests
+    only that the text input is used at all, never that *language* is.
     """
     generator = torch.Generator(device="cpu").manual_seed(0)
-    return torch.randn(num_stores, text_dim, generator=generator).to(device)
+    return torch.randn(num_tasks, text_dim, generator=generator).to(device)
 
 
-def store_identity_control(stage: InstructionStage, encoded, labels: torch.Tensor, surrogate: torch.Tensor) -> dict:
-    """Stage 3's falsifier: swap each instruction for its store's random surrogate.
+@torch.no_grad()
+def heldout_retrieval(stage, backbone, loader_iter, table, task_of_store, device, *, batches: int = 4) -> dict:
+    """Retrieval against instructions for tasks the head has never trained on.
 
-    If top-1 is unchanged the head learned store identity, not language, and the stage has
-    failed. Passing retrieval *and* passing this is a failure, not a partial success -- the
-    same reading error that made a mixed-domain pretraining run look like it had learned
-    binding when the control had reached the identical top-1.
+    This is Stage 3's real falsifier. Within this corpus instruction and task are bijective --
+    each task is a distinct store with its own objects and lighting -- so on *seen* tasks
+    "recognise the store and emit its vector" and "understand the instruction" are
+    behaviourally identical, and no within-batch control can tell them apart. On unseen tasks
+    a lookup has nothing to look up.
     """
-    with torch.no_grad():
-        loss, metrics = stage(encoded, surrogate[labels], labels)
-    return {"control_" + key: value for key, value in metrics.items()} | {"control_loss": float(loss)}
+    core = stage.module if hasattr(stage, "module") else stage
+    was_training = core.training
+    core.eval()
+    top1, chance, tasks = [], [], []
+    for _ in range(batches):
+        batch = next(loader_iter)
+        inputs = to_inputs(batch, device)
+        with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
+            encoded = backbone.encode_full(inputs)
+            labels = task_of_store[batch["store_idx"]].to(device)
+            _, metrics = core(encoded, table[batch["instruction_id"].clamp(min=0).to(device)], labels)
+        top1.append(metrics["instruction_top1"])
+        chance.append(metrics["instruction_chance"])
+        tasks.append(metrics["distinct_tasks"])
+    core.train(was_training)
+    mean_top1, mean_chance = float(np.mean(top1)), float(np.mean(chance))
+    return {
+        "heldout_top1": mean_top1,
+        "heldout_chance": mean_chance,
+        "heldout_gap": mean_top1 - mean_chance,
+        "heldout_ratio_to_chance": mean_top1 / max(mean_chance, 1e-9),
+        "heldout_distinct_tasks": float(np.mean(tasks)),
+    }
 
 
 # ======================================================================================
@@ -382,7 +439,10 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
     resume_step = runtime.find_latest_step(cfg.checkpoint_dir)
     init_tracking(cfg, run_dir, resuming=resume_step is not None)
 
-    dataset, domain_of_sample, task_of_store = build_dataset(cfg)
+    # Stage 3 trains on one task partition and evaluates on the other; Stage 4 has no
+    # held-out notion and uses everything.
+    train_partition = "train" if cfg.stage == STAGE_INSTRUCTION else "all"
+    dataset, domain_of_sample, task_of_store = build_dataset(cfg, partition=train_partition)
     task_of_store_t = torch.from_numpy(task_of_store)
     sampler = InfiniteBatchSampler(
         len(dataset),
@@ -402,6 +462,17 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
     )
 
+    def make_loader(ds, sam):
+        return torch.utils.data.DataLoader(
+            ds,
+            batch_sampler=sam,
+            num_workers=cfg.data.num_workers,
+            collate_fn=collate_clips,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=cfg.data.num_workers > 0,
+            prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
+        )
+
     frozen = load_frozen_backbone(cfg, device, run_dir)
     backbone = frozen.backbone
 
@@ -412,10 +483,26 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             if cfg.stage3.instruction_emb
             else torch.randn(4096, cfg.stage3.text_dim, device=device)
         )
-        surrogate = surrogate_table(int(task_of_store.max()) + 1, cfg.stage3.text_dim, device)
+        if cfg.stage3.surrogate_text:
+            # Control arm: every instruction becomes a fixed random vector for the WHOLE run.
+            # If held-out top-1 matches the real-embedding arm, language contributed nothing.
+            logger.warning("SURROGATE TEXT: instructions replaced by random per-task vectors")
+            table = surrogate_table(table.shape[0], cfg.stage3.text_dim, device)
+
+        eval_dataset, eval_domain_of_sample, eval_task_of_store = build_dataset(cfg, partition="heldout")
+        eval_sampler = InfiniteBatchSampler(
+            len(eval_dataset),
+            cfg.local_batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=cfg.seed + 7919,
+            domain_of_sample=eval_domain_of_sample,
+        )
+        eval_iter = iter(make_loader(eval_dataset, eval_sampler))
+        eval_task_of_store_t = torch.from_numpy(eval_task_of_store)
     else:
         stage = ActionStage(cfg).to(device)
-        table = surrogate = None
+        table = None
 
     trainable = [p for p in stage.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -463,6 +550,11 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             group["lr"] = lr
 
         extras: dict[str, float] = {}
+        # Interval-sampled falsifier metrics are kept OUT of `records`. reduce_metrics fills a
+        # missing key with 0.0 -- deliberate for the mode-frequency counters in pretraining,
+        # but it silently divides an interval-sampled scalar by the window length, so a
+        # control at chance reads as 50x below the number it is meant to be compared against.
+        sparse: dict[str, float] = {}
         if cfg.stage == STAGE_INSTRUCTION:
             with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
                 encoded = backbone.encode_full(inputs)
@@ -473,8 +565,9 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             text = table[batch["instruction_id"].clamp(min=0).to(device)]
             with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
                 loss, extras = model(encoded, text, labels)
-            if global_step % cfg.stage3.control_interval == 0:
-                extras |= store_identity_control(stage, encoded, labels, surrogate)
+            if global_step % cfg.stage3.eval_interval == 0:
+                sparse = heldout_retrieval(stage, backbone, eval_iter, table, eval_task_of_store_t, device)
+
         else:
             masks = build_rollout_masks(layout, split_step=cfg.stage4.split_step, batch_size=cfg.local_batch_size).to(
                 device
@@ -492,7 +585,7 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
                 loss = cfg.stage4.weight_latent * latent + cfg.stage4.weight_action_sync * sync
             extras = {"latent": float(latent.detach()), "action_sync": float(sync.detach())}
             if global_step % cfg.stage4.donor_interval == 0:
-                extras["action_donor_ratio"] = action_donor_ratio(stage, encoded, masks, action, action_mask, targets)
+                sparse = {"action_donor_ratio": action_donor_ratio(stage, encoded, masks, action, action_mask, targets)}
 
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite loss at step {global_step}: {loss.item()}")
@@ -523,6 +616,11 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
                     wandb.log({f"{cfg.stage}/{k}": v for k, v in metrics.items()}, step=global_step)
             records.clear()
             window_start = time.time()
+
+        if sparse and runtime.is_main_process():
+            logger.info("falsifier @%d: %s", global_step, {k: round(v, 4) for k, v in sparse.items()})
+            if cfg.wandb_enabled:
+                wandb.log({f"{cfg.stage}/{k}": v for k, v in sparse.items()}, step=global_step)
 
         if global_step % cfg.save_interval == 0 and runtime.is_main_process():
             runtime.save_checkpoint(

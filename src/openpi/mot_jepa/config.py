@@ -219,11 +219,29 @@ class Stage3Config:
     min_stores_per_domain: int = 4
     """A batch must be able to see several tasks or the retrieval is trivial. This drops RDP
     (2 stores), RDP_Bimanual (1), Unit (1), Unit_Bimanual (2) and QINGLOONG (3), leaving 10
-    domains and ~517 stores."""
-    control_interval: int = 1_000
-    """How often to run the store-identity control. It is the stage's falsifier, not a
-    diagnostic: passing retrieval while the control also passes means the head learned store
-    identity rather than language."""
+    domains and 518 stores / 248 tasks."""
+
+    holdout_frac: float = 0.2
+    """Fraction of TASKS reserved for evaluation, split deterministically by task id.
+
+    This is the stage's falsifier, and it has to be a held-out split rather than a control on
+    seen tasks. Within this corpus instruction and task are bijective -- every task is a
+    distinct store with distinct objects and lighting -- so "identify the store and emit its
+    vector" and "understand the instruction" are behaviourally *identical* on tasks the head
+    has seen. No within-batch control can separate them. Retrieval against instructions for
+    tasks never seen can: a lookup cannot generalize, language can.
+    """
+    eval_interval: int = 250
+
+    surrogate_text: bool = False
+    """Control arm: replace the instruction table with a fixed random vector per task and
+    train the whole run on it. If this reaches the same held-out top-1 as real embeddings,
+    language contributed nothing.
+
+    Note this must be a separate *run*, not an inline probe. Feeding surrogate vectors through
+    a ``text_proj`` that was fitted to SigLIP's space simply produces noise, so an inline
+    version sits at chance regardless of what the head learned -- it tests only that the text
+    input is used at all, not that *language* is."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,7 +346,7 @@ POSTTRAIN_CONFIGS: dict[str, MotJepaPosttrainConfig] = {
         log_interval=1,
         wandb_enabled=False,
         data=DataConfig(num_workers=0),
-        stage3=Stage3Config(min_stores_per_domain=1, control_interval=10),
+        stage3=Stage3Config(min_stores_per_domain=1, eval_interval=10, holdout_frac=0.5),
         stage4=Stage4Config(donor_interval=10),
     ),
     "mot_jepa_stage3": MotJepaPosttrainConfig(
