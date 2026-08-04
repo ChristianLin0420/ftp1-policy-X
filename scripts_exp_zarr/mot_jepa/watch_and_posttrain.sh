@@ -35,6 +35,12 @@ TIMEOUT_MIN="${TIMEOUT_MIN:-900}"
 POLL_SEC="${POLL_SEC:-120}"
 STAGE3_STEPS="${STAGE3_STEPS:-4000}"
 NODES="${NODES:-2}"
+# Footprint. The clip index enumerates EVERY frame as a clip start, so consecutive entries
+# overlap by 15/16 frames; a 4x sparser index costs almost no clip diversity but cuts the
+# per-rank index from ~35M rows to ~9M. Together with fewer loader workers this is what keeps
+# 8 ranks/node inside memory -- the full-density version OOM-killed both arms on 2026-08-04.
+INDEX_STEP="${INDEX_STEP:-4}"
+NUM_WORKERS="${NUM_WORKERS:-6}"
 
 cd "${REPO_ROOT}" || exit 1
 say() { echo "[$(date -Is)] $*"; }
@@ -85,6 +91,7 @@ export NODES WANDB_MODE="${WANDB_MODE:-online}"
 COMMON="--pretrained_run ${SNAP} --pretrained_step ${FINAL_STEP}"
 COMMON="${COMMON} --num_train_steps ${STAGE3_STEPS} --save_interval 1000"
 COMMON="${COMMON} --stage3.instruction_emb ${CLIPS}/instruction_emb.npz"
+COMMON="${COMMON} --data.index_step ${INDEX_STEP} --data.num_workers ${NUM_WORKERS}"
 
 for ARM in real surr; do
   EXTRA="${COMMON}"

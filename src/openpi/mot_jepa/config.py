@@ -167,6 +167,12 @@ def _from_dict(cls: type, payload: dict) -> object:
 
 _PILOT_ROPE = Rope3DConfig(head_dim=64, dim_t=32, dim_h=16, dim_w=16)
 
+# Post-training builds TWO clip indices (train + held-out) per rank instead of one, which is what
+# pushed 8 ranks/node over memory and OOM-killed both Stage 3 arms on 2026-08-04. The index
+# enumerates every frame as a clip start, so consecutive entries overlap by 15/16 frames and a 4x
+# sparser index costs almost no clip diversity while cutting it from ~35M rows to ~9M.
+_POSTTRAIN_DATA = DataConfig(index_step=4, num_workers=6)
+
 #: Named presets. ``debug`` is CPU-runnable and used by the smoke path.
 CONFIGS: dict[str, MotJepaTrainConfig] = {
     "mot_jepa_debug": MotJepaTrainConfig(
@@ -360,6 +366,7 @@ POSTTRAIN_CONFIGS: dict[str, MotJepaPosttrainConfig] = {
         layout_preset="pilot",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        data=_POSTTRAIN_DATA,
         num_train_steps=20_000,
         local_batch_size=32,
     ),
@@ -369,6 +376,7 @@ POSTTRAIN_CONFIGS: dict[str, MotJepaPosttrainConfig] = {
         layout_preset="pilot",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        data=_POSTTRAIN_DATA,
         num_train_steps=40_000,
         local_batch_size=16,
     ),
