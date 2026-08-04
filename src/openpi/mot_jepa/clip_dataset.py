@@ -161,8 +161,23 @@ class ClipIndex:
         dropped outright rather than clamped.
         """
         rows = []
+        unreadable: list[str] = []
         for store_idx, path in enumerate(store_paths):
-            ends = np.asarray(zarr.open(path, mode="r")["meta/episode_ends"][:], dtype=np.int64)
+            # One corrupt store must never take down a whole run. A build that dies partway
+            # (we hit the Lustre INODE quota at 23.8M of 26.2M files) leaves directories that
+            # look like stores but contain no zarr group; without this guard every rank
+            # raises GroupNotFoundError during dataset construction and the job is dead
+            # before step 0.
+            try:
+                ends = np.asarray(zarr.open(path, mode="r")["meta/episode_ends"][:], dtype=np.int64)
+            except Exception as exc:
+                logger.warning("skipping unreadable store %s: %s", path, type(exc).__name__)
+                unreadable.append(path)
+                continue
+            if ends.size == 0:
+                logger.warning("skipping store with no episodes: %s", path)
+                unreadable.append(path)
+                continue
             starts = np.concatenate([[0], ends[:-1]])
             for episode_start, episode_end in zip(starts, ends, strict=True):
                 for stride in strides:
@@ -182,6 +197,8 @@ class ClipIndex:
                         )
                     )
         entries = np.concatenate(rows, axis=0) if rows else np.zeros((0, 3), dtype=np.int64)
+        if unreadable:
+            logger.warning("%d of %d stores were unreadable and excluded", len(unreadable), len(store_paths))
         return cls(entries, store_paths)
 
     def save(self, path: str | pathlib.Path) -> None:
@@ -242,6 +259,11 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         self.clip_index = clip_index or ClipIndex.build(
             self.store_paths, num_frames=layout.num_frames, strides=strides, step=index_step
         )
+        if len(self.clip_index) == 0:
+            raise ValueError(
+                f"no usable clips across {len(self.store_paths)} store(s); every store was "
+                "unreadable or had episodes shorter than one clip"
+            )
         # Zarr handles are opened lazily per worker: an open handle is not fork-safe.
         self._stores: dict[int, zarr.Group] = {}
         self._keys: dict[int, StoreKeys] = {}

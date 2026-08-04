@@ -238,3 +238,32 @@ def test_all_three_tactile_types_survive_the_source_read(tmp_path):
     # uSkin carries 48 channels; the wrench carries 6. Both must exceed one.
     assert int((sample.lowdim[:, 0].abs().sum(dim=0) > 0).sum()) > 1
     assert int((sample.lowdim[:, 2].abs().sum(dim=0) > 0).sum()) > 1
+
+
+def test_one_corrupt_store_does_not_kill_the_dataset(tmp_path):
+    """A build that dies partway leaves a directory that looks like a store but has no group.
+
+    That is not hypothetical: hitting the Lustre inode quota (23.8M of 26.2M files) left 14
+    such shells among 511 derived stores, and every rank raised GroupNotFoundError during
+    dataset construction -- the job was dead before step 0. One bad store out of hundreds
+    must cost only that store.
+    """
+    good = make_store(tmp_path / "good.zarr", [20])
+    broken = tmp_path / "broken.zarr"
+    broken.mkdir()  # exists, looks like a store, contains no zarr group
+
+    index = ClipIndex.build([good, str(broken)], num_frames=LAYOUT.num_frames, strides=(1,))
+    assert len(index) > 0
+    assert {int(index[i].store_idx) for i in range(len(index))} == {0}, "only the good store contributes"
+
+    dataset = MotJepaClipDataset([good, str(broken)], LAYOUT, strides=(1,))
+    assert dataset[0].video.shape[0] == LAYOUT.num_frames
+
+
+def test_all_stores_unreadable_raises_rather_than_training_on_nothing(tmp_path):
+    """build() may legitimately return empty (short episodes); the DATASET must refuse."""
+    broken = tmp_path / "broken.zarr"
+    broken.mkdir()
+    assert len(ClipIndex.build([str(broken)], num_frames=LAYOUT.num_frames, strides=(1,))) == 0
+    with pytest.raises(ValueError, match="no usable clips"):
+        MotJepaClipDataset([str(broken)], LAYOUT, strides=(1,))
