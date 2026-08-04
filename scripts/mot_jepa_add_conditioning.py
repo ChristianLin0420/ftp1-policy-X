@@ -112,7 +112,11 @@ def add_conditioning(
         end = min(begin + batch_frames, total)
         state_out[begin:end] = ap.read_state(source["data"], spec, begin, end)
 
-    mask = ap.state_mask(spec)
+    # Tighten against the data, not just the declared streams: a static camera leaves the
+    # head block exactly constant, and nine dead slots marked "present" dilute every masked
+    # mean and let the action embedder spend capacity on a constant.
+    sample = np.asarray(state_out[:: max(1, total // 4096)], dtype=np.float32)
+    mask = ap.drop_constant_columns(sample, ap.state_mask(spec))
     mask_out = dest_meta.require_array("action_mask", shape=mask.shape, dtype="uint8")
     mask_out[:] = mask
 
@@ -130,6 +134,25 @@ def add_conditioning(
         "unique_instructions": int(np.unique(ids).size),
         "seconds": round(time.time() - start_time, 1),
     }
+
+
+def refresh_mask(dest_path: pathlib.Path) -> dict:
+    """Recompute ``meta/action_mask`` from the state already written, without touching it.
+
+    Cheap enough to run over the whole corpus: it reads a strided sample of ``data/state``
+    and rewrites 120 bytes. Separate from the full pass so an existing corpus can be
+    tightened without re-deriving anything.
+    """
+    dest = zarr.open(str(dest_path), mode="r+")
+    if "state" not in set(dest["data"].array_keys()):
+        return {"status": "skip", "reason": "no data/state"}
+    state = dest["data"]["state"]
+    stride = max(1, state.shape[0] // 4096)
+    sample = np.asarray(state[::stride], dtype=np.float32)
+    before = np.asarray(dest["meta"]["action_mask"][:], dtype=np.uint8)
+    after = ap.drop_constant_columns(sample, before)
+    dest["meta"]["action_mask"][:] = after
+    return {"status": "ok", "before": int(before.sum()), "after": int(after.sum())}
 
 
 def pair_stores(source_root: pathlib.Path, clips_root: pathlib.Path, domains: list[str] | None) -> list[tuple]:
@@ -180,6 +203,11 @@ def main() -> int:
     parser.add_argument("--vocabulary", type=pathlib.Path, default=None, help="Defaults to <clips>/instructions.json.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Report what would be written; write nothing.")
+    parser.add_argument(
+        "--refresh-mask",
+        action="store_true",
+        help="Only recompute meta/action_mask from the state already present; write nothing else.",
+    )
     args = parser.parse_args()
 
     pairs = pair_stores(args.source, args.clips, args.domains)
@@ -205,6 +233,16 @@ def main() -> int:
             staging = vocabulary_path.with_suffix(f".{os.getpid()}.tmp")
             staging.write_text(json.dumps({"instructions": ordered}, indent=2))
             os.replace(staging, vocabulary_path)
+
+    if args.refresh_mask:
+        tightened = 0
+        for domain, _, derived in pairs:
+            result = refresh_mask(derived)
+            if result["status"] == "ok" and result["after"] < result["before"]:
+                tightened += 1
+                print(f"[tighten] {domain}/{derived.name}: {result['before']} -> {result['after']} slots")
+        print(f"\ntightened {tightened} of {len(pairs)} store(s)")
+        return 0
 
     written, skipped, failed = 0, 0, []
     for domain, source, derived in pairs:
