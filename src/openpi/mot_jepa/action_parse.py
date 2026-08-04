@@ -306,6 +306,15 @@ ABSOLUTE_COLUMNS: tuple[int, ...] = (
     SLICES["left-hand-joints"][0] + GRIPPER_HAND_SLOT,
 )
 
+#: ``mat_to_pose9d`` of the identity transform: position 0 and the first two rows of I.
+#: A *relative* pose action for a stationary frame lands exactly here, so the rot6d block of
+#: a slow motion is this constant plus a perturbation three orders of magnitude smaller.
+#: Measured on RH20TCfg5Franka: ``right-wrist-rot[0]`` had mean 0.99994 and sd 0.00034, a
+#: 0.03% relative signal that no linear projection is going to recover. Subtracting the
+#: identity makes "no motion" exactly zero and puts the whole block on the scale of the
+#: motion rather than on the scale of the encoding.
+IDENTITY_POSE9D: np.ndarray = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
 
 def actions_from_state(state: np.ndarray, action_mask: np.ndarray) -> np.ndarray:
     """``(N, 120)`` states -> ``(N - 1, 120)`` actions, using only the mask.
@@ -327,7 +336,7 @@ def actions_from_state(state: np.ndarray, action_mask: np.ndarray) -> np.ndarray
     actions = state[1:] - state[:-1]
     for block in POSE_BLOCKS:
         if mask[block].any():
-            actions[:, block] = relative_pose(state, block)
+            actions[:, block] = relative_pose(state, block) - IDENTITY_POSE9D
     for column in ABSOLUTE_COLUMNS:
         if mask[column]:
             actions[:, column] = state[1:, column]
@@ -361,7 +370,7 @@ def states_to_actions(
 
     for arm in spec.arms:
         if arm.wrist_key is not None:
-            actions[:, arm.wrist_slice] = relative_pose(state, arm.wrist_slice)
+            actions[:, arm.wrist_slice] = relative_pose(state, arm.wrist_slice) - IDENTITY_POSE9D
         if arm.arm_key is not None:
             block = state[:, arm.arm_slice]
             actions[:, arm.arm_slice] = block[1:] - block[:-1]
@@ -374,7 +383,7 @@ def states_to_actions(
 
     if spec.head_key is not None:
         head = slice(HEAD_START, HEAD_START + 9)
-        actions[:, head] = relative_pose(state, head)
+        actions[:, head] = relative_pose(state, head) - IDENTITY_POSE9D
     if spec.supp_key is not None:
         supp = slice(SUPP_START, SUPP_START + spec.supp_width)
         actions[:, supp] = state[1:, supp] - state[:-1, supp]

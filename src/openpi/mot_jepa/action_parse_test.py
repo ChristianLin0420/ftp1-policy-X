@@ -348,3 +348,35 @@ def test_relative_pose_uses_an_exact_rigid_inverse():
     for step in range(5):
         expected = mat_to_pose9d(np.linalg.inv(mats[step]) @ mats[step + 1])
         np.testing.assert_allclose(ap.relative_pose(state, slice(0, 9))[step], expected, rtol=1e-9, atol=1e-9)
+
+
+def test_a_stationary_pose_yields_exactly_zero_action():
+    """ "No motion" must be the zero vector, not the rot6d encoding of the identity.
+
+    Measured on RH20TCfg5Franka before this: right-wrist-rot[0] had mean 0.99994 and sd
+    0.00034, and the static-camera head block was constant 1.0/0.0 to machine precision. Nine
+    of nineteen live slots carried no information and the rest were a 0.03% perturbation on a
+    unit offset -- so a donor clip's action was ~99% identical to the true one and the Stage 4
+    donor-ratio probe could not have moved regardless of what the predictor learned.
+    """
+    state = np.zeros((5, ap.ACTION_DIM), dtype=np.float32)
+    state[:, 0:9] = ap.IDENTITY_POSE9D  # a frame that never moves
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[0:9] = 1
+    np.testing.assert_allclose(ap.actions_from_state(state, mask)[:, 0:9], 0.0, atol=1e-6)
+
+
+def test_identity_pose9d_is_what_mat_to_pose9d_gives_for_no_transform():
+    np.testing.assert_allclose(mat_to_pose9d(np.eye(4)[None])[0], ap.IDENTITY_POSE9D, atol=1e-12)
+
+
+def test_pose_action_scale_matches_the_motion_not_the_encoding(tmp_path):
+    """The informative part must not sit on a unit offset three orders of magnitude larger."""
+    store = make_store(tmp_path / "fm.zarr", OBSERVED["FreeTacMan"])
+    spec = ap.specs_for_store(store["data"])
+    state = ap.read_state(store["data"], spec, 0, 40)
+    actions = ap.actions_from_state(state[:17:2], spec_mask := ap.state_mask(spec))
+    rot = actions[:, 3:9]
+    assert abs(float(rot.mean())) < 0.5, "rot6d block still carries the identity offset"
+    assert float(np.abs(rot).max()) > 0, "rot6d block is entirely dead"
+    assert spec_mask[3:9].all()
