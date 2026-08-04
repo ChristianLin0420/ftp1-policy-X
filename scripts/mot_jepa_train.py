@@ -423,17 +423,31 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
 
         if global_step % cfg.probe_interval == 0:
             want_panels = cfg.wandb_enabled and runtime.is_main_process()
-            probe_metrics = probes.run(
-                student,
-                teacher,
-                loader_iter,
-                device,
-                layout=layout,
-                projectors=loss_fn.projectors,
-                masks=masks,
-                collect_panels=want_panels,
-            )
-            if runtime.is_main_process():
+            # A probe is a measurement, not a training step, and must never be able to end a
+            # run. A 50k-step chain represents most of a day; losing it to a bug in an
+            # instrument that only reports numbers would be absurd. The panel rendering below
+            # has always been wrapped for this reason -- the probe itself was not, which left
+            # every requeue one probe bug away from ending the run.
+            #
+            # Note the batch is consumed as the first statement inside ``ProbeSuite.run``, so a
+            # later failure has already advanced every rank's loader identically and cannot
+            # desync the data stream.
+            probe_metrics: dict = {}
+            try:
+                probe_metrics = probes.run(
+                    student,
+                    teacher,
+                    loader_iter,
+                    device,
+                    layout=layout,
+                    projectors=loss_fn.projectors,
+                    masks=masks,
+                    collect_panels=want_panels,
+                )
+            except Exception:
+                logger.exception("probes failed at step %d; continuing", global_step)
+
+            if probe_metrics and runtime.is_main_process():
                 logger.info("probes @%d: %s", global_step, probe_metrics)
                 if cfg.wandb_enabled:
                     wandb.log({f"probe/{k}": v for k, v in probe_metrics.items()}, step=global_step)

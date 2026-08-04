@@ -663,9 +663,13 @@ def train(cfg: config_module.MotJepaPosttrainConfig) -> None:
             with torch.autocast("cuda", torch.bfloat16, enabled=device.type == "cuda"):
                 loss, extras = model(encoded, text, labels)
             if global_step % cfg.stage3.eval_interval == 0:
-                sparse = heldout_retrieval(
-                    stage, backbone, eval_loader, gallery, gallery_tasks, eval_task_of_store_t, device
-                )
+                # An evaluation must never end a run; see the same guard in mot_jepa_train.
+                try:
+                    sparse = heldout_retrieval(
+                        stage, backbone, eval_loader, gallery, gallery_tasks, eval_task_of_store_t, device
+                    )
+                except Exception:
+                    logger.exception("held-out retrieval failed at step %d; continuing", global_step)
 
         else:
             masks = build_rollout_masks(layout, split_step=cfg.stage4.split_step, batch_size=cfg.local_batch_size).to(
