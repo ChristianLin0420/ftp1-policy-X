@@ -116,7 +116,8 @@ def add_conditioning(
     # head block exactly constant, and nine dead slots marked "present" dilute every masked
     # mean and let the action embedder spend capacity on a constant.
     mask = ap.state_mask(spec)
-    mask = ap.drop_constant_columns(ap.sample_actions(np.asarray(state_out[:]), episode_ends, mask), mask)
+    ends = np.asarray(dest_meta["episode_ends"][:], dtype=np.int64)
+    mask = ap.drop_constant_columns(ap.sample_actions(np.asarray(state_out[:]), ends, mask), mask)
     mask_out = dest_meta.require_array("action_mask", shape=mask.shape, dtype="uint8")
     mask_out[:] = mask
 
