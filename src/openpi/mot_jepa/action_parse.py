@@ -232,6 +232,28 @@ def state_mask(spec: StoreStateSpec) -> np.ndarray:
     return mask
 
 
+def drop_constant_columns(state: np.ndarray, mask: np.ndarray, *, tol: float = 1e-6) -> np.ndarray:
+    """Clear mask bits whose column never varies across the store.
+
+    The declared presence of a stream is not evidence that it recorded anything -- exactly
+    the lesson ``is_degenerate`` encodes for tactile, applied here to proprioception. A
+    *static* camera makes ``camera_ego_pose`` constant, so its relative head transform is the
+    identity in every frame: on RH20TCfg5Franka that is nine of nineteen live slots carrying
+    literally zero information, while the mask insists they are present.
+
+    Dead slots are worse than absent ones. They dilute every masked mean, they let the action
+    embedder spend capacity on a constant, and they make ``mask.sum()`` overstate how much
+    proprioception a domain actually contributes.
+    """
+    mask = np.asarray(mask).reshape(-1).copy()
+    varies = state.std(axis=0) > tol
+    dead = (mask.astype(bool)) & (~varies)
+    if np.any(dead):
+        logger.info("dropping %d constant slot(s) from the action mask: %s", int(dead.sum()), np.flatnonzero(dead))
+    mask[dead] = 0
+    return mask
+
+
 def read_state(data: zarr.Group, spec: StoreStateSpec, begin: int, end: int) -> np.ndarray:
     """``(end - begin, 120) float32`` absolute state in FTP-1 slot order.
 

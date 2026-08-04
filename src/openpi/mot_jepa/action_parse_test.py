@@ -380,3 +380,31 @@ def test_pose_action_scale_matches_the_motion_not_the_encoding(tmp_path):
     assert abs(float(rot.mean())) < 0.5, "rot6d block still carries the identity offset"
     assert float(np.abs(rot).max()) > 0, "rot6d block is entirely dead"
     assert spec_mask[3:9].all()
+
+
+def test_constant_columns_are_dropped_from_the_mask():
+    """A static camera yields an exactly-constant head block that the mask still calls live.
+
+    Measured on RH20TCfg5Franka: head-track-pos and head-track-rot had sd 0.00000 across the
+    store, nine of nineteen live slots carrying zero information.
+    """
+    state = np.zeros((100, ap.ACTION_DIM), dtype=np.float32)
+    state[:, 0:3] = np.random.default_rng(0).normal(size=(100, 3))  # a wrist that moves
+    state[:, ap.HEAD_START : ap.HEAD_START + 9] = ap.IDENTITY_POSE9D  # a camera that does not
+
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[0:9] = 1
+    mask[ap.HEAD_START : ap.HEAD_START + 9] = 1
+
+    tightened = ap.drop_constant_columns(state, mask)
+    assert tightened[0:3].all(), "the moving wrist position must survive"
+    assert not tightened[ap.HEAD_START : ap.HEAD_START + 9].any(), "the static head must be dropped"
+    assert tightened.sum() < mask.sum()
+
+
+def test_dropping_constants_never_adds_a_slot():
+    rng = np.random.default_rng(1)
+    state = rng.normal(size=(50, ap.ACTION_DIM)).astype(np.float32)
+    mask = (rng.random(ap.ACTION_DIM) > 0.5).astype(np.uint8)
+    tightened = ap.drop_constant_columns(state, mask)
+    assert np.all(tightened <= mask)
