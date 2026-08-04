@@ -198,3 +198,159 @@ CONFIGS: dict[str, MotJepaTrainConfig] = {
 def cli() -> MotJepaTrainConfig:
     """Mirrors the repository's tyro entrypoint style (``training/config.py:1335``)."""
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in CONFIGS.items()})
+
+
+# ======================================================================================
+# Post-training (Stage 3: instruction, Stage 4: action)
+# ======================================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class Stage3Config:
+    """Clip<->language alignment."""
+
+    instruction_emb: str = ""
+    """Path to ``instruction_emb.npz`` from ``scripts/mot_jepa_embed_instructions.py``."""
+    text_dim: int = 768
+    """Width of the frozen instruction embedding. 768 for the SigLIP base text tower."""
+    hidden: int = 1024
+    projector_dim: int = 256
+    temperature: float = 0.07
+    min_stores_per_domain: int = 4
+    """A batch must be able to see several tasks or the retrieval is trivial. This drops RDP
+    (2 stores), RDP_Bimanual (1), Unit (1), Unit_Bimanual (2) and QINGLOONG (3), leaving 10
+    domains and ~517 stores."""
+    control_interval: int = 1_000
+    """How often to run the store-identity control. It is the stage's falsifier, not a
+    diagnostic: passing retrieval while the control also passes means the head learned store
+    identity rather than language."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Stage4Config:
+    """Action-conditioned latent rollout."""
+
+    split_step: int = 4
+    """Observe steps ``[0, split)``, predict ``[split, num_steps)``. Half and half at T=8."""
+    weight_latent: float = 1.0
+    weight_action_sync: float = 0.1
+    """Small InfoNCE matching a clip's transition to its own action sequence. This is the term
+    that is *provably* lower for the matched pair, mirroring ``L_sync``'s role in pretraining;
+    the latent regression alone has a solution that ignores the action entirely."""
+    temperature: float = 0.07
+    projector_dim: int = 256
+    donor_interval: int = 500
+    """How often to measure the action donor ratio -- the stage's falsifier."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MotJepaPosttrainConfig:
+    """One post-training run. The pretrained backbone is frozen throughout."""
+
+    name: str = "mot_jepa_stage3"
+    exp_name: str = "dev"
+    project_name: str = "mot-jepa"
+    run_root: str = ".cache/mot_jepa/runs"
+
+    stage: str = "instruction"
+    """``instruction`` (Stage 3) or ``action`` (Stage 4)."""
+    pretrained_run: str = ""
+    """Run directory of the pretraining run whose backbone this stage freezes."""
+    pretrained_step: int | None = None
+    """Which checkpoint to load. ``None`` takes the latest."""
+
+    layout_preset: str = "pilot"
+    encoder: MoTEncoderConfig = dataclasses.field(default_factory=MoTEncoderConfig)
+    predictor: MoTPredictorConfig = dataclasses.field(default_factory=MoTPredictorConfig)
+    data: DataConfig = dataclasses.field(default_factory=DataConfig)
+    stage3: Stage3Config = dataclasses.field(default_factory=Stage3Config)
+    stage4: Stage4Config = dataclasses.field(default_factory=Stage4Config)
+
+    seed: int = 42
+    local_batch_size: int = 16
+    num_train_steps: int = 20_000
+    lr_peak: float = 5e-4
+    lr_end: float = 1e-6
+    lr_warmup_steps: int = 1_000
+    weight_decay: float = 0.02
+    beta1: float = 0.9
+    beta2: float = 0.95
+    clip_grad_norm: float = 1.0
+
+    log_interval: int = 50
+    save_interval: int = 500
+    keep_last: int = 3
+    keep_period: int | None = 5_000
+
+    gradient_checkpointing: bool = False
+    wandb_enabled: bool = True
+    find_unused_parameters: bool = False
+    """False, unlike pretraining: ``T_HARD`` -- the mode that legitimately leaves the tactile
+    encoder without gradient -- does not occur in either post-training stage."""
+
+    @property
+    def layout(self) -> TokenLayout:
+        presets = {"pilot": LAYOUT_PILOT, "base": LAYOUT_BASE}
+        if self.layout_preset not in presets:
+            raise ValueError(f"unknown layout_preset={self.layout_preset!r}, expected one of {sorted(presets)}")
+        return presets[self.layout_preset]
+
+    @property
+    def run_dir(self) -> pathlib.Path:
+        return pathlib.Path(self.run_root) / self.name / self.exp_name
+
+    @property
+    def checkpoint_dir(self) -> pathlib.Path:
+        return self.run_dir / "checkpoints"
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> MotJepaPosttrainConfig:
+        return _from_dict(cls, json.loads(text))
+
+    def diff(self, other: MotJepaPosttrainConfig) -> dict[str, tuple[object, object]]:
+        mine, theirs = dataclasses.asdict(self), dataclasses.asdict(other)
+        return {key: (mine[key], theirs[key]) for key in mine if mine[key] != theirs[key]}
+
+
+POSTTRAIN_CONFIGS: dict[str, MotJepaPosttrainConfig] = {
+    "mot_jepa_posttrain_debug": MotJepaPosttrainConfig(
+        name="mot_jepa_posttrain_debug",
+        layout_preset="pilot",
+        encoder=MoTEncoderConfig(depth=2, num_local_layers=1, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=1, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        num_train_steps=20,
+        local_batch_size=2,
+        lr_warmup_steps=2,
+        save_interval=10,
+        log_interval=1,
+        wandb_enabled=False,
+        data=DataConfig(num_workers=0),
+        stage3=Stage3Config(min_stores_per_domain=1, control_interval=10),
+        stage4=Stage4Config(donor_interval=10),
+    ),
+    "mot_jepa_stage3": MotJepaPosttrainConfig(
+        name="mot_jepa_stage3",
+        stage="instruction",
+        layout_preset="pilot",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        num_train_steps=20_000,
+        local_batch_size=32,
+    ),
+    "mot_jepa_stage4": MotJepaPosttrainConfig(
+        name="mot_jepa_stage4",
+        stage="action",
+        layout_preset="pilot",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        num_train_steps=40_000,
+        local_batch_size=16,
+    ),
+}
+
+
+def posttrain_cli() -> MotJepaPosttrainConfig:
+    return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in POSTTRAIN_CONFIGS.items()})

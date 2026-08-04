@@ -284,3 +284,67 @@ def test_non_finite_poses_do_not_take_down_a_store(tmp_path):
     spec = ap.specs_for_store(store["data"])
     state = ap.read_state(store["data"], spec, 0, 40)
     assert np.all(np.isfinite(state))
+
+
+def test_mask_only_actions_agree_with_the_spec_driven_version(tmp_path, domain):
+    """The derived store carries state and action_mask but no spec, so it needs a spec-free
+    path. If the two ever disagree, actions computed at train time stop matching the ones the
+    builder's semantics describe -- and nothing downstream would report it.
+    """
+    store = make_store(tmp_path / f"{domain}.zarr", OBSERVED[domain])
+    spec = ap.specs_for_store(store["data"])
+    state = ap.read_state(store["data"], spec, 0, 40)
+    mask = ap.state_mask(spec)
+
+    np.testing.assert_allclose(
+        ap.actions_from_state(state[0:17:2], mask),
+        ap.states_to_actions(state[0:17:2], spec),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_pose_blocks_and_gripper_columns_land_where_ftp1_puts_them():
+    """These constants are what make the spec-free path possible; a wrong one is silent."""
+    assert ap.POSE_BLOCKS[0] == slice(0, 9)
+    assert ap.POSE_BLOCKS[1] == slice(48, 57)
+    assert ap.POSE_BLOCKS[2] == slice(96, 105)
+    assert ap.ABSOLUTE_COLUMNS == (16 + 28, 64 + 28)
+
+
+def test_mask_only_actions_zero_absent_slots(tmp_path):
+    store = make_store(tmp_path / "u.zarr", OBSERVED["Unit"])
+    spec = ap.specs_for_store(store["data"])
+    state = ap.read_state(store["data"], spec, 0, 40)
+    mask = ap.state_mask(spec)
+    actions = ap.actions_from_state(state[:9], mask)
+    assert np.all(actions[:, mask == 0] == 0.0)
+    # Unit has no wrist, so the pose block must stay zero rather than compose garbage.
+    assert np.all(actions[:, ap.POSE_BLOCKS[0]] == 0.0)
+
+
+def test_a_degenerate_pose_block_does_not_raise():
+    """``np.linalg.inv`` throws LinAlgError on a singular rotation, which inside a DataLoader
+    worker kills the worker and the whole job. One malformed frame in 17.7M must cost that
+    frame only, so the inverse is taken analytically and non-finite rows are zeroed.
+    """
+    state = np.zeros((5, ap.ACTION_DIM), dtype=np.float32)
+    state[:, 0:9] = np.arange(5, dtype=np.float32)[:, None]  # rot6d block is all-equal: singular
+    mask = np.zeros(ap.ACTION_DIM, dtype=np.uint8)
+    mask[0:9] = 1
+
+    actions = ap.actions_from_state(state, mask)
+    assert actions.shape == (4, ap.ACTION_DIM)
+    assert np.all(np.isfinite(actions))
+
+
+def test_relative_pose_uses_an_exact_rigid_inverse():
+    """The analytic inverse must agree with the general one on genuine rotations."""
+    rng = np.random.default_rng(11)
+    poses = mat_to_pose9d(pose_to_mat(rng.normal(0.0, 0.7, (6, 6))))
+    state = np.zeros((6, ap.ACTION_DIM))
+    state[:, 0:9] = poses
+    mats = pose10d_to_mat(poses)
+    for step in range(5):
+        expected = mat_to_pose9d(np.linalg.inv(mats[step]) @ mats[step + 1])
+        np.testing.assert_allclose(ap.relative_pose(state, slice(0, 9))[step], expected, rtol=1e-9, atol=1e-9)

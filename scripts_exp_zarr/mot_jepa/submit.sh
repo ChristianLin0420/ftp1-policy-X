@@ -36,6 +36,9 @@ if [[ -f "${RUN_DIR}/DONE" ]]; then
 fi
 
 export REPO_ROOT RUN_DIR CONFIG_NAME
+# Post-training reuses this whole harness -- requeue chain, W&B continuity, rendezvous --
+# and differs only in which entrypoint torchrun launches.
+export TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/mot_jepa_train.py}"
 export DATA_GLOB="${DATA_GLOB:-}"
 export STAGE_SOURCE="${STAGE_SOURCE:-}"
 export EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -43,6 +46,7 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 
 echo "repo      ${REPO_ROOT}"
 echo "config    ${CONFIG_NAME}"
+echo "script    ${TRAIN_SCRIPT}"
 echo "run dir   ${RUN_DIR}"
 echo "nodes     ${NODES} x 8 H100"
 echo "data      ${DATA_GLOB:-<staged from ${STAGE_SOURCE}>}"

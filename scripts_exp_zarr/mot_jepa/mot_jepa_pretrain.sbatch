@@ -39,7 +39,7 @@ CONFIG_NAME="${CONFIG_NAME:-mot_jepa_pilot}"
 MAX_REQUEUES="${MAX_REQUEUES:-60}"
 SCRIPT_DIR="${REPO_ROOT}/scripts_exp_zarr/mot_jepa"
 
-export REPO_ROOT RUN_DIR CONFIG_NAME SCRIPT_DIR
+export REPO_ROOT RUN_DIR CONFIG_NAME SCRIPT_DIR TRAIN_SCRIPT
 
 echo "[$(date -Is)] job=${SLURM_JOB_ID} attempt=${SLURM_RESTART_COUNT:-0} nodes=${SLURM_NNODES} run=${RUN_DIR}"
 

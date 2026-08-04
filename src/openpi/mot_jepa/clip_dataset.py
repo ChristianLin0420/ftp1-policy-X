@@ -251,6 +251,7 @@ class ClipSample:
     # a shape that varied with the store would deadlock DDP's all-reduce -- but only filled
     # when the dataset is built with ``with_conditioning=True``.
     state: torch.Tensor  # (T, 120) float32
+    action: torch.Tensor  # (num_steps, 120) float32, derived from state at this clip's stride
     action_mask: torch.Tensor  # (120,) float32
     instruction_id: torch.Tensor  # () int64
     episode_idx: torch.Tensor  # () int64
@@ -326,6 +327,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         """
         out = {
             "state": torch.zeros(self.layout.num_frames, ap.ACTION_DIM, dtype=torch.float32),
+            "action": torch.zeros(self.layout.num_steps, ap.ACTION_DIM, dtype=torch.float32),
             "action_mask": torch.zeros(ap.ACTION_DIM, dtype=torch.float32),
             "instruction_id": torch.tensor(-1, dtype=torch.int64),
             "episode_idx": torch.tensor(entry.episode_idx, dtype=torch.int64),
@@ -333,9 +335,20 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         if not (self.with_conditioning and self._conditioned[entry.store_idx]):
             return out
         group = self._stores[entry.store_idx]
-        out["state"] = torch.from_numpy(np.asarray(group["data"]["state"][frames], dtype=np.float32))
-        out["action_mask"] = torch.from_numpy(np.asarray(group["meta"]["action_mask"][:], dtype=np.float32))
+        state = np.asarray(group["data"]["state"][frames], dtype=np.float32)
+        mask = np.asarray(group["meta"]["action_mask"][:], dtype=np.float32)
+        out["state"] = torch.from_numpy(state)
+        out["action_mask"] = torch.from_numpy(mask)
         out["instruction_id"] = torch.tensor(int(group["meta"]["instruction_id"][entry.episode_idx]), dtype=torch.int64)
+
+        # Actions are derived here, on the clip's OWN frames, which is the whole reason they
+        # are not stored: they depend on the stride, and this dataset samples stride in {1,2}.
+        # Taken at tubelet granularity so it lines up with the token time axis and no rotation
+        # has to be composed inside a tubelet. The final step has no successor, so it repeats
+        # rather than inventing one.
+        anchors = state[:: self.layout.tubelet_t]
+        actions = ap.actions_from_state(anchors, mask)
+        out["action"] = torch.from_numpy(np.concatenate([actions, actions[-1:]], axis=0))
         return out
 
     def _specs(self, store_idx: int) -> list[tp.TactileSpec]:

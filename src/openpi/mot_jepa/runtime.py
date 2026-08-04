@@ -219,7 +219,9 @@ def save_checkpoint(
 
     module = student.module if hasattr(student, "module") else student
     torch.save(module.state_dict(), staging / "student.pt")
-    torch.save(teacher.state_dict(), staging / "teacher_ema.pt")
+    # Post-training freezes the backbone, so there is no EMA to shadow and no teacher to save.
+    if teacher is not None:
+        torch.save(teacher.state_dict(), staging / "teacher_ema.pt")
     torch.save(optimizer.state_dict(), staging / "optimizer.pt")
     torch.save({"global_step": step, **(extra or {})}, staging / "metadata.pt")
     (staging / "train_config.json").write_text(config_json)
@@ -268,7 +270,8 @@ def load_checkpoint(
     path = pathlib.Path(checkpoint_dir) / str(step)
     module = student.module if hasattr(student, "module") else student
     module.load_state_dict(torch.load(path / "student.pt", map_location=device))
-    teacher.load_state_dict(torch.load(path / "teacher_ema.pt", map_location=device))
+    if teacher is not None:
+        teacher.load_state_dict(torch.load(path / "teacher_ema.pt", map_location=device))
     if optimizer is not None:
         optimizer.load_state_dict(torch.load(path / "optimizer.pt", map_location=device))
     metadata = torch.load(path / "metadata.pt", map_location="cpu")

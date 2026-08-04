@@ -63,7 +63,7 @@ exec "${REPO_ROOT}/.venv/bin/python" -m torch.distributed.run \
   --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
   --rdzv_id="${SLURM_JOB_ID}_${SLURM_RESTART_COUNT:-0}" \
   --max_restarts=0 \
-  scripts/mot_jepa_train.py "${CONFIG_NAME}" \
+  "${TRAIN_SCRIPT:-scripts/mot_jepa_train.py}" "${CONFIG_NAME}" \
   --run_root "$(dirname "$(dirname "${RUN_DIR}")")" \
   --exp_name "$(basename "${RUN_DIR}")" \
   --data.store_glob "${DATA_GLOB}" \

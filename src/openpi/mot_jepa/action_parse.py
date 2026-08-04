@@ -265,9 +265,74 @@ def relative_pose(state: np.ndarray, columns: slice) -> np.ndarray:
     that helper cannot express (it takes one base for the whole slice). ``action_parse_test``
     asserts step-by-step equality against it so the semantics stay pinned to the repository's
     definition rather than to this implementation.
+
+    The inverse is taken analytically -- ``inv([[R, t], [0, 1]]) == [[R^T, -R^T t], [0, 1]]``
+    -- rather than with ``np.linalg.inv``. That is both cheaper and, more importantly, it
+    cannot raise: a degenerate rotation block makes ``inv`` throw ``LinAlgError``, which in a
+    DataLoader worker kills the worker and takes the whole job with it. One malformed frame in
+    17.7 M must cost that frame, not the run.
     """
     mats = pose10d_to_mat(np.asarray(state[:, columns], dtype=np.float64))
-    return mat_to_pose9d(np.linalg.inv(mats[:-1]) @ mats[1:])
+    rotation, translation = mats[:-1, :3, :3], mats[:-1, :3, 3]
+    inverse_rotation = rotation.transpose(0, 2, 1)
+
+    relative = np.zeros_like(mats[1:])
+    relative[:, :3, :3] = inverse_rotation @ mats[1:, :3, :3]
+    relative[:, :3, 3] = np.einsum("nij,nj->ni", inverse_rotation, mats[1:, :3, 3] - translation)
+    relative[:, 3, 3] = 1.0
+
+    out = mat_to_pose9d(relative)
+    # A non-orthonormal block yields finite garbage rather than an exception; a NaN one would
+    # still poison the loss, so it is zeroed and reported instead.
+    bad = ~np.all(np.isfinite(out), axis=-1)
+    if np.any(bad):
+        logger.warning("%d degenerate pose transition(s) zeroed", int(bad.sum()))
+        out[bad] = 0.0
+    return out
+
+
+#: The 9-D pose blocks of the 120-D layout. Fixed by the FTP-1 slot map, so a reader can
+#: identify them without the source store's spec -- which is what lets the *derived* store,
+#: which carries only ``state`` and ``action_mask``, produce actions on its own.
+POSE_BLOCKS: tuple[slice, ...] = (
+    slice(SLICES["right-wrist-pos"][0], SLICES["right-wrist-rot"][1]),
+    slice(SLICES["left-wrist-pos"][0], SLICES["left-wrist-rot"][1]),
+    slice(SLICES["head-track-pos"][0], SLICES["head-track-rot"][1]),
+)
+
+#: Gripper column of each hand, absolute under ``action_joint_rep="mix"``.
+ABSOLUTE_COLUMNS: tuple[int, ...] = (
+    SLICES["right-hand-joints"][0] + GRIPPER_HAND_SLOT,
+    SLICES["left-hand-joints"][0] + GRIPPER_HAND_SLOT,
+)
+
+
+def actions_from_state(state: np.ndarray, action_mask: np.ndarray) -> np.ndarray:
+    """``(N, 120)`` states -> ``(N - 1, 120)`` actions, using only the mask.
+
+    Equivalent to :func:`states_to_actions` but needs no :class:`StoreStateSpec`, because the
+    pose blocks and the gripper columns are properties of the *layout*, not of the store. That
+    is what lets the derived clip store -- which carries ``state`` and ``action_mask`` and
+    nothing else -- derive actions at read time for whatever stride the clip used.
+
+    ``action_parse_test`` asserts this agrees with the spec-driven version on every observed
+    layout, so the two cannot drift apart.
+    """
+    if state.ndim != 2 or state.shape[1] != ACTION_DIM:
+        raise ValueError(f"state must be (N, {ACTION_DIM}), got {state.shape}")
+    if state.shape[0] < 2:
+        raise ValueError("need at least two states to form one action")
+
+    mask = np.asarray(action_mask).reshape(-1).astype(bool)
+    actions = state[1:] - state[:-1]
+    for block in POSE_BLOCKS:
+        if mask[block].any():
+            actions[:, block] = relative_pose(state, block)
+    for column in ABSOLUTE_COLUMNS:
+        if mask[column]:
+            actions[:, column] = state[1:, column]
+    actions[:, ~mask] = 0.0
+    return actions.astype(np.float32)
 
 
 def states_to_actions(
