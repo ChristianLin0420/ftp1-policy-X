@@ -62,7 +62,16 @@ class InfiniteBatchSampler(torch.utils.data.Sampler):
     40-job chain sees the same sample order an uninterrupted run would.
     """
 
-    def __init__(self, num_samples: int, batch_size: int, *, rank: int, world_size: int, seed: int) -> None:
+    def __init__(
+        self,
+        num_samples: int,
+        batch_size: int,
+        *,
+        rank: int,
+        world_size: int,
+        seed: int,
+        domain_of_sample: np.ndarray | None = None,
+    ) -> None:
         self.num_samples = num_samples
         self.batch_size = batch_size
         self.rank = rank
@@ -73,6 +82,31 @@ class InfiniteBatchSampler(torch.utils.data.Sampler):
         if self.global_batch > num_samples:
             raise ValueError(f"global batch {self.global_batch} exceeds dataset size {num_samples}")
 
+        # Domain-pure batches. Without this, Level-A InfoNCE is solvable by DATASET IDENTITY:
+        # a GelSight clip and a uSkin clip differ so obviously in appearance that matching
+        # video to touch needs no temporal correspondence at all. Measured on a mixed-domain
+        # run, the positional-shortcut control reached the SAME top-1 as real tactile
+        # (retrieval_gap = 0.0 at step 6000, ratio-to-chance 14.0) -- the shuffle-equals-real
+        # failure this whole design exists to prevent, reproduced in our own model.
+        #
+        # Keeping every batch single-domain makes sensor, embodiment, appearance and lighting
+        # constant across the positive and all negatives, so they carry zero discriminative
+        # signal and only *when things happen* can solve it.
+        self.domain_pools: list[np.ndarray] | None = None
+        if domain_of_sample is not None:
+            pools = [np.flatnonzero(domain_of_sample == d) for d in np.unique(domain_of_sample)]
+            # A domain smaller than one global batch cannot fill a pure batch; drop it rather
+            # than silently padding with another domain's clips.
+            self.domain_pools = [p for p in pools if p.size >= self.global_batch]
+            dropped = len(pools) - len(self.domain_pools)
+            if dropped:
+                logger.warning("%d domain(s) smaller than one global batch were dropped", dropped)
+            if not self.domain_pools:
+                raise ValueError(
+                    f"no domain has >= {self.global_batch} clips; lower local_batch_size or "
+                    "disable domain-pure batching"
+                )
+
     def set_start_step(self, step: int) -> None:
         self.start_step = int(step)
 
@@ -81,11 +115,29 @@ class InfiniteBatchSampler(torch.utils.data.Sampler):
         return rng.permutation(self.num_samples)
 
     def indices_for_step(self, step: int) -> list[int]:
-        batches_per_epoch = self.num_samples // self.global_batch
+        if self.domain_pools is None:
+            batches_per_epoch = self.num_samples // self.global_batch
+            epoch, offset = divmod(step, batches_per_epoch)
+            permutation = self._epoch_permutation(epoch)
+            begin = offset * self.global_batch + self.rank * self.batch_size
+            return permutation[begin : begin + self.batch_size].tolist()
+
+        # Domain choice is a pure function of the step, so every rank picks the SAME domain --
+        # ranks disagreeing here would put different datasets in one all-gathered InfoNCE
+        # batch and quietly reintroduce the very shortcut this removes.
+        pool = self.domain_pools[self._domain_for_step(step)]
+        batches_per_epoch = max(pool.size // self.global_batch, 1)
         epoch, offset = divmod(step, batches_per_epoch)
-        permutation = self._epoch_permutation(epoch)
+        rng = np.random.Generator(np.random.PCG64(self.seed * 7_919 + step - offset))
+        permutation = pool[rng.permutation(pool.size)]
         begin = offset * self.global_batch + self.rank * self.batch_size
         return permutation[begin : begin + self.batch_size].tolist()
+
+    def _domain_for_step(self, step: int) -> int:
+        """Sample a domain in proportion to its size, identically on every rank."""
+        sizes = np.array([p.size for p in self.domain_pools], dtype=np.float64)
+        rng = np.random.Generator(np.random.PCG64(self.seed * 104_729 + step))
+        return int(rng.choice(len(self.domain_pools), p=sizes / sizes.sum()))
 
     def __iter__(self):
         step = self.start_step
@@ -109,8 +161,13 @@ def build_dataset(cfg: config_module.MotJepaTrainConfig) -> MotJepaClipDataset:
         stores = [path for _, path in pairs]
         domain_ids = [names.index(name) for name, _ in pairs]
     elif cfg.data.store_glob:
+        # Domain = the parent directory (<clips>/<domain>/<store>.zarr). Assigning every
+        # store id 0 here would silently make domain-pure batching a no-op, which is exactly
+        # the shortcut it exists to remove.
         stores = sorted(glob.glob(cfg.data.store_glob))
-        domain_ids = [0] * len(stores)
+        names = sorted({pathlib.Path(p).parent.name for p in stores})
+        domain_ids = [names.index(pathlib.Path(p).parent.name) for p in stores]
+        logger.info("discovered %d domains from %d stores: %s", len(names), len(stores), names)
     else:
         raise ValueError("set either data.domain_config or data.store_glob")
     if not stores:

@@ -4,6 +4,7 @@ import concurrent.futures
 import dataclasses
 import json
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -12,6 +13,7 @@ from openpi.mot_jepa import runtime
 from openpi.mot_jepa.config import CONFIGS
 from openpi.mot_jepa.config import MotJepaTrainConfig
 from openpi.mot_jepa.ema import EmaTeacher
+from scripts.mot_jepa_train import InfiniteBatchSampler
 
 
 def tiny_state(tmp_path, step: int) -> None:
@@ -199,3 +201,33 @@ def test_resolve_run_config_times_out_rather_than_hanging(tmp_path):
     (tmp_path / "run_config.claim").touch()  # winner claimed then died before writing
     with pytest.raises(TimeoutError, match="did not become readable"):
         runtime.resolve_run_config(tmp_path, json.dumps({"a": 1}), timeout_s=0.5, poll_s=0.05)
+
+
+def test_domain_pure_batches_never_mix_domains():
+    """Every batch must be single-domain, or Level-A InfoNCE is solvable by dataset identity.
+
+    Measured on a mixed-domain run: the positional-shortcut control reached the SAME top-1
+    as real tactile (retrieval_gap 0.0 at step 6000, ratio-to-chance 14.0). A GelSight clip
+    and a uSkin clip differ so obviously that matching video to touch needs no temporal
+    correspondence at all.
+    """
+    domain_of_sample = np.repeat(np.arange(4), 500)  # 4 domains x 500 clips
+    samplers = [
+        InfiniteBatchSampler(2000, 8, rank=r, world_size=2, seed=42, domain_of_sample=domain_of_sample)
+        for r in range(2)
+    ]
+    for step in range(60):
+        per_rank = [s.indices_for_step(step) for s in samplers]
+        domains = {int(domain_of_sample[i]) for idx in per_rank for i in idx}
+        assert len(domains) == 1, f"step {step} mixed domains {domains}"
+        assert not set(per_rank[0]) & set(per_rank[1]), "ranks must get disjoint clips"
+
+    # Every domain should be reachable, weighted by size.
+    seen = {int(domain_of_sample[samplers[0].indices_for_step(s)[0]]) for s in range(300)}
+    assert seen == {0, 1, 2, 3}
+
+
+def test_domain_smaller_than_a_global_batch_is_dropped_not_padded():
+    domain_of_sample = np.concatenate([np.zeros(500, int), np.ones(3, int)])
+    s = InfiniteBatchSampler(503, 8, rank=0, world_size=2, seed=1, domain_of_sample=domain_of_sample)
+    assert len(s.domain_pools) == 1, "the 3-clip domain cannot fill a 16-clip batch"
