@@ -55,6 +55,49 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+class ActionNormalizer(nn.Module):
+    """Per-domain, per-dimension z-scoring of action chunks. The head works in normalised space.
+
+    Raw FTP-1 actions are first differences, so they are tiny -- measured mean |a| of 0.0013 to
+    0.0107 depending on domain -- and their scale differs ~8x across domains. Both facts break
+    training if left alone:
+
+    * **Flow matching becomes trivial.** ``x_t = t*noise + (1-t)*a`` mixes N(0,1) noise with a
+      signal of magnitude 0.01, so the action contributes ~1% of the input and the target
+      ``u_t = noise - a`` is almost exactly the noise. The model scores near-zero loss by echoing
+      back what it was given, having learned nothing about actions.
+    * **Large-motion domains dominate.** A shared head trained on raw values weights sharpa's
+      0.0013-scale actions at a fraction of D-WHEEL's 0.0107.
+
+    Per *domain* rather than globally because batches are domain-pure and the embodiments are not
+    comparable; the statistics are stored as buffers so they land in the checkpoint and evaluation
+    can denormalise with exactly the values training used.
+    """
+
+    mean: torch.Tensor
+    scale: torch.Tensor
+
+    def __init__(self, num_domains: int, action_dim: int = ACTION_DIM) -> None:
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(num_domains, action_dim))
+        self.register_buffer("scale", torch.ones(num_domains, action_dim))
+
+    def load_stats(self, mean: torch.Tensor, scale: torch.Tensor) -> None:
+        if mean.shape != self.mean.shape or scale.shape != self.scale.shape:
+            raise ValueError(f"expected stats of shape {tuple(self.mean.shape)}")
+        with torch.no_grad():
+            self.mean.copy_(mean)
+            # A dead or constant slot has zero spread; leaving it at 1.0 maps it to a constant
+            # zero target rather than dividing by ~0 and manufacturing enormous values.
+            self.scale.copy_(torch.where(scale > 1e-6, scale, torch.ones_like(scale)))
+
+    def normalize(self, actions: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        return (actions - self.mean[domain_id].unsqueeze(1)) / self.scale[domain_id].unsqueeze(1)
+
+    def denormalize(self, actions: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        return actions * self.scale[domain_id].unsqueeze(1) + self.mean[domain_id].unsqueeze(1)
+
+
 class DiTBlock(nn.Module):
     """Pre-norm self-attention + cross-attention + SwiGLU, with adaLN-Zero conditioning.
 

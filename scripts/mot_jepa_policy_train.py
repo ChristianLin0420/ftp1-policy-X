@@ -39,6 +39,7 @@ from torch.nn.parallel import DistributedDataParallel
 from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.action_dit import ActionDiT
+from openpi.mot_jepa.action_dit import ActionNormalizer
 from openpi.mot_jepa.action_dit import flow_matching_loss
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
@@ -86,6 +87,64 @@ def build_dataset(cfg: config_module.PolicyConfig) -> MotJepaClipDataset:
     )
 
 
+def fit_action_stats(
+    dataset: MotJepaClipDataset, num_domains: int, path: pathlib.Path, *, clips_per_domain: int = 4096
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-domain, per-dimension mean/std of the action chunk, cached to ``path``.
+
+    Computed once by rank 0 and reused across the whole requeue chain: recomputing per job would
+    make the target distribution drift between checkpoints, so a resumed head would be predicting
+    in a slightly different space than the one it was trained in.
+
+    Only live slots contribute. A masked-out slot is structurally absent, and letting its zeros
+    into the mean would drag every live statistic toward zero in proportion to how many slots the
+    embodiment happens to leave empty.
+    """
+    if path.exists():
+        blob = np.load(path)
+        return torch.from_numpy(blob["mean"]), torch.from_numpy(blob["scale"])
+
+    total = np.zeros((num_domains, 120), dtype=np.float64)
+    total_sq = np.zeros((num_domains, 120), dtype=np.float64)
+    count = np.zeros((num_domains, 120), dtype=np.float64)
+
+    domain_of_sample = np.asarray(dataset.domain_ids, dtype=np.int64)[dataset.clip_index.entries[:, 0]]
+    rng = np.random.default_rng(0)
+    picks: list[int] = []
+    for domain in range(num_domains):
+        pool = np.flatnonzero(domain_of_sample == domain)
+        if pool.size:
+            picks.extend(rng.choice(pool, size=min(clips_per_domain, pool.size), replace=False).tolist())
+
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(dataset, picks), batch_size=64, num_workers=8, collate_fn=collate_clips
+    )
+    for batch in loader:
+        chunk = batch["action_chunk"].numpy().astype(np.float64)
+        mask = batch["chunk_mask"].numpy().astype(np.float64)
+        for row, domain in enumerate(batch["domain_id"].tolist()):
+            total[domain] += (chunk[row] * mask[row]).sum(axis=0)
+            total_sq[domain] += ((chunk[row] ** 2) * mask[row]).sum(axis=0)
+            count[domain] += mask[row].sum(axis=0)
+
+    safe = np.maximum(count, 1.0)
+    mean = total / safe
+    scale = np.sqrt(np.maximum(total_sq / safe - mean**2, 0.0))
+    mean[count == 0] = 0.0
+    scale[count == 0] = 1.0
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, mean=mean.astype(np.float32), scale=scale.astype(np.float32))
+    logger.info(
+        "action stats over %d clips: median live scale %.5f (min %.5f, max %.5f)",
+        len(picks),
+        float(np.median(scale[count > 0])),
+        float(scale[count > 0].min()),
+        float(scale[count > 0].max()),
+    )
+    return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(scale.astype(np.float32))
+
+
 def init_tracking(cfg: config_module.PolicyConfig, run_dir: pathlib.Path, *, resuming: bool) -> None:
     """Fixed W&B run id so a requeue chain appends to one run instead of forking."""
     if not cfg.wandb_enabled or not runtime.is_main_process():
@@ -122,6 +181,17 @@ def train(cfg: config_module.PolicyConfig) -> None:
 
     dataset = build_dataset(cfg)
     logger.info("%d clips at horizon %d", len(dataset), cfg.head.horizon)
+
+    # The head predicts NORMALISED actions. Raw FTP-1 deltas are ~0.01 and vary 8x across
+    # domains, which makes flow matching degenerate (the action is 1% of x_t, so echoing the
+    # noise scores near-zero loss) and lets large-motion domains dominate a shared head.
+    num_domains = int(max(dataset.domain_ids)) + 1
+    stats_path = run_dir / "action_stats.npz"
+    if runtime.is_main_process():
+        fit_action_stats(dataset, num_domains, stats_path)
+    runtime.barrier()
+    normalizer = ActionNormalizer(num_domains).to(device)
+    normalizer.load_stats(*[t.to(device) for t in fit_action_stats(dataset, num_domains, stats_path)])
     # Domain-pure batches, which pretraining does not need but IDP does. Its neighbour geometry
     # and its reference variance are both computed WITHIN a batch, so a batch mixing embodiments
     # would compare a 16-slot arm against a 40-slot bimanual rig and read the difference in
@@ -192,9 +262,14 @@ def train(cfg: config_module.PolicyConfig) -> None:
             group["lr"] = lr
 
         inputs = to_inputs(batch, device)
-        actions = batch["action_chunk"].to(device, non_blocking=True).float()
+        domain_id = batch["domain_id"].to(device, non_blocking=True)
         action_mask = batch["action_mask"].to(device, non_blocking=True).float()
         chunk_mask = batch["chunk_mask"].to(device, non_blocking=True).float()
+        # Normalise, then re-apply the mask: z-scoring a dead slot would turn its structural zero
+        # into -mean/scale, which is not zero and would be regressed as if it were a real target.
+        actions = normalizer.normalize(
+            batch["action_chunk"].to(device, non_blocking=True).float(), domain_id
+        ) * chunk_mask
 
         # The encoder never trains, so no activations are kept for it. That is what makes the
         # step affordable: only the 61.9M-parameter head holds a graph.
@@ -247,11 +322,10 @@ def train(cfg: config_module.PolicyConfig) -> None:
                 teacher=None,
                 optimizer=optimizer,
                 config_json=cfg.to_json(),
+                loss_fn=normalizer,
                 keep_last=cfg.keep_last,
                 keep_period=cfg.keep_period,
             )
-        if preempted.is_set():
-            break
 
     if runtime.is_main_process():
         runtime.save_checkpoint(
@@ -261,6 +335,7 @@ def train(cfg: config_module.PolicyConfig) -> None:
             teacher=None,
             optimizer=optimizer,
             config_json=cfg.to_json(),
+            loss_fn=normalizer,
             keep_last=cfg.keep_last,
             keep_period=cfg.keep_period,
         )
