@@ -196,8 +196,8 @@ def train(cfg: config_module.PolicyConfig) -> None:
         action_mask = batch["action_mask"].to(device, non_blocking=True).float()
         chunk_mask = batch["chunk_mask"].to(device, non_blocking=True).float()
 
-        # The encoder never trains. Running it under no_grad is what makes this affordable:
-        # the head is ~30M parameters against the encoder's 254-tensor forward.
+        # The encoder never trains, so no activations are kept for it. That is what makes the
+        # step affordable: only the 61.9M-parameter head holds a graph.
         with torch.no_grad(), torch.autocast(device.type, torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(inputs)
         encoded = type(encoded)(
