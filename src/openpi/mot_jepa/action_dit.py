@@ -1,0 +1,239 @@
+"""A DiT action head over a frozen MoT-JEPA encoder.
+
+Emits a future action chunk ``(B, H, 120)`` in the FTP-1 slot layout, conditioned on the frozen
+encoder's per-tubelet readout. Two objectives share the same trunk:
+
+``drifting``
+    A pushforward map. The head draws its own noise and returns a chunk in **one** forward pass;
+    there is no timestep, no noise schedule and no sampler. Trained by
+    :mod:`openpi.mot_jepa.drifting`.
+
+``flowmatch``
+    Conditional flow matching, the control arm. Takes ``(x_t, t)`` and returns a velocity, mirroring
+    ``models_pytorch/ftp1_pytorch.py:435-534`` for training and ``:541-675`` for Euler sampling.
+
+The control arm exists because this pipeline changes two things at once relative to the FTP-1
+policy -- the conditioning encoder *and* the generative objective. Without an arm that changes only
+the encoder, a bad number cannot be attributed to either.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+
+import torch
+from torch import nn
+import torch.nn.functional as F  # noqa: N812
+
+from openpi.mot_jepa.action_parse import ACTION_DIM
+from openpi.mot_jepa.layout import TokenLayout
+from openpi.mot_jepa.mot_encoder import EncoderOutput
+
+OBJECTIVES = ("drifting", "flowmatch")
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionDiTConfig:
+    """Shape of the action head. The frozen encoder's widths come from the layout."""
+
+    width: int = 512
+    depth: int = 8
+    num_heads: int = 8
+    horizon: int = 32
+    objective: str = "drifting"
+    mlp_ratio: float = 4.0
+
+    def __post_init__(self) -> None:
+        if self.objective not in OBJECTIVES:
+            raise ValueError(f"objective must be one of {OBJECTIVES}, got {self.objective!r}")
+        if self.width % self.num_heads:
+            raise ValueError(f"width {self.width} must divide by num_heads {self.num_heads}")
+
+
+def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiTBlock(nn.Module):
+    """Pre-norm self-attention + cross-attention + SwiGLU, with adaLN-Zero conditioning.
+
+    adaLN-Zero rather than conditioning tokens: the gates are zero-initialised, so at step 0 every
+    block is exactly the identity and the head starts as a pass-through. That matters here because
+    the conditioning comes from a *frozen* encoder -- a randomly-scaled modulation at init would
+    inject noise into a signal the head cannot correct by retraining the encoder.
+    """
+
+    def __init__(self, width: int, num_heads: int, mlp_ratio: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(width, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.cross = nn.MultiheadAttention(width, num_heads, batch_first=True)
+        self.norm3 = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+
+        hidden = int(width * mlp_ratio)
+        self.mlp_in = nn.Linear(width, 2 * hidden)  # SwiGLU: value and gate
+        self.mlp_out = nn.Linear(hidden, width)
+
+        # Nine vectors: shift/scale/gate for self-attn, cross-attn and MLP.
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 9 * width))
+        nn.init.zeros_(self.modulation[1].weight)
+        nn.init.zeros_(self.modulation[1].bias)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        params = self.modulation(cond).chunk(9, dim=-1)
+        shift_sa, scale_sa, gate_sa, shift_ca, scale_ca, gate_ca, shift_mlp, scale_mlp, gate_mlp = params
+
+        h = _modulate(self.norm1(x), shift_sa, scale_sa)
+        x = x + gate_sa.unsqueeze(1) * self.attn(h, h, h, need_weights=False)[0]
+
+        h = _modulate(self.norm2(x), shift_ca, scale_ca)
+        x = x + gate_ca.unsqueeze(1) * self.cross(h, context, context, need_weights=False)[0]
+
+        h = _modulate(self.norm3(x), shift_mlp, scale_mlp)
+        value, gate = self.mlp_in(h).chunk(2, dim=-1)
+        return x + gate_mlp.unsqueeze(1) * self.mlp_out(F.silu(gate) * value)
+
+
+def timestep_embedding(t: torch.Tensor, width: int, *, max_period: float = 10_000.0) -> torch.Tensor:
+    """Sinusoidal embedding of a continuous scalar, as in ``pi0_pytorch.create_sinusoidal_pos_embedding``."""
+    half = width // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
+    args = t.float().reshape(-1, 1) * freqs.reshape(1, -1)
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+class ActionDiT(nn.Module):
+    """Frozen encoder readout -> future action chunk.
+
+    The head owns no encoder. It consumes :attr:`EncoderOutput.sync_readout`, the per-tubelet
+    unimodal readout, because that is the representation the viability gate measured -- the ridge
+    that recovered the action chunk at R^2 0.32 pooled read exactly these tokens. Conditioning on
+    the final tokens instead would condition on something never gated.
+    """
+
+    def __init__(self, config: ActionDiTConfig, layout: TokenLayout, *, action_dim: int = ACTION_DIM) -> None:
+        super().__init__()
+        self.config = config
+        self.action_dim = action_dim
+        width = config.width
+
+        # One projection per expert, so the two widths (384 video, 192 tactile at pilot) enter a
+        # shared space before the head sees them.
+        self.context_proj = nn.ModuleList(
+            [nn.Linear(layout.video_width, width), nn.Linear(layout.tactile_width, width)]
+        )
+        self.context_norm = nn.LayerNorm(width)
+
+        self.action_in = nn.Linear(action_dim, width)
+        self.pos_embed = nn.Parameter(torch.zeros(1, config.horizon, width))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.blocks = nn.ModuleList([DiTBlock(width, config.num_heads, config.mlp_ratio) for _ in range(config.depth)])
+        self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
+        self.action_out = nn.Linear(width, action_dim)
+        nn.init.zeros_(self.action_out.weight)
+        nn.init.zeros_(self.action_out.bias)
+
+    def context_tokens(self, encoded: EncoderOutput) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, 2*num_steps, width)`` cross-attention memory and the ``(B, width)`` adaLN vector."""
+        projected = [proj(readout.to(proj.weight.dtype)) for proj, readout in zip(self.context_proj, encoded.sync_readout, strict=True)]
+        context = self.context_norm(torch.cat(projected, dim=1))
+        return context, context.mean(dim=1)
+
+    def forward(
+        self,
+        encoded: EncoderOutput,
+        action_mask: torch.Tensor,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns ``(B, H, action_dim)``: a *sample* under ``drifting``, a *velocity* under ``flowmatch``.
+
+        Both objectives share this signature. IDP is not the pure pushforward the original
+        Drifting paper describes -- it evaluates the generator twice per step, once at
+        ``(a_0, t=0)`` for the one-step prediction and once at ``(a* + (1-t_*)eps, t_*)`` for the
+        expert-proximal probe -- so it needs the same ``(x, t)`` interface flow matching does.
+        Inference is still one call; the second evaluation is a training-time term only.
+        """
+        context, pooled = self.context_tokens(encoded)
+        x = noisy_actions.to(context.dtype)
+        cond = pooled + timestep_embedding(timestep, self.config.width).to(context.dtype)
+        horizon = self.config.horizon
+
+        # Mask BEFORE the projection, never after. An absent action group -- a domain with no left
+        # arm, say -- must contribute exactly zero rather than a learned bias, or the head can read
+        # embodiment identity off the input and appear to use the action without doing so.
+        mask = action_mask.to(x.dtype)
+        if mask.dim() == 2:  # (B, action_dim) -> broadcast over the horizon
+            mask = mask.unsqueeze(1)
+        x = self.action_in(x * mask)
+        h = x + self.pos_embed[:, :horizon]
+
+        for block in self.blocks:
+            h = block(h, context, cond)
+
+        shift, scale = self.final_modulation(cond).chunk(2, dim=-1)
+        return self.action_out(_modulate(self.final_norm(h), shift, scale))
+
+    @torch.no_grad()
+    def sample(
+        self,
+        encoded: EncoderOutput,
+        action_mask: torch.Tensor,
+        *,
+        num_steps: int = 10,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Generate an action chunk. **One** forward pass under ``drifting``; Euler under ``flowmatch``.
+
+        The 1-NFE claim is the headline reason to prefer drifting for a high-rate controller, so
+        it is asserted by a test rather than left as a comment.
+        """
+        batch = encoded.sync_readout[0].shape[0]
+        device = encoded.sync_readout[0].device
+        x = torch.randn(batch, self.config.horizon, self.action_dim, device=device, generator=generator)
+
+        if self.config.objective == "drifting":
+            return self(encoded, action_mask, x, torch.zeros(batch, device=device))
+
+        dt = -1.0 / num_steps
+        t = torch.ones(batch, device=device)
+        for _ in range(num_steps):
+            x = x + dt * self(encoded, action_mask, x, t)
+            t = t + dt
+        return x
+
+
+def flow_matching_loss(
+    head: ActionDiT,
+    encoded: EncoderOutput,
+    actions: torch.Tensor,
+    action_mask: torch.Tensor,
+    chunk_mask: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Rectified-flow loss, mirroring ``ftp1_pytorch.py:472-534``.
+
+    ``x_t = t * noise + (1 - t) * actions`` and ``u_t = noise - actions`` -- the optimal-transport
+    path. The loss is masked and normalised by the mask sum, so a domain that populates 10 of 120
+    slots contributes the same per-live-dimension weight as one that populates 40.
+    """
+    noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype, generator=generator)
+    # Beta(1.5, 1.0) concentrates samples near t=0 where the velocity field is hardest to fit.
+    beta = torch.distributions.Beta(1.5, 1.0)
+    t = beta.sample((actions.shape[0],)).to(actions.device) * 0.999 + 0.001
+    t_b = t.reshape(-1, 1, 1)
+
+    x_t = t_b * noise + (1.0 - t_b) * actions
+    u_t = noise - actions
+    velocity = head(encoded, action_mask, noisy_actions=x_t, timestep=t)
+
+    error = (velocity - u_t) ** 2 * chunk_mask
+    loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
+    return loss, {"flow_mse": float(loss.detach())}
