@@ -20,6 +20,8 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
+from openpi.mot_jepa.model import MotJepaStudent
+
 logger = logging.getLogger(__name__)
 
 _STEP_DIR_RE = re.compile(r"^\d+$")
@@ -301,6 +303,36 @@ def load_checkpoint(
             )
     metadata = torch.load(path / "metadata.pt", map_location="cpu")
     return int(metadata["global_step"])
+
+
+def load_frozen_backbone(run: pathlib.Path, step: int | None, cfg, device: torch.device):
+    """Load a pretrained EMA teacher as a frozen backbone. Returns ``(backbone, step)``.
+
+    The **teacher** shadow is loaded, not the student: the EMA is what pretraining selects for
+    and what every probe number was measured on.
+
+    ``EmaTeacher.state_dict`` serialises the fp32 shadow as a **positional** list keyed
+    ``shadow.0 ... shadow.N-1``, ordered by ``backbone.parameters()`` -- not as named parameters.
+    Loading it with ``load_state_dict(..., strict=False)`` therefore matches nothing at all and
+    leaves the backbone at its random init, with the run looking entirely healthy. That happened
+    once and cost a day, hence the positional copy and the hard count check below.
+    """
+    checkpoint_dir = pathlib.Path(run) / "checkpoints"
+    step = step or find_latest_step(checkpoint_dir)
+    if step is None:
+        raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
+    shadow = torch.load(checkpoint_dir / str(step) / "teacher_ema.pt", map_location="cpu", weights_only=True)
+    student = MotJepaStudent(cfg.layout, cfg.encoder, cfg.predictor, lowdim_channels=cfg.data.lowdim_channels)
+    params = list(student.backbone.parameters())
+    if len(shadow) != len(params):
+        raise RuntimeError(f"{len(shadow)} shadow tensors for {len(params)} parameters; config mismatch")
+    with torch.no_grad():
+        for index, param in enumerate(params):
+            param.copy_(shadow[f"shadow.{index}"].to(param.dtype))
+    backbone = student.to(device).eval().backbone
+    backbone.requires_grad_(requires_grad=False)
+    logger.info("loaded frozen backbone from %s step %d (%d params)", checkpoint_dir, step, len(params))
+    return backbone, step
 
 
 def resolve_run_config(

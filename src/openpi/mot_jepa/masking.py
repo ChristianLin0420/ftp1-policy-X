@@ -406,60 +406,6 @@ def build_batch_masks(
     )
 
 
-def build_rollout_masks(
-    layout: TokenLayout,
-    *,
-    split_step: int,
-    batch_size: int,
-    mode: MaskMode = MaskMode.X,
-) -> ClipMasks:
-    """Causal split for action post-training: observe ``[0, split)``, predict ``[split, T)``.
-
-    Nothing random happens here -- every row is the same split -- so this needs no seed and no
-    generator. It produces the same :class:`ClipMasks` contract as
-    :func:`build_batch_masks`, which is what lets the post-training loop reuse the encoder,
-    predictor and loss code unchanged.
-
-    ``mode`` defaults to :attr:`MaskMode.X` rather than a new enum member on purpose: adding
-    one would grow ``MoTPredictor.mode_embed`` and make every pretraining checkpoint fail to
-    load. The value is inert during action post-training, where the action -- not the mode --
-    is the conditioning signal.
-    """
-    if not 0 < split_step < layout.num_steps:
-        raise ValueError(f"split_step={split_step} must be in (0, num_steps={layout.num_steps})")
-
-    step_of_token = layout.coords[:, 0]
-    ctx_parts, tgt_parts = [], []
-    ctx_counts, tgt_counts = {}, {}
-    for stream in STREAM_ORDER:
-        sl = layout.stream_slices[stream]
-        index = torch.arange(sl.start, sl.stop, dtype=torch.int64)
-        future = step_of_token[sl] >= split_step
-        ctx_parts.append(index[~future])
-        tgt_parts.append(index[future])
-        ctx_counts[stream] = int((~future).sum())
-        tgt_counts[stream] = int(future.sum())
-
-    # Streams are laid out in ascending global order and each part is ascending within its
-    # stream, so the concatenation is ascending overall -- the precondition that keeps
-    # modality-local attention a pair of contiguous slices.
-    ctx_index = torch.cat(ctx_parts).expand(batch_size, -1).contiguous()
-    tgt_index = torch.cat(tgt_parts).expand(batch_size, -1).contiguous()
-
-    ctx_bounds, ctx_expert_bounds = _bounds_from_counts(ctx_counts)
-    tgt_bounds, tgt_expert_bounds = _bounds_from_counts(tgt_counts)
-    return ClipMasks(
-        mode=torch.tensor(int(mode), dtype=torch.int64),
-        ctx_index=ctx_index,
-        tgt_index=tgt_index,
-        ctx_bounds=ctx_bounds,
-        tgt_bounds=tgt_bounds,
-        ctx_expert_bounds=ctx_expert_bounds,
-        tgt_expert_bounds=tgt_expert_bounds,
-        seeds=torch.zeros(batch_size, dtype=torch.int64),
-    )
-
-
 def assert_mask_invariants(masks: ClipMasks, spec: MaskSpec) -> None:
     """Validate the four properties the rest of the package relies on.
 

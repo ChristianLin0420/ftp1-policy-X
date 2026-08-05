@@ -66,10 +66,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("USE_SWANLAB", "false")
 
 from openpi.mot_jepa import config as config_module
+from openpi.mot_jepa import runtime
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.model import ClipInputs
-from scripts.mot_jepa_action_probe import load_backbone
 
 logger = logging.getLogger("timeshuffle_control")
 
@@ -220,7 +220,7 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = config_module.CONFIGS[args.config]
-    backbone, step = load_backbone(args.pretrained_run, args.pretrained_step, cfg, device)
+    backbone, step = runtime.load_frozen_backbone(args.pretrained_run, args.pretrained_step, cfg, device)
 
     stores = sorted(glob.glob(args.clips))
     names = sorted({pathlib.Path(p).parent.name for p in stores})
