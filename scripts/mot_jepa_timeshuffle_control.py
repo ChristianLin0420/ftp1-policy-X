@@ -115,12 +115,39 @@ def between_clip_distance(vectors: torch.Tensor) -> float:
     return float((1.0 - similarity[off_diagonal]).mean())
 
 
+def temporal_variation(tensor: torch.Tensor) -> float:
+    """Fraction of a clip's magnitude that varies over time: ``||x - mean_t x|| / ||x||``.
+
+    The denominator the latent measurement was missing. If the gel frames inside a clip are
+    near-duplicates -- static contact, slow manipulation, too short a temporal span -- then
+    shuffling them barely changes the input, an order-blind encoder is the CORRECT answer, and
+    the defect is the clip configuration rather than the objective. Without this number a small
+    latent displacement cannot distinguish "the encoder discards order" from "there was no order
+    information in the input to begin with".
+    """
+    residual = tensor - tensor.mean(dim=1, keepdim=True)
+    scale = tensor.flatten(start_dim=1).norm(dim=-1)
+    return float((residual.flatten(start_dim=1).norm(dim=-1) / scale.clamp_min(1e-8)).mean())
+
+
+def _time_residual(tensor: torch.Tensor) -> torch.Tensor:
+    """Per-clip time-varying component, flattened.
+
+    Shuffling frames leaves a clip's temporal mean untouched, so centring is identical for the
+    real and shuffled versions and the comparison isolates exactly the part order can affect.
+    Measuring raw pixels instead would let the shared DC component dominate both the
+    displacement and the spread.
+    """
+    return (tensor - tensor.mean(dim=1, keepdim=True)).flatten(start_dim=1)
+
+
 @torch.no_grad()
 def collect(backbone, loader, device, num_batches: int) -> dict[str, list[float]]:
     """Displacement under each shuffle, pooled and unpooled, in units of between-clip spread."""
     out: dict[str, list[float]] = {key: [] for key in (
         "pooled_shared", "pooled_persample", "unpooled_shared", "unpooled_persample",
         "pooled_spread", "unpooled_spread",
+        "input_persample", "input_spread", "gel_temporal_variation",
     )}
 
     for index, batch in enumerate(loader):
@@ -162,9 +189,21 @@ def collect(backbone, loader, device, num_batches: int) -> dict[str, list[float]
             out[f"pooled_{tag}"].append(float((1.0 - _cosine_rows(pooled["real"], pooled[name])).mean()))
             out[f"unpooled_{tag}"].append(float((1.0 - _cosine_rows(flat["real"], flat[name])).mean()))
 
+        # Input side, on the same clips and the same per-sample permutation: how much does the
+        # SHUFFLE ITSELF change what the encoder was given? This is the denominator for every
+        # latent number above.
+        gel_shuffled = permute_time_per_sample(inputs.gel, seed=0)
+        residual_real = _time_residual(inputs.gel)
+        out["gel_temporal_variation"].append(temporal_variation(inputs.gel))
+        out["input_spread"].append(between_clip_distance(residual_real))
+        out["input_persample"].append(
+            float((1.0 - _cosine_rows(residual_real, _time_residual(gel_shuffled))).mean())
+        )
+
         if index == 0:
             logger.info("readout %s -> pooled %s, flat %s",
                         tuple(real.shape), tuple(pooled["real"].shape), tuple(flat["real"].shape))
+            logger.info("gel %s", tuple(inputs.gel.shape))
     return out
 
 
@@ -207,15 +246,33 @@ def main() -> int:
             verdict[f"{readout}_{shuffle}"] = ratio
             print(f"{readout:12s} {shuffle:12s} {value:14.5f} {ratio:12.3f}")
 
-    # The precondition for a retrieval gap: shuffling must move a clip meaningfully relative to
-    # how far apart unrelated clips sit. Below ~0.1 the representation has barely budged and no
-    # retrieval-based probe could have resolved a gap, whatever the encoder learned.
+    # The input side, on the same clips and the same permutation: the denominator for all of the
+    # above. A latent that does not move is only evidence about the ENCODER if the shuffle moved
+    # what the encoder was given.
+    input_spread = float(np.mean(results["input_spread"]))
+    input_displacement = float(np.mean(results["input_persample"]))
+    input_ratio = input_displacement / input_spread if input_spread > 0 else float("nan")
+    variation = float(np.mean(results["gel_temporal_variation"]))
+    verdict["input_persample"] = input_ratio
+    print(f"{'input(gel)':12s} {'persample':12s} {input_displacement:14.5f} {input_ratio:12.3f}")
+    print(f"\ngel temporal variation ||x - mean_t x|| / ||x||:  {variation:.5f}")
+
+    # Below ~0.1 a quantity has barely budged relative to the natural spread, so no
+    # retrieval-based probe could have resolved a gap in it whatever the encoder learned.
+    input_moves = input_ratio >= 0.1
     pooled_blind = verdict["pooled_persample"] < 0.1
     encoder_sees = verdict["unpooled_persample"] >= 0.1
     print("\nverdict:")
-    if pooled_blind and not encoder_sees:
-        print("  the encoder is order-blind -- shuffling moves nothing, pooled or not.")
-        print("  timeshuffle_gap ~ 0 is a real finding and the tactile objective has not fixed it.")
+    if not input_moves:
+        print("  THE INPUT ITSELF BARELY CHANGES under a full temporal scramble. The frames in a")
+        print("  clip are near-duplicates, so an order-blind encoder is the CORRECT answer and")
+        print("  timeshuffle_gap ~ 0 says nothing about the objective. The defect is the clip")
+        print("  temporal span -- widen stride or frame count and rebuild before touching losses.")
+    elif pooled_blind and not encoder_sees:
+        print("  the input changes but the encoder is order-blind -- it discards order that was")
+        print("  present. timeshuffle_gap ~ 0 is a real finding about the OBJECTIVE: nothing in")
+        print("  the loss rewards temporal correspondence. Clip-pooled L_sync is order-invariant")
+        print("  after pooling by construction; a time-local sync term is the targeted fix.")
     elif pooled_blind and encoder_sees:
         print("  the ENCODER tracks temporal order but the mean-over-time readout discards it.")
         print("  timeshuffle_gap measures the readout, not the encoder. The probe2/probe3 null")

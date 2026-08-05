@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from scripts.mot_jepa_timeshuffle_control import _time_residual
 from scripts.mot_jepa_timeshuffle_control import between_clip_distance
 from scripts.mot_jepa_timeshuffle_control import permute_time_per_sample
 from scripts.mot_jepa_timeshuffle_control import permute_time_shared
+from scripts.mot_jepa_timeshuffle_control import temporal_variation
 
 
 def _clip(batch: int = 8, steps: int = 16, *, trailing: tuple[int, ...] = (3,)) -> torch.Tensor:
@@ -63,6 +65,43 @@ def test_per_sample_handles_extra_trailing_dims():
     assert shuffled.shape == tensor.shape
     for row in range(4):
         assert torch.equal(tensor[row].flatten().sort().values, shuffled[row].flatten().sort().values)
+
+
+def test_static_clip_reports_no_temporal_variation():
+    """The case that flips the verdict: identical frames mean the shuffle is a no-op.
+
+    If a clip's frames are duplicates, an order-blind encoder is correct behaviour and
+    timeshuffle_gap ~ 0 carries no information about the objective. This is the denominator the
+    latent-only measurement was missing.
+    """
+    static = torch.randn(4, 1, 3, 8, 8).expand(4, 16, 3, 8, 8).contiguous()
+    assert temporal_variation(static) < 1e-6
+    # ... and the shuffle genuinely cannot change it.
+    assert torch.equal(permute_time_per_sample(static, seed=0), static)
+
+
+def test_moving_clip_reports_temporal_variation():
+    """A clip that actually changes over time must read clearly above zero, or the guard is dead."""
+    moving = torch.randn(4, 16, 3, 8, 8)
+    assert temporal_variation(moving) > 0.5
+
+
+def test_time_residual_is_unchanged_by_the_clip_mean():
+    """Centring must isolate the time-varying part, so a large DC offset cannot mask a null.
+
+    Raw pixels share a huge constant component; without centring both the displacement and the
+    between-clip spread would be dominated by it and their ratio would be uninformative.
+    """
+    signal = torch.randn(3, 8, 5)
+    offset = signal + 100.0
+    assert torch.allclose(_time_residual(signal), _time_residual(offset), atol=1e-4)
+
+
+def test_shuffling_preserves_the_clip_mean_so_centring_is_comparable():
+    """Real and shuffled are centred by the same vector -- otherwise the comparison is invalid."""
+    clip = torch.randn(4, 16, 3, 8, 8)
+    shuffled = permute_time_per_sample(clip, seed=0)
+    assert torch.allclose(clip.mean(dim=1), shuffled.mean(dim=1), atol=1e-5)
 
 
 def test_between_clip_distance_ignores_the_diagonal():
