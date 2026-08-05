@@ -201,6 +201,7 @@ def save_checkpoint(
     teacher,  # EmaTeacher; untyped to avoid a circular import
     optimizer: torch.optim.Optimizer,
     config_json: str,
+    loss_fn: nn.Module | None = None,
     keep_last: int = 3,
     keep_period: int | None = None,
     extra: dict | None = None,
@@ -223,6 +224,14 @@ def save_checkpoint(
     if teacher is not None:
         torch.save(teacher.state_dict(), staging / "teacher_ema.pt")
     torch.save(optimizer.state_dict(), staging / "optimizer.pt")
+    # The loss module owns trainable state that lives OUTSIDE the student: the two synchrony
+    # projectors and the running ``lowdim_scale``. They are in the optimizer's parameter list
+    # (mot_jepa_train.py:306), so omitting them here does not merely lose them -- the restored
+    # optimizer reapplies the OLD Adam moments to freshly random projectors, which is worse than
+    # a clean restart. Observed on probe3's requeue at step 37970: retrieval 0.586 -> 0.176 and
+    # loss 0.66 -> 1.04 in one interval.
+    if loss_fn is not None:
+        torch.save(loss_fn.state_dict(), staging / "loss.pt")
     torch.save({"global_step": step, **(extra or {})}, staging / "metadata.pt")
     (staging / "train_config.json").write_text(config_json)
 
@@ -261,11 +270,17 @@ def load_checkpoint(
     teacher,  # EmaTeacher
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
+    loss_fn: nn.Module | None = None,
 ) -> int:
-    """Restore student, teacher shadow, optimizer and ``global_step``.
+    """Restore student, teacher shadow, optimizer, loss state and ``global_step``.
 
     Nothing scheduler-shaped is restored because nothing scheduler-shaped is stored: both the
     learning rate and the EMA decay are pure functions of ``global_step``.
+
+    ``loss.pt`` is absent from checkpoints written before it was saved at all, so a missing file
+    is tolerated -- those runs resume with the behaviour they already had rather than failing to
+    start. It is logged, because silently keeping a random projector is the failure this exists
+    to remove.
     """
     path = pathlib.Path(checkpoint_dir) / str(step)
     module = student.module if hasattr(student, "module") else student
@@ -274,6 +289,16 @@ def load_checkpoint(
         teacher.load_state_dict(torch.load(path / "teacher_ema.pt", map_location=device))
     if optimizer is not None:
         optimizer.load_state_dict(torch.load(path / "optimizer.pt", map_location=device))
+    if loss_fn is not None:
+        loss_path = path / "loss.pt"
+        if loss_path.exists():
+            loss_fn.load_state_dict(torch.load(loss_path, map_location=device))
+        else:
+            logger.warning(
+                "%s has no loss.pt: synchrony projectors resume from random init and the "
+                "restored optimizer moments no longer match them. Expect a retrieval dip.",
+                path,
+            )
     metadata = torch.load(path / "metadata.pt", map_location="cpu")
     return int(metadata["global_step"])
 

@@ -67,6 +67,51 @@ def test_checkpoint_roundtrip_restores_step_and_weights(tmp_path):
     assert torch.equal(model.weight, original)
 
 
+def test_checkpoint_roundtrip_restores_loss_module_state(tmp_path):
+    """The synchrony projectors live outside the student and were silently lost on requeue.
+
+    ``MotJepaLoss`` owns trainable projectors and a running ``lowdim_scale``, and its parameters
+    are in the optimizer's list (mot_jepa_train.py:306). Saving only the student meant every
+    requeue rebuilt them at random init while the RESTORED optimizer reapplied the old Adam
+    moments to those fresh weights -- worse than a clean restart. probe3's requeue at step 37970
+    showed it: retrieval 0.586 -> 0.176, loss 0.66 -> 1.04 in a single interval.
+    """
+    model = nn.Linear(4, 4)
+    loss_fn = nn.Module()
+    loss_fn.projector = nn.Linear(4, 4)
+    loss_fn.register_buffer("lowdim_scale", torch.tensor(3.5))
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(loss_fn.parameters()), lr=1e-3)
+    runtime.save_checkpoint(
+        tmp_path, 7, student=model, teacher=None, optimizer=optimizer, config_json="{}", loss_fn=loss_fn
+    )
+
+    original = loss_fn.projector.weight.detach().clone()
+    with torch.no_grad():
+        loss_fn.projector.weight.add_(1.0)
+        loss_fn.lowdim_scale.fill_(1.0)
+
+    runtime.load_checkpoint(
+        tmp_path, 7, student=model, teacher=None, optimizer=optimizer, device=torch.device("cpu"), loss_fn=loss_fn
+    )
+    assert torch.equal(loss_fn.projector.weight, original)
+    assert float(loss_fn.lowdim_scale) == 3.5
+
+
+def test_checkpoint_without_loss_state_still_loads(tmp_path):
+    """Checkpoints written before loss.pt existed must still resume, with a warning not a crash."""
+    model = nn.Linear(4, 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    runtime.save_checkpoint(tmp_path, 5, student=model, teacher=None, optimizer=optimizer, config_json="{}")
+    assert not (tmp_path / "5" / "loss.pt").exists()
+
+    loss_fn = nn.Module()
+    loss_fn.projector = nn.Linear(4, 4)
+    step = runtime.load_checkpoint(
+        tmp_path, 5, student=model, teacher=None, optimizer=optimizer, device=torch.device("cpu"), loss_fn=loss_fn
+    )
+    assert step == 5
+
+
 def test_retention_keeps_last_n_plus_every_period(tmp_path):
     for step in range(0, 60, 10):
         tiny_state(tmp_path, step)

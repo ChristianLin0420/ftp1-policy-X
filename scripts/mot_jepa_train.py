@@ -311,7 +311,13 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
     global_step = 0
     if resume_step is not None:
         global_step = runtime.load_checkpoint(
-            cfg.checkpoint_dir, resume_step, student=student, teacher=teacher, optimizer=optimizer, device=device
+            cfg.checkpoint_dir,
+            resume_step,
+            student=student,
+            teacher=teacher,
+            optimizer=optimizer,
+            device=device,
+            loss_fn=loss_fn,
         )
         logger.info("resumed from step %d", global_step)
     sampler.set_start_step(global_step)
@@ -468,6 +474,7 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
                 teacher=teacher,
                 optimizer=optimizer,
                 config_json=frozen_json,
+                loss_fn=loss_fn,
                 keep_last=cfg.keep_last,
                 keep_period=cfg.keep_period,
             )
@@ -480,6 +487,7 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
             teacher=teacher,
             optimizer=optimizer,
             config_json=frozen_json,
+            loss_fn=loss_fn,
             keep_last=cfg.keep_last,
             keep_period=cfg.keep_period,
         )
