@@ -15,6 +15,8 @@ import typing
 
 import tyro
 
+from openpi.mot_jepa.action_dit import ActionDiTConfig
+from openpi.mot_jepa.drifting import DriftingConfig
 from openpi.mot_jepa.layout import LAYOUT_BASE
 from openpi.mot_jepa.layout import LAYOUT_PILOT
 from openpi.mot_jepa.layout import TokenLayout
@@ -205,3 +207,99 @@ def cli() -> MotJepaTrainConfig:
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in CONFIGS.items()})
 
 
+
+
+# ======================================================================================
+# Action policy post-training (frozen encoder + DiT action head)
+# ======================================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class PolicyConfig:
+    """One action-policy run. The pretrained encoder is frozen throughout.
+
+    ``encoder``/``predictor`` are here only to rebuild the pretrained student so the frozen
+    backbone can be loaded into it -- they must match the pretraining run the checkpoint came
+    from, or the positional shadow copy raises on the parameter count.
+    """
+
+    name: str = "mot_jepa_policy"
+    exp_name: str = "dev"
+    project_name: str = "mot-jepa"
+    run_root: str = ".cache/mot_jepa/runs"
+
+    pretrained_run: str = ""
+    """Run directory (or backbone snapshot) whose EMA teacher becomes the frozen encoder."""
+    pretrained_step: int | None = None
+
+    layout_preset: str = "pilot"
+    encoder: MoTEncoderConfig = dataclasses.field(default_factory=MoTEncoderConfig)
+    predictor: MoTPredictorConfig = dataclasses.field(default_factory=MoTPredictorConfig)
+    data: DataConfig = dataclasses.field(default_factory=DataConfig)
+    head: ActionDiTConfig = dataclasses.field(default_factory=ActionDiTConfig)
+    drifting: DriftingConfig = dataclasses.field(default_factory=DriftingConfig)
+
+    seed: int = 42
+    local_batch_size: int = 16
+    num_train_steps: int = 40_000
+    lr_peak: float = 1e-4
+    lr_end: float = 1e-6
+    lr_warmup_steps: int = 1_000
+    weight_decay: float = 0.01
+    beta1: float = 0.9
+    beta2: float = 0.95
+    clip_grad_norm: float = 1.0
+
+    log_interval: int = 50
+    save_interval: int = 1_000
+    keep_last: int = 3
+    keep_period: int | None = 10_000
+    wandb_enabled: bool = True
+    find_unused_parameters: bool = False
+    """False, unlike pretraining: every head parameter is used on every step. Pretraining needs
+    True only because mask mode T_HARD drops the tactile expert entirely on some steps."""
+
+    @property
+    def layout(self) -> TokenLayout:
+        presets = {"pilot": LAYOUT_PILOT, "base": LAYOUT_BASE}
+        if self.layout_preset not in presets:
+            raise ValueError(f"unknown layout_preset={self.layout_preset!r}, expected one of {sorted(presets)}")
+        return presets[self.layout_preset]
+
+    @property
+    def run_dir(self) -> pathlib.Path:
+        return pathlib.Path(self.run_root) / self.name / self.exp_name
+
+    @property
+    def checkpoint_dir(self) -> pathlib.Path:
+        return self.run_dir / "checkpoints"
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> PolicyConfig:
+        return _from_dict(cls, json.loads(text))
+
+
+#: The two arms differ in exactly one field, so the comparison is clean.
+POLICY_CONFIGS: dict[str, PolicyConfig] = {
+    "mot_jepa_policy_drifting": PolicyConfig(
+        name="mot_jepa_policy",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        head=ActionDiTConfig(objective="drifting"),
+        data=DataConfig(index_step=4, num_workers=6),
+    ),
+    "mot_jepa_policy_flowmatch": PolicyConfig(
+        name="mot_jepa_policy",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        head=ActionDiTConfig(objective="flowmatch"),
+        data=DataConfig(index_step=4, num_workers=6),
+    ),
+}
+
+
+def policy_cli() -> PolicyConfig:
+    return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in POLICY_CONFIGS.items()})
