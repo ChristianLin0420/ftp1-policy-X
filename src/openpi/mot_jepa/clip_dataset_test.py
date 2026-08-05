@@ -365,3 +365,76 @@ def test_an_old_three_column_index_upgrades_rather_than_mis_indexing(tmp_path):
     upgraded = ClipIndex.load(legacy)
     assert upgraded.entries.shape[1] == 4
     assert upgraded[0].episode_idx == 0
+
+
+# --------------------------------------------------------------------------------------
+# Future action chunks for policy training
+# --------------------------------------------------------------------------------------
+
+
+def test_action_horizon_shrinks_the_index_and_never_crosses_an_episode(tmp_path):
+    """Every chunk must lie inside its clip's own episode.
+
+    A chunk that ran past the end would splice the next episode's motion onto this one's
+    observation -- a target no policy could ever be right about, and one that looks like noise
+    rather than a bug. Same reject-never-clamp contract the observation window already has.
+    """
+    lengths = [40, 45, 38]
+    path = make_store(tmp_path / "chunk.zarr", lengths)
+    add_conditioning_arrays(path, lengths)
+
+    horizon = 8
+    plain = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,))
+    gated = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,), action_horizon=horizon)
+    assert len(gated) < len(plain), "a horizon must remove clips that have no future left"
+
+    ends = np.cumsum(lengths)
+    starts = np.concatenate([[0], ends[:-1]])
+    for store_idx, start, stride, episode_idx in gated.entries:
+        del store_idx
+        last_observed = start + (LAYOUT.num_frames - 1) * stride
+        assert last_observed + horizon * stride < ends[episode_idx]
+        assert start >= starts[episode_idx]
+
+
+def test_action_chunk_is_the_future_not_the_observed_clip(tmp_path):
+    """The chunk must start where the observation ends, or the policy is predicting the past.
+
+    ``state`` here is frame_index broadcast over all 120 columns, so a first difference is
+    exactly 1.0 on every live column -- which makes an off-by-one in the window visible as a
+    wrong *value*, not merely a wrong shape.
+    """
+    lengths = [60]
+    path = make_store(tmp_path / "future.zarr", lengths)
+    add_conditioning_arrays(path, lengths)
+
+    horizon = 6
+    dataset = MotJepaClipDataset(
+        [path], LAYOUT, strides=(1,), with_conditioning=True, action_horizon=horizon
+    )
+    sample = dataset[0]
+    assert sample.action_chunk.shape == (horizon, ap.ACTION_DIM)
+    assert sample.chunk_mask.shape == (horizon, ap.ACTION_DIM)
+
+    live = sample.chunk_mask[0].bool()
+    # Consecutive states differ by exactly 1 on live columns, and the pose blocks are excluded
+    # from that because they go through relative_pose rather than a first difference.
+    plain = live.clone()
+    for block in ap.POSE_BLOCKS:
+        plain[block] = False
+    assert plain.any()
+    assert torch.allclose(sample.action_chunk[:, plain], torch.ones_like(sample.action_chunk[:, plain]))
+    # Masked-out columns must be exactly zero, not a small number.
+    assert torch.equal(sample.action_chunk[:, ~live], torch.zeros_like(sample.action_chunk[:, ~live]))
+
+
+def test_action_chunk_is_absent_without_a_horizon(tmp_path):
+    """Pretraining must keep paying nothing: no horizon, no extra zarr read, zeros in the batch."""
+    lengths = [40]
+    path = make_store(tmp_path / "nohorizon.zarr", lengths)
+    add_conditioning_arrays(path, lengths)
+
+    dataset = MotJepaClipDataset([path], LAYOUT, strides=(1,), with_conditioning=True)
+    sample = dataset[0]
+    assert torch.equal(sample.action_chunk, torch.zeros_like(sample.action_chunk))
+    assert torch.equal(sample.chunk_mask, torch.zeros_like(sample.chunk_mask))

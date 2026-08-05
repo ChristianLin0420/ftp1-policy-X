@@ -158,12 +158,19 @@ class ClipIndex:
         num_frames: int,
         strides: tuple[int, ...] = (1, 2),
         step: int = 1,
+        action_horizon: int = 0,
     ) -> ClipIndex:
         """Enumerate valid clips by scanning only ``meta/episode_ends``.
 
         A clip beginning at ``s`` with stride ``r`` is valid when
         ``s + (num_frames - 1) * r < episode_end``. Starts that would run past the end are
         dropped outright rather than clamped.
+
+        ``action_horizon > 0`` additionally requires the *future* window to fit:
+        ``s + (num_frames - 1 + horizon) * r < episode_end``. A policy conditioned on a clip
+        must predict actions that genuinely follow it, and an edge-padded chunk would be a
+        chunk of repeated rows -- perfectly predictable, and it would inflate any metric
+        computed over it. Same contract as the observation window: reject, never clamp.
         """
         rows = []
         unreadable: list[str] = []
@@ -186,7 +193,7 @@ class ClipIndex:
             starts = np.concatenate([[0], ends[:-1]])
             for episode_idx, (episode_start, episode_end) in enumerate(zip(starts, ends, strict=True)):
                 for stride in strides:
-                    span = (num_frames - 1) * stride
+                    span = (num_frames - 1 + action_horizon) * stride
                     last_start = episode_end - 1 - span
                     if last_start < episode_start:
                         continue
@@ -255,6 +262,11 @@ class ClipSample:
     action_mask: torch.Tensor  # (120,) float32
     instruction_id: torch.Tensor  # () int64
     episode_idx: torch.Tensor  # () int64
+    # Future action chunk for policy training. Zero-filled unless the dataset was built with
+    # ``action_horizon > 0``; ``chunk_mask`` is the per-clip mask broadcast over the horizon,
+    # matching what ``dataset_zarr.py`` emits so the two action pipelines agree.
+    action_chunk: torch.Tensor  # (H, 120) float32
+    chunk_mask: torch.Tensor  # (H, 120) float32
 
 
 class MotJepaClipDataset(torch.utils.data.Dataset):
@@ -272,6 +284,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         lowdim_channels: int | None = None,
         prefer_rgb: str | None = None,
         with_conditioning: bool = False,
+        action_horizon: int = 0,
     ) -> None:
         self.store_paths = list(store_paths)
         self.layout = layout
@@ -281,8 +294,15 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         # Off by default: pretraining has no use for proprioception, and reading it would add
         # a zarr access per clip for nothing.
         self.with_conditioning = with_conditioning
+        # A horizon shrinks the index -- every clip must now have `horizon` frames of future
+        # inside its own episode -- so it belongs in the index build, not just the read path.
+        self.action_horizon = action_horizon
         self.clip_index = clip_index or ClipIndex.build(
-            self.store_paths, num_frames=layout.num_frames, strides=strides, step=index_step
+            self.store_paths,
+            num_frames=layout.num_frames,
+            strides=strides,
+            step=index_step,
+            action_horizon=action_horizon,
         )
         if len(self.clip_index) == 0:
             raise ValueError(
@@ -325,12 +345,15 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         is a real vocabulary entry, so defaulting to it would quietly pair unlabelled clips
         with whichever instruction sorted first.
         """
+        horizon = max(self.action_horizon, 1)
         out = {
             "state": torch.zeros(self.layout.num_frames, ap.ACTION_DIM, dtype=torch.float32),
             "action": torch.zeros(self.layout.num_steps, ap.ACTION_DIM, dtype=torch.float32),
             "action_mask": torch.zeros(ap.ACTION_DIM, dtype=torch.float32),
             "instruction_id": torch.tensor(-1, dtype=torch.int64),
             "episode_idx": torch.tensor(entry.episode_idx, dtype=torch.int64),
+            "action_chunk": torch.zeros(horizon, ap.ACTION_DIM, dtype=torch.float32),
+            "chunk_mask": torch.zeros(horizon, ap.ACTION_DIM, dtype=torch.float32),
         }
         if not (self.with_conditioning and self._conditioned[entry.store_idx]):
             return out
@@ -349,6 +372,17 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         anchors = state[:: self.layout.tubelet_t]
         actions = ap.actions_from_state(anchors, mask)
         out["action"] = torch.from_numpy(np.concatenate([actions, actions[-1:]], axis=0))
+
+        if self.action_horizon > 0:
+            # The chunk starts at the clip's LAST observed frame and runs forward. Reading
+            # horizon+1 states gives horizon actions, and the index guarantees the window is
+            # inside the episode, so nothing is padded and nothing crosses a boundary.
+            last = int(frames[-1])
+            future = np.arange(last, last + (self.action_horizon + 1) * entry.stride, entry.stride, dtype=np.int64)
+            future_state = np.asarray(group["data"]["state"][future], dtype=np.float32)
+            chunk = ap.actions_from_state(future_state, mask)
+            out["action_chunk"] = torch.from_numpy(np.ascontiguousarray(chunk))
+            out["chunk_mask"] = torch.from_numpy(mask).unsqueeze(0).expand(self.action_horizon, -1).contiguous()
         return out
 
     def _specs(self, store_idx: int) -> list[tp.TactileSpec]:

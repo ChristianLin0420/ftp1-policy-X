@@ -47,7 +47,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("USE_SWANLAB", "false")
 
-from openpi.mot_jepa import action_parse as ap
 from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
@@ -61,41 +60,72 @@ MIN_CLIPS = 500
 gate learned this the hard way from a 14-clip domain."""
 
 
-def r_squared(features: np.ndarray, targets: np.ndarray, *, holdout: float = 0.3) -> tuple[float, int]:
-    """Held-out R^2 of a ridge fit ``targets ~ features``.
+RIDGE_GRID = (1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)
+"""The readout has 4608 features against a few hundred to a few thousand clips, so ``p >> n`` and
+the penalty is not a detail -- it decides the answer. A fixed 1e-3 (inherited from the Stage 4
+probe, where features were only 240-D) interpolates the training set and reports a spectacular
+negative held-out R^2 that says nothing about the encoder. The penalty is chosen on a validation
+split, never on the test split."""
 
-    Held out rather than in-sample: with thousands of action dimensions and a few hundred clips,
-    an in-sample fit reports a high R^2 from sheer capacity and says nothing. Ridge rather than
-    plain least squares because the latent columns are strongly correlated and a singular normal
-    matrix would otherwise decide the answer.
+
+def r_squared(features: np.ndarray, targets: np.ndarray, *, holdout: float = 0.3) -> tuple[float, int, float]:
+    """Held-out R^2 of a ridge fit ``targets ~ features``, penalty tuned on a validation split.
+
+    Three-way split: fit on train, pick the penalty on validation, report on test. Picking the
+    penalty on the test split would report the best of eight tries as if it were one measurement.
+
+    Returns ``(r2, n, chosen_lambda)``.
     """
-    if features.shape[0] < 20:
-        return float("nan"), features.shape[0]
-    split = int(features.shape[0] * (1.0 - holdout))
-    x_train, x_test = features[:split], features[split:]
-    y_train, y_test = targets[:split], targets[split:]
+    count = features.shape[0]
+    if count < 60:  # need three usable splits
+        return float("nan"), count, float("nan")
+    fit_end = int(count * (1.0 - 2 * holdout / 3))
+    val_end = int(count * (1.0 - holdout / 3))
+    x_fit, x_val, x_test = features[:fit_end], features[fit_end:val_end], features[val_end:]
+    y_fit, y_val, y_test = targets[:fit_end], targets[fit_end:val_end], targets[val_end:]
+    if min(x_val.shape[0], x_test.shape[0]) < 10:
+        return float("nan"), count, float("nan")
 
-    # Standardise on train statistics only; a constant column would otherwise dominate.
-    mean, scale = x_train.mean(0), x_train.std(0)
+    # Standardise on fit statistics only; a constant column would otherwise dominate.
+    mean, scale = x_fit.mean(0), x_fit.std(0)
     keep = scale > 1e-8
     if not keep.any():
-        return float("nan"), features.shape[0]
-    x_train = (x_train[:, keep] - mean[keep]) / scale[keep]
-    x_test = (x_test[:, keep] - mean[keep]) / scale[keep]
-    x_train = np.hstack([x_train, np.ones((x_train.shape[0], 1))])
-    x_test = np.hstack([x_test, np.ones((x_test.shape[0], 1))])
+        return float("nan"), count, float("nan")
 
-    ridge = 1e-3 * np.eye(x_train.shape[1])
-    weights = np.linalg.solve(x_train.T @ x_train + ridge, x_train.T @ y_train)
-    residual = ((y_test - x_test @ weights) ** 2).sum()
-    total = ((y_test - y_train.mean(0)) ** 2).sum()
-    return float(1.0 - residual / max(total, 1e-12)), features.shape[0]
+    def prep(x: np.ndarray) -> np.ndarray:
+        z = (x[:, keep] - mean[keep]) / scale[keep]
+        return np.hstack([z, np.ones((z.shape[0], 1))])
+
+    x_fit, x_val, x_test = prep(x_fit), prep(x_val), prep(x_test)
+    gram = x_fit.T @ x_fit
+    rhs = x_fit.T @ y_fit
+    eye = np.eye(gram.shape[0])
+
+    def score(x: np.ndarray, y: np.ndarray, weights: np.ndarray, baseline: np.ndarray) -> float:
+        residual = ((y - x @ weights) ** 2).sum()
+        total = ((y - baseline) ** 2).sum()
+        return float(1.0 - residual / max(total, 1e-12))
+
+    best_lambda, best_val, best_weights = float("nan"), -np.inf, None
+    for lam in RIDGE_GRID:
+        weights = np.linalg.solve(gram + lam * eye, rhs)
+        val = score(x_val, y_val, weights, y_fit.mean(0))
+        if val > best_val:
+            best_lambda, best_val, best_weights = lam, val, weights
+
+    return score(x_test, y_test, best_weights, y_fit.mean(0)), count, best_lambda
 
 
 @torch.no_grad()
-def collect(backbone, loader, device, max_batches: int, horizon: int) -> dict[int, tuple[list, list]]:
-    """Per domain: the frozen latent readout, and the future action chunk it should explain."""
-    out: dict[int, tuple[list, list]] = collections.defaultdict(lambda: ([], []))
+def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list, list, list]]:
+    """Per domain: the frozen readout, the future action chunk, and the positive-control state.
+
+    The third target is the control. The clip's own proprioceptive state is fed straight into the
+    encoder through the lowdim stream, so a readout that cannot recover it is a broken estimator,
+    not an uninformative encoder. Without it a negative action R^2 is uninterpretable -- exactly
+    the trap the timeshuffle probe fell into.
+    """
+    out: dict[int, tuple[list, list, list]] = collections.defaultdict(lambda: ([], [], []))
     for seen, batch in enumerate(loader):
         if seen >= max_batches:
             break
@@ -112,39 +142,17 @@ def collect(backbone, loader, device, max_batches: int, horizon: int) -> dict[in
         readout = torch.cat([expert.float().flatten(start_dim=1) for expert in encoded.sync_readout], dim=-1)
         features = readout.cpu().numpy()
 
-        # The future chunk, derived at the clip's own stride from the per-frame state. The clip
-        # dataset's own `action` field is retrospective and only 8 steps long, so it cannot answer
-        # this question -- the chunk has to be built here from `state`.
-        state = batch["state"].numpy()
+        # The genuine future window, built by the dataset at this clip's own stride and guaranteed
+        # by the index to lie inside the episode. The dataset's `action` field cannot answer this
+        # question: it is retrospective over the observed clip, not the future.
+        chunks = (batch["action_chunk"] * batch["chunk_mask"]).numpy()
         masks = batch["action_mask"].numpy()
+        anchors = batch["state"][:, :: 2].numpy()  # tubelet anchors, the POSITIVE CONTROL target
         for row, domain in enumerate(batch["domain_id"].tolist()):
-            chunk = _future_chunk(state[row], masks[row], horizon)
-            if chunk is None:
-                continue
             out[domain][0].append(features[row])
-            out[domain][1].append(chunk.reshape(-1))
+            out[domain][1].append(chunks[row].reshape(-1))
+            out[domain][2].append((anchors[row] * masks[row]).reshape(-1))
     return out
-
-
-def _future_chunk(state: np.ndarray, mask: np.ndarray, horizon: int) -> np.ndarray | None:
-    """``(num_frames, 120)`` state -> ``(horizon, 120)`` actions, edge-padded at the clip end.
-
-    The clip carries ``num_frames`` states, so at most ``num_frames - 1`` real actions exist. The
-    last action is repeated to reach the horizon, matching ``dataset_zarr.py:1885-1889``. That is
-    a stopgap for the gate only -- Phase C reads a genuinely longer window from the store. It is
-    honest here because it measures the *hardest* part of the horizon, the near-term actions, and
-    padding cannot inflate R^2: repeated rows are perfectly predictable and would only be added to
-    both sides of the fit.
-    """
-    if state.shape[0] < 2:
-        return None
-    actions = ap.actions_from_state(state, mask.astype(np.uint8))
-    if actions.shape[0] == 0:
-        return None
-    if actions.shape[0] >= horizon:
-        return actions[:horizon]
-    pad = np.repeat(actions[-1:], horizon - actions.shape[0], axis=0)
-    return np.concatenate([actions, pad], axis=0)
 
 
 def main() -> int:
@@ -167,45 +175,64 @@ def main() -> int:
     names = sorted({pathlib.Path(p).parent.name for p in stores})
     domain_ids = [names.index(pathlib.Path(p).parent.name) for p in stores]
     dataset = MotJepaClipDataset(
-        stores, cfg.layout, domain_ids=domain_ids, strides=(1,), index_step=37, with_conditioning=True
+        stores,
+        cfg.layout,
+        domain_ids=domain_ids,
+        strides=(1,),
+        index_step=37,
+        with_conditioning=True,
+        action_horizon=args.horizon,
     )
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=6, collate_fn=collate_clips
     )
     logger.info("%d stores / %d domains / %d clips", len(stores), len(names), len(dataset))
 
-    collected = collect(backbone, loader, device, args.batches, args.horizon)
+    collected = collect(backbone, loader, device, args.batches)
 
     print(f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}")
-    print(f"\n{'domain':26s} {'clips':>7s} {'R^2 action<-latent':>20s}")
-    rows, all_x, all_y = [], [], []
+    print(f"\n{'domain':26s} {'clips':>7s} {'R2 action':>11s} {'lambda':>9s} {'R2 state(ctl)':>14s}")
+    rows, all_x, all_y, all_c = [], [], [], []
     for domain in sorted(collected):
         features = np.stack(collected[domain][0])
         targets = np.stack(collected[domain][1])
-        score, count = r_squared(features, targets)
-        rows.append((names[domain], score, count))
+        control = np.stack(collected[domain][2])
+        score, count, lam = r_squared(features, targets)
+        ctl, _, _ = r_squared(features, control)
+        rows.append((names[domain], score, count, ctl))
         all_x.append(features)
         all_y.append(targets)
-        print(f"{names[domain]:26s} {count:7d} {score:20.4f}")
+        all_c.append(control)
+        print(f"{names[domain]:26s} {count:7d} {score:11.4f} {lam:9.0e} {ctl:14.4f}")
 
-    pooled, pooled_n = r_squared(np.concatenate(all_x), np.concatenate(all_y))
-    print(f"\n{'POOLED':26s} {pooled_n:7d} {pooled:20.4f}")
+    x, y, c = np.concatenate(all_x), np.concatenate(all_y), np.concatenate(all_c)
+    pooled, pooled_n, pooled_lam = r_squared(x, y)
+    pooled_ctl, _, _ = r_squared(x, c)
+    print(f"\n{'POOLED':26s} {pooled_n:7d} {pooled:11.4f} {pooled_lam:9.0e} {pooled_ctl:14.4f}")
 
-    solid = [(n, s) for n, s, c in rows if c >= MIN_CLIPS and np.isfinite(s)]
-    best = max((s for _, s in solid), default=float("nan"))
-    best_name = next((n for n, s in solid if s == best), "-")
-    print(f"\nbest R^2 over domains with >={MIN_CLIPS} clips = {best:.4f}  ({best_name})")
+    solid = [(n, s, ctl) for n, s, cnt, ctl in rows if cnt >= MIN_CLIPS and np.isfinite(s)]
+    best = max((s for _, s, _ in solid), default=float("nan"))
+    best_name = next((n for n, s, _ in solid if s == best), "-")
+    best_ctl = max((ctl for _, _, ctl in solid if np.isfinite(ctl)), default=float("nan"))
+    print(f"\nbest R2(action) over domains with >={MIN_CLIPS} clips = {best:.4f}  ({best_name})")
+    print(f"best R2(state) -- the positive control -- over the same domains = {best_ctl:.4f}")
     print(f"  ({len(solid)} of {len(rows)} domains cleared that bar)")
-    print(
-        "\nverdict: "
-        + (
-            "the frozen latent carries action-relevant information -- a DiT head has something "
-            "to learn from. Proceed to the policy build."
-            if best > 0.05
-            else "a ridge cannot read the action out of the frozen latent. A DiT will not "
-            "either. Fix pretraining (time-local L_sync) before building a policy on it."
-        )
-    )
+
+    # Order matters: a failed control invalidates the action number entirely, so it is checked
+    # first. Reporting "no action signal" from an estimator that cannot recover the state either
+    # would be a null with no evidentiary value.
+    print("\nverdict: ")
+    if not np.isfinite(best_ctl) or best_ctl < 0.2:
+        print("  CONTROL FAILED. The readout cannot recover the clip's own state, which is fed")
+        print("  straight into the encoder via the lowdim stream. The estimator is broken, not")
+        print("  the encoder -- the action number below it means nothing. Fix the probe.")
+    elif best > 0.05:
+        print("  the frozen latent carries action-relevant information and the control passes.")
+        print("  A DiT head has something to learn from. Proceed to the policy build.")
+    else:
+        print("  the control passes but the action does not: the readout recovers the state and")
+        print("  still cannot recover the action. That is a real null about the encoder. Fix")
+        print("  pretraining (time-local L_sync) before building a policy on it.")
     return 0
 
 
