@@ -285,14 +285,19 @@ class PolicyConfig:
 #: The two arms differ in exactly one field, so the comparison is clean.
 POLICY_CONFIGS: dict[str, PolicyConfig] = {
     "mot_jepa_policy_drifting": PolicyConfig(
-        name="mot_jepa_policy",
+        # `name` MUST equal the preset key: submit.sh derives the sbatch's RUN_DIR from
+        # CONFIG_NAME, while the trainer derives its own from cfg.name. When they disagreed the
+        # sbatch wrote PREEMPT_REQUEST into a directory the trainer never watched, so the graceful
+        # save never ran and the requeue never armed -- both arms were killed at the 4h walltime
+        # at step 18000 on 2026-08-05. Pretraining's presets follow the same rule.
+        name="mot_jepa_policy_drifting",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="drifting"),
         data=DataConfig(index_step=4, num_workers=6),
     ),
     "mot_jepa_policy_flowmatch": PolicyConfig(
-        name="mot_jepa_policy",
+        name="mot_jepa_policy_flowmatch",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="flowmatch"),
