@@ -231,6 +231,13 @@ class PolicyConfig:
     pretrained_run: str = ""
     """Run directory (or backbone snapshot) whose EMA teacher becomes the frozen encoder."""
     pretrained_step: int | None = None
+    init_head_from: str = ""
+    """Path to a ``student.pt`` whose head weights initialise this run (fine-tuning).
+
+    Applied only on a FRESH run, at step 0, with a fresh optimizer and LR schedule. A requeue
+    resumes from its own checkpoint instead. The normalizer is not carried over -- a different
+    dataset has different domains, and refitting is the point.
+    """
 
     layout_preset: str = "pilot"
     encoder: MoTEncoderConfig = dataclasses.field(default_factory=MoTEncoderConfig)

@@ -227,6 +227,24 @@ def train(cfg: config_module.PolicyConfig) -> None:
             cfg.checkpoint_dir, resume_step, student=head, teacher=None, optimizer=optimizer, device=device
         )
         logger.info("resumed from step %d", global_step)
+    elif cfg.init_head_from:
+        # Fine-tuning: start from a head trained on another dataset, at step 0 with a fresh
+        # optimizer and a fresh LR schedule. Deliberately only on a FRESH run -- a requeue must
+        # continue from its own checkpoint, not silently rewind to the initialisation.
+        #
+        # The head only. The normalizer is NOT loaded: its buffers are (num_domains, 120) and the
+        # fine-tuning corpus has different domains, so the shapes need not even match. Refitting
+        # is also what we want -- the head predicts in normalised units, which is precisely what
+        # lets it transfer across datasets whose raw action scales differ ~8x.
+        init_path = pathlib.Path(cfg.init_head_from)
+        weights = torch.load(init_path, map_location=device, weights_only=True)
+        missing, unexpected = head.load_state_dict(weights, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"head init from {init_path} mismatched: {len(missing)} missing, "
+                f"{len(unexpected)} unexpected. Refusing to start on a partly-loaded head."
+            )
+        logger.info("initialised head from %s (%d tensors); optimizer and step start fresh", init_path, len(weights))
     sampler.set_start_step(global_step)
     init_tracking(cfg, run_dir, resuming=resume_step is not None)
 
