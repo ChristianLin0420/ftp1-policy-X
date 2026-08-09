@@ -231,6 +231,9 @@ class PolicyConfig:
     pretrained_run: str = ""
     """Run directory (or backbone snapshot) whose EMA teacher becomes the frozen encoder."""
     pretrained_step: int | None = None
+    holdout_mod: int = 0
+    """Hold out every Nth EPISODE for offline evaluation. 0 disables. The evaluator reads the
+    same field and takes the complement, so the two cannot drift apart."""
     init_head_from: str = ""
     """Path to a ``student.pt`` whose head weights initialise this run (fine-tuning).
 

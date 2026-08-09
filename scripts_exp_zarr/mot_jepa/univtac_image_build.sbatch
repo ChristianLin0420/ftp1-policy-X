@@ -30,6 +30,10 @@ IMAGE_OUT="${IMAGE_OUT:?set IMAGE_OUT -- an absolute .sqsh path on Lustre}"
 ISAACLAB_TAG="${ISAACLAB_TAG:-v2.1.1}"
 MARKER="${MARKER:-/lustre/fsw/portfolios/edgeai/users/chrislin/images/BUILD_OK}"
 
+# EXPORT, not just assign. srun starts the container with a fresh shell, so a plain assignment in
+# this outer script is invisible inside and the `${VAR:?}` guards abort with exit 127.
+export ISAACLAB_TAG MARKER
+
 mkdir -p "$(dirname "${IMAGE_OUT}")"
 rm -f "${MARKER}"
 echo "[$(date -Is)] base=${IMAGE_IN} -> ${IMAGE_OUT}  isaaclab=${ISAACLAB_TAG}"

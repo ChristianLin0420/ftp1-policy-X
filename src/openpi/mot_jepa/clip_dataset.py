@@ -125,6 +125,30 @@ def discover_keys(store: zarr.Group, *, prefer_rgb: str | None = None, drop_dege
     return StoreKeys(rgb=rgb, gel=tuple(gel), lowdim=tuple(lowdim))
 
 
+def split_clip_index(index: ClipIndex, *, holdout_mod: int, want: str) -> ClipIndex:
+    """Split a clip index by EPISODE, not by clip. ``want`` is ``"train"`` or ``"holdout"``.
+
+    Episode-level because clips overlap: at ``index_step=4`` consecutive starts share 15/16 of
+    their frames, so a clip-level split would put near-duplicates of the same motion on both
+    sides and report a held-out score that is really an in-sample one.
+
+    ``holdout_mod=10`` holds out every 10th episode of every store -- roughly 10%, spread evenly
+    across tasks rather than concentrated in whichever episodes happen to sort last. ``0`` or
+    ``1`` disables splitting and returns the index unchanged.
+
+    Both the trainer and the evaluator call this with the same ``holdout_mod`` and opposite
+    ``want``. Duplicating the predicate instead would let train and eval silently overlap.
+    """
+    if want not in ("train", "holdout"):
+        raise ValueError(f"want must be 'train' or 'holdout', got {want!r}")
+    if holdout_mod <= 1:
+        return index
+    episode = index.entries[:, 3]
+    held = (episode % holdout_mod) == (holdout_mod - 1)
+    keep = held if want == "holdout" else ~held
+    return ClipIndex(index.entries[keep], index.store_paths)
+
+
 @dataclasses.dataclass(frozen=True)
 class ClipIndexEntry:
     store_idx: int

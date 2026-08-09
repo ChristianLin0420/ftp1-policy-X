@@ -44,6 +44,7 @@ from openpi.mot_jepa.action_dit import flow_matching_loss
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import load_domain_config
+from openpi.mot_jepa.clip_dataset import split_clip_index
 from openpi.mot_jepa.drifting import drifting_loss
 from openpi.shared.wandb_compat import wandb
 from scripts.mot_jepa_train import InfiniteBatchSampler
@@ -75,7 +76,7 @@ def build_dataset(cfg: config_module.PolicyConfig) -> MotJepaClipDataset:
     if not stores:
         raise ValueError("no *.zarr stores matched the data configuration")
 
-    return MotJepaClipDataset(
+    dataset = MotJepaClipDataset(
         stores,
         cfg.layout,
         domain_ids=domain_ids,
@@ -85,6 +86,11 @@ def build_dataset(cfg: config_module.PolicyConfig) -> MotJepaClipDataset:
         with_conditioning=True,
         action_horizon=cfg.head.horizon,
     )
+    if cfg.holdout_mod > 1:
+        before = len(dataset)
+        dataset.clip_index = split_clip_index(dataset.clip_index, holdout_mod=cfg.holdout_mod, want="train")
+        logger.info("holdout_mod=%d: training on %d of %d clips", cfg.holdout_mod, len(dataset), before)
+    return dataset
 
 
 def fit_action_stats(
