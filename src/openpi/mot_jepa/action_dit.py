@@ -30,7 +30,7 @@ from openpi.mot_jepa.action_parse import ACTION_DIM
 from openpi.mot_jepa.layout import TokenLayout
 from openpi.mot_jepa.mot_encoder import EncoderOutput
 
-OBJECTIVES = ("drifting", "flowmatch")
+OBJECTIVES = ("drifting", "flowmatch", "linear")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,3 +280,70 @@ def flow_matching_loss(
     error = (velocity - u_t) ** 2 * chunk_mask
     loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
     return loss, {"flow_mse": float(loss.detach())}
+
+
+class LinearHead(nn.Module):
+    """A single affine map from the frozen readout to the action chunk. The diagnostic baseline.
+
+    Exists to separate two explanations of a policy that loses to a constant: a defective *head*,
+    or a defective *pipeline*. A ridge on these same features reaches R^2 0.6-0.95 on episode-held
+    -out UniVTAC, so if this reproduces that through our own dataloader, normaliser, masking and
+    loss plumbing, the pipeline is sound and the DiT is at fault. If this fails too, the fault is
+    upstream of any architecture and the ridge comparison was never like-for-like.
+
+    Deterministic on purpose. It ignores the noise and timestep arguments so it can be dropped into
+    the same trainer and evaluator without special-casing, and so its score is a conditional mean
+    rather than a sample -- which is the quantity the ridge reports.
+    """
+
+    def __init__(self, config: ActionDiTConfig, layout: TokenLayout, *, action_dim: int = ACTION_DIM) -> None:
+        super().__init__()
+        self.config = config
+        self.action_dim = action_dim
+        features = layout.num_steps * (layout.video_width + layout.tactile_width)
+        self.proj = nn.Linear(features, config.horizon * action_dim)
+        # Zero-init, like the DiT's output layer. Targets are normalised to unit variance, so a
+        # zero output IS the mean prediction and the loss starts at ~1.0. Default init instead
+        # starts it near 9 -- far worse than a constant -- and the first thousands of steps are
+        # spent climbing back to where zero-init begins.
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        encoded: EncoderOutput,
+        action_mask: torch.Tensor,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
+        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
+        out = self.proj(flat.to(self.proj.weight.dtype))
+        return out.reshape(out.shape[0], self.config.horizon, self.action_dim)
+
+    @torch.no_grad()
+    def sample(self, encoded, action_mask, *, num_steps: int = 10, generator=None) -> torch.Tensor:
+        del num_steps, generator
+        batch = encoded.sync_readout[0].shape[0]
+        device = encoded.sync_readout[0].device
+        zeros = torch.zeros(batch, self.config.horizon, self.action_dim, device=device)
+        return self(encoded, action_mask, zeros, torch.zeros(batch, device=device))
+
+
+def regression_loss(
+    head,
+    encoded: EncoderOutput,
+    actions: torch.Tensor,
+    action_mask: torch.Tensor,
+    chunk_mask: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Masked MSE against the expert chunk. Normalised by the mask sum, like the other two."""
+    del generator
+    batch = actions.shape[0]
+    zeros = torch.zeros_like(actions)
+    predicted = head(encoded, action_mask, zeros, torch.zeros(batch, device=actions.device))
+    error = (predicted - actions) ** 2 * chunk_mask
+    loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
+    return loss, {"regress_mse": float(loss.detach())}

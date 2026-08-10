@@ -306,6 +306,16 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
         head=ActionDiTConfig(objective="drifting"),
         data=DataConfig(index_step=4, num_workers=6),
     ),
+    "mot_jepa_policy_linear": PolicyConfig(
+        # Diagnostic baseline: a single affine map from the frozen readout, trained through the
+        # IDENTICAL pipeline. Separates "the DiT is at fault" from "the pipeline is at fault"
+        # when a ridge on the same features reaches R^2 0.6-0.95 and the DiT loses to a constant.
+        name="mot_jepa_policy_linear",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        head=ActionDiTConfig(objective="linear"),
+        data=DataConfig(index_step=4, num_workers=6),
+    ),
     "mot_jepa_policy_flowmatch": PolicyConfig(
         name="mot_jepa_policy_flowmatch",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),

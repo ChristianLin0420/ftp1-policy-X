@@ -40,7 +40,9 @@ from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionNormalizer
+from openpi.mot_jepa.action_dit import LinearHead
 from openpi.mot_jepa.action_dit import flow_matching_loss
+from openpi.mot_jepa.action_dit import regression_loss
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import load_domain_config
@@ -177,7 +179,8 @@ def train(cfg: config_module.PolicyConfig) -> None:
     backbone, backbone_step = runtime.load_frozen_backbone(
         pathlib.Path(cfg.pretrained_run), cfg.pretrained_step, cfg, device
     )
-    head = ActionDiT(cfg.head, cfg.layout).to(device)
+    head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
+    head = head_cls(cfg.head, cfg.layout).to(device)
     logger.info(
         "frozen backbone step %d; head %s, %.1fM trainable params",
         backbone_step,
@@ -308,6 +311,8 @@ def train(cfg: config_module.PolicyConfig) -> None:
             loss, extras = drifting_loss(
                 model, encoded, actions, action_mask, chunk_mask, config=cfg.drifting
             )
+        elif cfg.head.objective == "linear":
+            loss, extras = regression_loss(model, encoded, actions, action_mask, chunk_mask)
         else:
             loss, extras = flow_matching_loss(model, encoded, actions, action_mask, chunk_mask)
 

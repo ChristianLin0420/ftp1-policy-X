@@ -68,7 +68,9 @@ negative held-out R^2 that says nothing about the encoder. The penalty is chosen
 split, never on the test split."""
 
 
-def r_squared(features: np.ndarray, targets: np.ndarray, *, holdout: float = 0.3) -> tuple[float, int, float]:
+def r_squared(
+    features: np.ndarray, targets: np.ndarray, episodes: np.ndarray | None = None, *, holdout: float = 0.3
+) -> tuple[float, int, float]:
     """Held-out R^2 of a ridge fit ``targets ~ features``, penalty tuned on a validation split.
 
     Three-way split: fit on train, pick the penalty on validation, report on test. Picking the
@@ -79,8 +81,27 @@ def r_squared(features: np.ndarray, targets: np.ndarray, *, holdout: float = 0.3
     count = features.shape[0]
     if count < 60:  # need three usable splits
         return float("nan"), count, float("nan")
-    fit_end = int(count * (1.0 - 2 * holdout / 3))
-    val_end = int(count * (1.0 - holdout / 3))
+
+    # Split by EPISODE. Splitting by row -- which is what a positional slice over a shuffled
+    # loader does -- puts clips of the SAME episode on both sides: same scene, same object
+    # placement, same motion signature. That inflates R^2 and is exactly what made the original
+    # gate disagree with the held-out policy evaluation.
+    if episodes is None:
+        fit_end = int(count * (1.0 - 2 * holdout / 3))
+        val_end = int(count * (1.0 - holdout / 3))
+        order = np.arange(count)
+    else:
+        unique = np.unique(episodes)
+        if unique.size < 6:
+            return float("nan"), count, float("nan")
+        cut_fit = int(unique.size * (1.0 - 2 * holdout / 3))
+        cut_val = int(unique.size * (1.0 - holdout / 3))
+        fit_eps, val_eps = set(unique[:cut_fit].tolist()), set(unique[cut_fit:cut_val].tolist())
+        in_fit = np.array([e in fit_eps for e in episodes])
+        in_val = np.array([e in val_eps for e in episodes])
+        order = np.concatenate([np.flatnonzero(in_fit), np.flatnonzero(in_val), np.flatnonzero(~in_fit & ~in_val)])
+        fit_end, val_end = int(in_fit.sum()), int(in_fit.sum() + in_val.sum())
+    features, targets = features[order], targets[order]
     x_fit, x_val, x_test = features[:fit_end], features[fit_end:val_end], features[val_end:]
     y_fit, y_val, y_test = targets[:fit_end], targets[fit_end:val_end], targets[val_end:]
     if min(x_val.shape[0], x_test.shape[0]) < 10:
@@ -117,7 +138,7 @@ def r_squared(features: np.ndarray, targets: np.ndarray, *, holdout: float = 0.3
 
 
 @torch.no_grad()
-def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list, list, list]]:
+def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list, list, list, list]]:
     """Per domain: the frozen readout, the future action chunk, and the positive-control state.
 
     The third target is the control. The clip's own proprioceptive state is fed straight into the
@@ -125,7 +146,7 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list,
     not an uninformative encoder. Without it a negative action R^2 is uninterpretable -- exactly
     the trap the timeshuffle probe fell into.
     """
-    out: dict[int, tuple[list, list, list]] = collections.defaultdict(lambda: ([], [], []))
+    out: dict[int, tuple[list, list, list, list]] = collections.defaultdict(lambda: ([], [], [], []))
     for seen, batch in enumerate(loader):
         if seen >= max_batches:
             break
@@ -148,10 +169,15 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list,
         chunks = (batch["action_chunk"] * batch["chunk_mask"]).numpy()
         masks = batch["action_mask"].numpy()
         anchors = batch["state"][:, :: 2].numpy()  # tubelet anchors, the POSITIVE CONTROL target
+        store = batch["store_idx"].tolist()
+        episode = batch["episode_idx"].tolist()
         for row, domain in enumerate(batch["domain_id"].tolist()):
             out[domain][0].append(features[row])
             out[domain][1].append(chunks[row].reshape(-1))
             out[domain][2].append((anchors[row] * masks[row]).reshape(-1))
+            # Globally unique per (store, episode) so the split cannot merge episode 0 of two
+            # different stores into one group.
+            out[domain][3].append(store[row] * 1_000_000 + episode[row])
     return out
 
 
@@ -192,22 +218,25 @@ def main() -> int:
 
     print(f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}")
     print(f"\n{'domain':26s} {'clips':>7s} {'R2 action':>11s} {'lambda':>9s} {'R2 state(ctl)':>14s}")
-    rows, all_x, all_y, all_c = [], [], [], []
+    rows, all_x, all_y, all_c, all_e = [], [], [], [], []
     for domain in sorted(collected):
         features = np.stack(collected[domain][0])
         targets = np.stack(collected[domain][1])
         control = np.stack(collected[domain][2])
-        score, count, lam = r_squared(features, targets)
-        ctl, _, _ = r_squared(features, control)
+        eps = np.asarray(collected[domain][3])
+        score, count, lam = r_squared(features, targets, eps)
+        ctl, _, _ = r_squared(features, control, eps)
         rows.append((names[domain], score, count, ctl))
         all_x.append(features)
         all_y.append(targets)
         all_c.append(control)
+        all_e.append(eps)
         print(f"{names[domain]:26s} {count:7d} {score:11.4f} {lam:9.0e} {ctl:14.4f}")
 
     x, y, c = np.concatenate(all_x), np.concatenate(all_y), np.concatenate(all_c)
-    pooled, pooled_n, pooled_lam = r_squared(x, y)
-    pooled_ctl, _, _ = r_squared(x, c)
+    e = np.concatenate(all_e)
+    pooled, pooled_n, pooled_lam = r_squared(x, y, e)
+    pooled_ctl, _, _ = r_squared(x, c, e)
     print(f"\n{'POOLED':26s} {pooled_n:7d} {pooled:11.4f} {pooled_lam:9.0e} {pooled_ctl:14.4f}")
 
     solid = [(n, s, ctl) for n, s, cnt, ctl in rows if cnt >= MIN_CLIPS and np.isfinite(s)]

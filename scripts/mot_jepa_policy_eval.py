@@ -42,6 +42,7 @@ from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionNormalizer
+from openpi.mot_jepa.action_dit import LinearHead
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import split_clip_index
@@ -65,7 +66,8 @@ def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device
         raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
     path = checkpoint_dir / str(step)
 
-    head = ActionDiT(cfg.head, cfg.layout).to(device)
+    head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
+    head = head_cls(cfg.head, cfg.layout).to(device)
     weights = torch.load(path / "student.pt", map_location=device, weights_only=True)
     missing, unexpected = head.load_state_dict(weights, strict=False)
     if missing or unexpected:
@@ -86,7 +88,7 @@ def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device
 
 
 @torch.no_grad()
-def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: int) -> dict:
+def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: int, num_samples: int = 1) -> dict:
     """Squared error accumulated per domain and per action group, over live slots only."""
     sq: dict = collections.defaultdict(lambda: collections.defaultdict(float))
     count: dict = collections.defaultdict(lambda: collections.defaultdict(float))
@@ -108,7 +110,16 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
         )
 
         # The deployment path, not the training path: 1 NFE under drifting, Euler under flowmatch.
-        predicted = head.sample(encoded, action_mask, num_steps=num_steps).float()
+        #
+        # ``num_samples > 1`` averages independent samples to estimate the CONDITIONAL MEAN.
+        # This matters because RMSE structurally penalises a generative model: a sampler that has
+        # correctly learned p(a|o) pays Var[a|o] + bias^2, while a mean-predictor pays only
+        # bias^2, so a perfectly calibrated sampler scores WORSE than a blurry averager. Comparing
+        # the K-sample mean against the single-sample score separates "did not learn the
+        # conditional structure" from "learned it and is paying honest sampling variance".
+        predicted = torch.stack(
+            [head.sample(encoded, action_mask, num_steps=num_steps).float() for _ in range(num_samples)]
+        ).mean(dim=0)
         # Back to raw units before scoring, so the RMSE is in radians and comparable across arms
         # whose normalisers differ.
         predicted = normalizer.denormalize(predicted, domain_id) * chunk_mask
@@ -137,10 +148,19 @@ def main() -> int:
     parser.add_argument("--index-step", type=int, default=17)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--euler-steps", type=int, default=10)
+    parser.add_argument("--num-samples", type=int, default=1,
+                        help="Average K samples per observation to estimate the conditional mean.")
     parser.add_argument("--out", type=pathlib.Path, default=None)
     args = parser.parse_args()
 
-    preset = args.config or ("mot_jepa_policy_drifting" if "drifting" in str(args.run) else "mot_jepa_policy_flowmatch")
+    if args.config:
+        preset = args.config
+    elif "linear" in str(args.run):
+        preset = "mot_jepa_policy_linear"
+    elif "drifting" in str(args.run):
+        preset = "mot_jepa_policy_drifting"
+    else:
+        preset = "mot_jepa_policy_flowmatch"
     cfg = config_module.POLICY_CONFIGS[preset]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -169,7 +189,8 @@ def main() -> int:
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=6, collate_fn=collate_clips
     )
-    acc = evaluate(backbone, head, normalizer, loader, device, names, num_steps=args.euler_steps)
+    acc = evaluate(backbone, head, normalizer, loader, device, names, num_steps=args.euler_steps,
+                   num_samples=args.num_samples)
 
     def rmse(name: str, group: str) -> float:
         c = acc["count"][name].get(group, 0.0)
@@ -177,7 +198,7 @@ def main() -> int:
 
     live = [g for g in (*GROUPS, "ALL") if any(acc["count"][n].get(g, 0.0) > 0 for n in acc["count"])]
     print(f"\n{preset}  head step {step}  backbone step {backbone_step}  objective {cfg.head.objective}")
-    print(f"held-out clips: {len(dataset)}   (every {args.holdout_mod}th episode)\n")
+    print(f"held-out clips: {len(dataset)}   samples/obs: {args.num_samples}   (every {args.holdout_mod}th episode)\n")
     header = f"{'domain':24s}" + "".join(f"{g[:14]:>16s}" for g in live)
     print(header)
     for name in sorted(acc["count"]):
