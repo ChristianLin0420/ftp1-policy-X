@@ -50,7 +50,6 @@ from openpi.mot_jepa import config as config_module
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
-from openpi.mot_jepa.drifting import neighbour_weights
 from openpi.mot_jepa.model import ClipInputs
 
 logger = logging.getLogger("mot_jepa.multimodality")
@@ -77,13 +76,33 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list,
     return out
 
 
-def ratio_for(embeddings: np.ndarray, actions: np.ndarray, mask: np.ndarray) -> tuple[float, int]:
-    """Conditional spread as a fraction of the marginal, over live dimensions."""
+def ratio_for(
+    embeddings: np.ndarray, actions: np.ndarray, mask: np.ndarray, *, top_k: int = 8, shuffle: bool = False
+) -> tuple[float, int]:
+    """Conditional spread as a fraction of the marginal, over live dimensions.
+
+    ``top_k`` restricts the weighting to the k nearest clips. IDP's own row-standardised softmax is
+    deliberately broad -- it spreads mass over most of the batch -- which is right for its geometry
+    but wrong as a multimodality diagnostic: averaging over ~63 clips approaches the marginal
+    variance by construction, so it would report "multimodal" on any dataset.
+
+    ``shuffle`` randomises the embeddings, destroying the observation-action correspondence while
+    leaving every marginal untouched. It is the control: a metric that cannot tell the real
+    embedding from a shuffled one is measuring its own weighting, not the data.
+    """
     live = mask.mean(axis=0) > 0.5
     if live.sum() == 0 or embeddings.shape[0] < 32:
         return float("nan"), embeddings.shape[0]
     actions = actions[:, live]
-    weights = neighbour_weights(torch.from_numpy(embeddings).float()).numpy()
+    if shuffle:
+        embeddings = embeddings[np.random.default_rng(0).permutation(embeddings.shape[0])]
+
+    normed = embeddings / (np.linalg.norm(embeddings, axis=-1, keepdims=True) + 1e-8)
+    similarity = normed @ normed.T
+    np.fill_diagonal(similarity, -np.inf)
+    keep = np.argsort(-similarity, axis=-1)[:, :top_k]
+    weights = np.zeros_like(similarity)
+    np.put_along_axis(weights, keep, 1.0 / top_k, axis=-1)
 
     delta = actions[None, :, :] - actions[:, None, :]  # (i, j, d)
     v_cond = np.einsum("ij,ijd->id", weights, delta**2)
@@ -131,19 +150,27 @@ def main() -> int:
     collected = collect(backbone, loader, device, args.batches)
 
     print(f"\nbackbone step {step}, horizon {args.horizon}\n")
-    print(f"{'domain':26s} {'clips':>7s} {'cond/marginal spread':>22s}")
-    values = []
+    print(f"{'domain':26s} {'clips':>7s} {'real emb':>12s} {'SHUFFLED (ctl)':>16s} {'gap':>10s}")
+    values, ctl_values = [], []
     for domain in sorted(collected):
         emb = np.stack(collected[domain][0])
         act = np.stack(collected[domain][1])
         msk = np.stack(collected[domain][2])
         r, n = ratio_for(emb, act, msk)
+        c, _ = ratio_for(emb, act, msk, shuffle=True)
         if np.isfinite(r):
             values.append(r)
-        print(f"{names[domain]:26s} {n:7d} {r:22.4f}")
+            ctl_values.append(c)
+        print(f"{names[domain]:26s} {n:7d} {r:12.4f} {c:16.4f} {c - r:10.4f}")
 
     overall = float(np.mean(values)) if values else float("nan")
-    print(f"\n{'MEAN over domains':26s} {'':7s} {overall:22.4f}")
+    control = float(np.mean(ctl_values)) if ctl_values else float("nan")
+    print(f"\n{'MEAN over domains':26s} {'':7s} {overall:12.4f} {control:16.4f} {control - overall:10.4f}")
+    print(
+        "\nThe control shuffles the embeddings, destroying the observation-action correspondence\n"
+        "while leaving every marginal intact. If real and shuffled agree, the metric is blind and\n"
+        "neither number says anything about the data."
+    )
     print(
         "\n1.0 = observation-similar clips disagree as much as random pairs (multimodal, or the\n"
         "embedding is blind).  Toward 0 = similar observations imply similar actions (one mode).\n"

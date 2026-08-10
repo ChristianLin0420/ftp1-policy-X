@@ -301,6 +301,12 @@ class LinearHead(nn.Module):
         self.config = config
         self.action_dim = action_dim
         features = layout.num_steps * (layout.video_width + layout.tactile_width)
+        # Normalise the readout first. It is NOT unit scale -- measured std 5.19, max |.| 54.5 --
+        # so an unnormalised affine map diverges at any learning rate that trains in reasonable
+        # time. The ridge this baseline is meant to reproduce standardises its features on train
+        # statistics before fitting, and the DiT normalises via context_norm, so without this the
+        # comparison would not be like-for-like either.
+        self.norm = nn.LayerNorm(features)
         self.proj = nn.Linear(features, config.horizon * action_dim)
         # Zero-init, like the DiT's output layer. Targets are normalised to unit variance, so a
         # zero output IS the mean prediction and the loss starts at ~1.0. Default init instead
@@ -318,7 +324,7 @@ class LinearHead(nn.Module):
     ) -> torch.Tensor:
         del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
         flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
-        out = self.proj(flat.to(self.proj.weight.dtype))
+        out = self.proj(self.norm(flat.to(self.proj.weight.dtype)))
         return out.reshape(out.shape[0], self.config.horizon, self.action_dim)
 
     @torch.no_grad()
