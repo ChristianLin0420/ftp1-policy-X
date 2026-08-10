@@ -4,6 +4,7 @@ import torch
 
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionDiTConfig
+from openpi.mot_jepa.action_dit import LinearHead
 from openpi.mot_jepa.config import CONFIGS
 from openpi.mot_jepa.drifting import DriftingConfig
 from openpi.mot_jepa.drifting import drifting_loss
@@ -122,7 +123,9 @@ def test_drifting_loss_runs_and_reports_its_geometry():
     generator = torch.Generator().manual_seed(5)
     batch, horizon = 12, 6
     head = ActionDiT(
-        ActionDiTConfig(width=64, depth=2, num_heads=4, horizon=horizon, objective="drifting"), LAYOUT
+        ActionDiTConfig(width=64, depth=2, num_heads=4, horizon=horizon, objective="drifting"),
+        LAYOUT,
+        num_domains=3,
     )
     encoded = fake_encoded(batch, generator=generator)
     actions = torch.randn(batch, horizon, 120, generator=generator)
@@ -130,8 +133,9 @@ def test_drifting_loss_runs_and_reports_its_geometry():
     action_mask[:, :16] = 1.0
     chunk_mask = action_mask[:, None, :].expand(batch, horizon, 120)
 
+    domain_id = torch.zeros(batch, dtype=torch.long)
     loss, metrics = drifting_loss(
-        head, encoded, actions, action_mask, chunk_mask, config=DriftingConfig(), generator=generator
+        head, encoded, actions, action_mask, chunk_mask, domain_id, config=DriftingConfig(), generator=generator
     )
     assert torch.isfinite(loss)
     loss.backward()
@@ -144,11 +148,65 @@ def test_drifting_inference_is_one_forward_pass():
     calls = []
     horizon = 6
     head = ActionDiT(
-        ActionDiTConfig(width=64, depth=1, num_heads=4, horizon=horizon, objective="drifting"), LAYOUT
+        ActionDiTConfig(width=64, depth=1, num_heads=4, horizon=horizon, objective="drifting"),
+        LAYOUT,
+        num_domains=2,
     )
     original = head.forward
     head.forward = lambda *a, **k: (calls.append(1), original(*a, **k))[1]
 
     encoded = fake_encoded(3)
-    head.sample(encoded, torch.ones(3, 120))
+    head.sample(encoded, torch.ones(3, 120), torch.zeros(3, dtype=torch.long))
     assert len(calls) == 1, f"drifting inference must be 1 NFE, took {len(calls)}"
+
+
+def test_domain_id_changes_the_prediction():
+    """The head must actually route on domain, or the embedding is decoration.
+
+    This is the defect the embedding exists to fix: a ridge fitted PER DOMAIN reaches R^2 0.65-0.93
+    on held-out UniVTAC while the same ridge fitted as ONE SHARED map over the eight domains scores
+    -0.34. Every head trained before this was that shared map -- none had any domain input at all --
+    and every one lost to a per-domain constant. If swapping domain_id leaves the output unchanged,
+    the head is still that shared map and the fix did nothing.
+    """
+    generator = torch.Generator().manual_seed(7)
+    horizon, batch = 6, 4
+    head = ActionDiT(
+        ActionDiTConfig(width=64, depth=2, num_heads=4, horizon=horizon, objective="flowmatch"),
+        LAYOUT,
+        num_domains=5,
+    )
+    # A zero-init adaLN gate makes every block the identity at init, so route on a TRAINED head.
+    with torch.no_grad():
+        for block in head.blocks:
+            block.modulation[1].weight.normal_(std=0.05)
+            block.modulation[1].bias.normal_(std=0.05)
+        head.action_out.weight.normal_(std=0.05)
+
+    encoded = fake_encoded(batch, generator=generator)
+    mask = torch.ones(batch, 120)
+    x = torch.randn(batch, horizon, 120, generator=generator)
+    t = torch.zeros(batch)
+
+    first = head(encoded, mask, x, t, torch.zeros(batch, dtype=torch.long))
+    second = head(encoded, mask, x, t, torch.full((batch,), 3, dtype=torch.long))
+    assert not torch.allclose(first, second, atol=1e-6), "output is invariant to domain_id"
+
+
+def test_linear_head_also_routes_on_domain():
+    """Same requirement for the diagnostic baseline, which is the arm compared against the ridge."""
+    generator = torch.Generator().manual_seed(8)
+    horizon, batch = 6, 4
+    head = LinearHead(
+        ActionDiTConfig(width=64, depth=1, num_heads=4, horizon=horizon, objective="linear"),
+        LAYOUT,
+        num_domains=5,
+    )
+    with torch.no_grad():
+        head.proj.weight.normal_(std=0.01)  # zero-init would make every domain identical
+
+    encoded = fake_encoded(batch, generator=generator)
+    mask = torch.ones(batch, 120)
+    first = head.sample(encoded, mask, torch.zeros(batch, dtype=torch.long))
+    second = head.sample(encoded, mask, torch.full((batch,), 4, dtype=torch.long))
+    assert not torch.allclose(first, second, atol=1e-6), "linear head ignores domain_id"

@@ -67,7 +67,7 @@ def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device
     path = checkpoint_dir / str(step)
 
     head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
-    head = head_cls(cfg.head, cfg.layout).to(device)
+    head = head_cls(cfg.head, cfg.layout, num_domains=num_domains).to(device)
     weights = torch.load(path / "student.pt", map_location=device, weights_only=True)
     missing, unexpected = head.load_state_dict(weights, strict=False)
     if missing or unexpected:
@@ -118,7 +118,7 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
         # the K-sample mean against the single-sample score separates "did not learn the
         # conditional structure" from "learned it and is paying honest sampling variance".
         predicted = torch.stack(
-            [head.sample(encoded, action_mask, num_steps=num_steps).float() for _ in range(num_samples)]
+            [head.sample(encoded, action_mask, domain_id, num_steps=num_steps).float() for _ in range(num_samples)]
         ).mean(dim=0)
         # Back to raw units before scoring, so the RMSE is in radians and comparable across arms
         # whose normalisers differ.

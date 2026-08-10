@@ -106,6 +106,7 @@ def drifting_loss(
     actions: torch.Tensor,
     action_mask: torch.Tensor,
     chunk_mask: torch.Tensor,
+    domain_id: torch.Tensor,
     *,
     config: DriftingConfig | None = None,
     generator: torch.Generator | None = None,
@@ -129,14 +130,14 @@ def drifting_loss(
     # y: the one-step prediction, pure noise at t = 0. This is what inference runs.
     noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype, generator=generator)
     zeros = torch.zeros(batch, device=actions.device)
-    y = head(encoded, action_mask, noise, zeros)
+    y = head(encoded, action_mask, noise, zeros, domain_id)
 
     # z: the expert-proximal probe. Without it the geometry is only ever evaluated far from the
     # data, where it says little about the modes the policy has to keep apart.
     probe_noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype, generator=generator)
     perturbed = actions + (1.0 - config.t_star) * probe_noise
     t_star = torch.full((batch,), config.t_star, device=actions.device)
-    z = head(encoded, action_mask, perturbed, t_star)
+    z = head(encoded, action_mask, perturbed, t_star, domain_id)
 
     energy_y = geometric_energy(y.reshape(batch, -1), flat_actions, excess, flat_mask)
     energy_z = geometric_energy(z.reshape(batch, -1), flat_actions, excess, flat_mask)

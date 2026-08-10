@@ -154,13 +154,30 @@ class ActionDiT(nn.Module):
     unimodal readout, because that is the representation the viability gate measured -- the ridge
     that recovered the action chunk at R^2 0.32 pooled read exactly these tokens. Conditioning on
     the final tokens instead would condition on something never gated.
+
+    A **domain embedding** is added to the conditioning vector. Without it the head sees only the
+    readout and cannot route between embodiments, and the measurement says that is fatal here: a
+    ridge fitted PER DOMAIN reaches R^2 0.65-0.93 on held-out UniVTAC while the same ridge fitted as
+    ONE SHARED map over the eight domains scores -0.34. Every head trained before this was that one
+    shared map, and every one lost to a per-domain constant.
     """
 
-    def __init__(self, config: ActionDiTConfig, layout: TokenLayout, *, action_dim: int = ACTION_DIM) -> None:
+    def __init__(
+        self,
+        config: ActionDiTConfig,
+        layout: TokenLayout,
+        *,
+        num_domains: int = 1,
+        action_dim: int = ACTION_DIM,
+    ) -> None:
         super().__init__()
         self.config = config
         self.action_dim = action_dim
         width = config.width
+        # See the class docstring: one shared map over eight domains scores R^2 -0.34 where
+        # per-domain maps score 0.65-0.93. This is what lets the head route.
+        self.domain_embed = nn.Embedding(num_domains, width)
+        nn.init.normal_(self.domain_embed.weight, std=0.02)
 
         # One projection per expert, so the two widths (384 video, 192 tactile at pilot) enter a
         # shared space before the head sees them.
@@ -194,6 +211,7 @@ class ActionDiT(nn.Module):
         action_mask: torch.Tensor,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
+        domain_id: torch.Tensor,
     ) -> torch.Tensor:
         """Returns ``(B, H, action_dim)``: a *sample* under ``drifting``, a *velocity* under ``flowmatch``.
 
@@ -206,6 +224,7 @@ class ActionDiT(nn.Module):
         context, pooled = self.context_tokens(encoded)
         x = noisy_actions.to(context.dtype)
         cond = pooled + timestep_embedding(timestep, self.config.width).to(context.dtype)
+        cond = cond + self.domain_embed(domain_id).to(context.dtype)
         horizon = self.config.horizon
 
         # Mask BEFORE the projection, never after. An absent action group -- a domain with no left
@@ -228,6 +247,7 @@ class ActionDiT(nn.Module):
         self,
         encoded: EncoderOutput,
         action_mask: torch.Tensor,
+        domain_id: torch.Tensor,
         *,
         num_steps: int = 10,
         generator: torch.Generator | None = None,
@@ -242,12 +262,12 @@ class ActionDiT(nn.Module):
         x = torch.randn(batch, self.config.horizon, self.action_dim, device=device, generator=generator)
 
         if self.config.objective == "drifting":
-            return self(encoded, action_mask, x, torch.zeros(batch, device=device))
+            return self(encoded, action_mask, x, torch.zeros(batch, device=device), domain_id)
 
         dt = -1.0 / num_steps
         t = torch.ones(batch, device=device)
         for _ in range(num_steps):
-            x = x + dt * self(encoded, action_mask, x, t)
+            x = x + dt * self(encoded, action_mask, x, t, domain_id)
             t = t + dt
         return x
 
@@ -258,6 +278,7 @@ def flow_matching_loss(
     actions: torch.Tensor,
     action_mask: torch.Tensor,
     chunk_mask: torch.Tensor,
+    domain_id: torch.Tensor,
     *,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -296,11 +317,24 @@ class LinearHead(nn.Module):
     rather than a sample -- which is the quantity the ridge reports.
     """
 
-    def __init__(self, config: ActionDiTConfig, layout: TokenLayout, *, action_dim: int = ACTION_DIM) -> None:
+    def __init__(
+        self,
+        config: ActionDiTConfig,
+        layout: TokenLayout,
+        *,
+        num_domains: int = 1,
+        action_dim: int = ACTION_DIM,
+    ) -> None:
         super().__init__()
         self.config = config
         self.action_dim = action_dim
         features = layout.num_steps * (layout.video_width + layout.tactile_width)
+        # Concatenated rather than added: an affine map over [features | one-hot domain] can learn
+        # a per-domain bias but still shares its weights, which is exactly the comparison of
+        # interest against the per-domain ridge.
+        self.domain_embed = nn.Embedding(num_domains, config.width)
+        nn.init.normal_(self.domain_embed.weight, std=0.02)
+        features = features + config.width
         # Normalise the readout first. It is NOT unit scale -- measured std 5.19, max |.| 54.5 --
         # so an unnormalised affine map diverges at any learning rate that trains in reasonable
         # time. The ridge this baseline is meant to reproduce standardises its features on train
@@ -321,19 +355,21 @@ class LinearHead(nn.Module):
         action_mask: torch.Tensor,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
+        domain_id: torch.Tensor,
     ) -> torch.Tensor:
         del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
         flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
+        flat = torch.cat([flat, self.domain_embed(domain_id).to(flat.dtype)], dim=-1)
         out = self.proj(self.norm(flat.to(self.proj.weight.dtype)))
         return out.reshape(out.shape[0], self.config.horizon, self.action_dim)
 
     @torch.no_grad()
-    def sample(self, encoded, action_mask, *, num_steps: int = 10, generator=None) -> torch.Tensor:
+    def sample(self, encoded, action_mask, domain_id, *, num_steps: int = 10, generator=None) -> torch.Tensor:
         del num_steps, generator
         batch = encoded.sync_readout[0].shape[0]
         device = encoded.sync_readout[0].device
         zeros = torch.zeros(batch, self.config.horizon, self.action_dim, device=device)
-        return self(encoded, action_mask, zeros, torch.zeros(batch, device=device))
+        return self(encoded, action_mask, zeros, torch.zeros(batch, device=device), domain_id)
 
 
 def regression_loss(
@@ -342,6 +378,7 @@ def regression_loss(
     actions: torch.Tensor,
     action_mask: torch.Tensor,
     chunk_mask: torch.Tensor,
+    domain_id: torch.Tensor,
     *,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -349,7 +386,7 @@ def regression_loss(
     del generator
     batch = actions.shape[0]
     zeros = torch.zeros_like(actions)
-    predicted = head(encoded, action_mask, zeros, torch.zeros(batch, device=actions.device))
+    predicted = head(encoded, action_mask, zeros, torch.zeros(batch, device=actions.device), domain_id)
     error = (predicted - actions) ** 2 * chunk_mask
     loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
     return loss, {"regress_mse": float(loss.detach())}

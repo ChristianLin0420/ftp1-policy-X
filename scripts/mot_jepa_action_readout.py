@@ -138,7 +138,9 @@ def r_squared(
 
 
 @torch.no_grad()
-def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list, list, list, list]]:
+def collect(
+    backbone, loader, device, max_batches: int, *, layernorm_features: bool = False
+) -> dict[int, tuple[list, list, list, list]]:
     """Per domain: the frozen readout, the future action chunk, and the positive-control state.
 
     The third target is the control. The clip's own proprioceptive state is fed straight into the
@@ -161,6 +163,8 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, tuple[list,
         # will cross-attend to, so the gate measures the representation the policy will actually
         # receive rather than a more favourable summary of it.
         readout = torch.cat([expert.float().flatten(start_dim=1) for expert in encoded.sync_readout], dim=-1)
+        if layernorm_features:
+            readout = torch.nn.functional.layer_norm(readout, (readout.shape[-1],))
         features = readout.cpu().numpy()
 
         # The genuine future window, built by the dataset at this clip's own stride and guaranteed
@@ -190,6 +194,16 @@ def main() -> int:
     parser.add_argument("--config", default="mot_jepa_pilot")
     parser.add_argument("--horizon", type=int, default=15)
     parser.add_argument("--batches", type=int, default=192)
+    parser.add_argument(
+        "--layernorm-features",
+        action="store_true",
+        help=(
+            "Apply LayerNorm to the readout before fitting -- per SAMPLE across all 4608 dims, "
+            "discarding that sample's mean and magnitude. This reproduces what LinearHead and the "
+            "DiT's context_norm do, and asks in closed form whether that transform is what costs "
+            "the trained heads their accuracy. No training required."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
@@ -214,9 +228,10 @@ def main() -> int:
     )
     logger.info("%d stores / %d domains / %d clips", len(stores), len(names), len(dataset))
 
-    collected = collect(backbone, loader, device, args.batches)
+    collected = collect(backbone, loader, device, args.batches, layernorm_features=args.layernorm_features)
 
-    print(f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}")
+    print(f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}"
+          f"{'  [LayerNorm features]' if args.layernorm_features else ''}")
     print(f"\n{'domain':26s} {'clips':>7s} {'R2 action':>11s} {'lambda':>9s} {'R2 state(ctl)':>14s}")
     rows, all_x, all_y, all_c, all_e = [], [], [], [], []
     for domain in sorted(collected):

@@ -179,22 +179,25 @@ def train(cfg: config_module.PolicyConfig) -> None:
     backbone, backbone_step = runtime.load_frozen_backbone(
         pathlib.Path(cfg.pretrained_run), cfg.pretrained_step, cfg, device
     )
-    head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
-    head = head_cls(cfg.head, cfg.layout).to(device)
-    logger.info(
-        "frozen backbone step %d; head %s, %.1fM trainable params",
-        backbone_step,
-        cfg.head.objective,
-        sum(p.numel() for p in head.parameters()) / 1e6,
-    )
-
     dataset = build_dataset(cfg)
     logger.info("%d clips at horizon %d", len(dataset), cfg.head.horizon)
 
     # The head predicts NORMALISED actions. Raw FTP-1 deltas are ~0.01 and vary 8x across
     # domains, which makes flow matching degenerate (the action is 1% of x_t, so echoing the
     # noise scores near-zero loss) and lets large-motion domains dominate a shared head.
+    # num_domains also sizes the head's domain embedding, so the dataset must be built first.
     num_domains = int(max(dataset.domain_ids)) + 1
+
+    head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
+    head = head_cls(cfg.head, cfg.layout, num_domains=num_domains).to(device)
+    logger.info(
+        "frozen backbone step %d; head %s over %d domains, %.1fM trainable params",
+        backbone_step,
+        cfg.head.objective,
+        num_domains,
+        sum(p.numel() for p in head.parameters()) / 1e6,
+    )
+
     stats_path = run_dir / "action_stats.npz"
     if runtime.is_main_process():
         fit_action_stats(dataset, num_domains, stats_path)
@@ -309,12 +312,12 @@ def train(cfg: config_module.PolicyConfig) -> None:
 
         if cfg.head.objective == "drifting":
             loss, extras = drifting_loss(
-                model, encoded, actions, action_mask, chunk_mask, config=cfg.drifting
+                model, encoded, actions, action_mask, chunk_mask, domain_id, config=cfg.drifting
             )
         elif cfg.head.objective == "linear":
-            loss, extras = regression_loss(model, encoded, actions, action_mask, chunk_mask)
+            loss, extras = regression_loss(model, encoded, actions, action_mask, chunk_mask, domain_id)
         else:
-            loss, extras = flow_matching_loss(model, encoded, actions, action_mask, chunk_mask)
+            loss, extras = flow_matching_loss(model, encoded, actions, action_mask, chunk_mask, domain_id)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
