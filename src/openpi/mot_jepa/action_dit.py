@@ -43,6 +43,10 @@ class ActionDiTConfig:
     horizon: int = 32
     objective: str = "drifting"
     mlp_ratio: float = 4.0
+    # Give every domain its own trunk as well as its own output layer, so the whole map is eight
+    # independent affine functions. Only LinearHead reads this. See LinearHead for the measurement
+    # that motivates it.
+    per_domain_trunk: bool = False
 
     def __post_init__(self) -> None:
         if self.objective not in OBJECTIVES:
@@ -366,12 +370,23 @@ class LinearHead(nn.Module):
         # time. The ridge this baseline reproduces standardises its features before fitting, and
         # the DiT normalises via context_norm, so without this the comparison is not like-for-like.
         self.norm = nn.LayerNorm(features)
-        # Shared trunk, PER-DOMAIN output. A full per-domain 4608->3840 map would be 141M
-        # parameters; factoring through `width` keeps the whole composition linear (rank `width`)
-        # while giving each domain its own output weights. That distinction is the entire point:
-        # a shared map with per-domain normalised targets measures R^2 -0.0016 where eight
-        # per-domain maps measure 0.65-0.93, and a per-domain *bias* cannot close that.
-        self.trunk = nn.Linear(features, config.width)
+        # The trunk is shared across domains by default and per-domain under `per_domain_trunk`.
+        # That switch is the last structural difference between this head and the ridge that beats
+        # it. Both fit the same features on the same episode split; the ridge fits EIGHT
+        # independent maps and scores 0.00329 against the constant's 0.00435, while every trained
+        # head -- which shares this trunk and branches only at `proj` -- lands 4-11% *worse* than
+        # the constant. A shared rank-`width` bottleneck trained jointly is the suspect: batches
+        # are domain-pure, so consecutive steps drag the shared weights between eight different
+        # input-to-action relationships, and a per-domain output layer cannot undo a trunk that is
+        # oscillating underneath it.
+        #
+        # Per-domain costs `num_domains`x the trunk parameters -- 18.9M at eight domains and width
+        # 512, against 2.4M shared -- which is the price of removing the interference. Still far
+        # under a full per-domain 4608->3840 map at 141M.
+        if config.per_domain_trunk:
+            self.trunk = PerDomainLinear(num_domains, features, config.width)
+        else:
+            self.trunk = nn.Linear(features, config.width)
         # Zero-init, like the DiT's output layer: targets are unit-variance, so a zero output IS
         # the mean prediction and the loss starts at ~1.0 rather than near 9.
         self.proj = PerDomainLinear(num_domains, config.width, config.horizon * action_dim, zero_init=True)
@@ -386,7 +401,8 @@ class LinearHead(nn.Module):
     ) -> torch.Tensor:
         del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
         flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
-        hidden = self.trunk(self.norm(flat.to(self.trunk.weight.dtype)))
+        normed = self.norm(flat.to(self.trunk.weight.dtype))
+        hidden = self.trunk(normed, domain_id) if self.config.per_domain_trunk else self.trunk(normed)
         out = self.proj(hidden, domain_id)
         return out.reshape(out.shape[0], self.config.horizon, self.action_dim)
 

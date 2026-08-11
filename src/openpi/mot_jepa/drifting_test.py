@@ -249,10 +249,17 @@ def test_per_domain_linear_routes_each_row_to_its_own_domain():
         assert torch.allclose(got[row], expected, atol=1e-6), f"row {row} used the wrong domain"
 
 
-def _loss_fixture(objective: str, *, batch: int = 6, horizon: int = 5):
+def _loss_fixture(objective: str, *, batch: int = 6, horizon: int = 5, per_domain_trunk: bool = False):
     head_cls = LinearHead if objective == "linear" else ActionDiT
     head = head_cls(
-        ActionDiTConfig(width=64, depth=2, num_heads=4, horizon=horizon, objective=objective),
+        ActionDiTConfig(
+            width=64,
+            depth=2,
+            num_heads=4,
+            horizon=horizon,
+            objective=objective,
+            per_domain_trunk=per_domain_trunk,
+        ),
         LAYOUT,
         num_domains=4,
     )
@@ -280,6 +287,35 @@ def test_every_loss_runs_end_to_end():
         loss.backward()
         assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters()), objective
         assert metrics, f"{objective} reported no metrics"
+
+
+def test_per_domain_trunk_gives_each_domain_an_independent_map():
+    """The point of the flag: perturbing one domain's trunk must not move another domain's output.
+
+    Asserted rather than assumed because a shared trunk passes every shape and finiteness check a
+    per-domain one does, so nothing else in this suite can tell the two apart -- and the whole
+    reason the flag exists is that a shared trunk is the suspected defect.
+    """
+    head, encoded, _, action_mask, _, _ = _loss_fixture("linear", per_domain_trunk=True)
+    zero = torch.zeros(6, dtype=torch.long)
+    one = torch.ones(6, dtype=torch.long)
+    with torch.no_grad():
+        # `proj` ships zero-initialised, so at init the head emits exactly zero and no trunk
+        # perturbation is observable downstream. Give it weight before measuring.
+        head.proj.weight.normal_(std=0.1)
+        before_zero = head.sample(encoded, action_mask, zero)
+        before_one = head.sample(encoded, action_mask, one)
+        head.trunk.weight[0].add_(1.0)
+        after_zero = head.sample(encoded, action_mask, zero)
+        after_one = head.sample(encoded, action_mask, one)
+    assert not torch.allclose(before_zero, after_zero), "domain 0's own trunk did not affect it"
+    torch.testing.assert_close(before_one, after_one, msg="domain 0's trunk leaked into domain 1")
+
+
+def test_shared_trunk_remains_the_default():
+    """The three shipped presets trained with a shared trunk; their checkpoints must still load."""
+    head, *_ = _loss_fixture("linear")
+    assert isinstance(head.trunk, torch.nn.Linear), "default head must keep the shared nn.Linear trunk"
 
 
 def test_every_objective_samples_end_to_end():

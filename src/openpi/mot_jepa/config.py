@@ -316,6 +316,20 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
         head=ActionDiTConfig(objective="linear"),
         data=DataConfig(index_step=4, num_workers=6),
     ),
+    "mot_jepa_policy_linear_perdomain": PolicyConfig(
+        # The same affine map, but with a per-domain trunk instead of a shared one -- eight fully
+        # independent maps, which is the one structural property the ridge has and no trained head
+        # has had. The ridge scores 0.00329 held-out against the constant's 0.00435 and wins on all
+        # eight domains; the shared-trunk heads score 0.00454-0.00484 and win on none. If this
+        # closes that gap, joint training through a shared bottleneck was the whole defect and the
+        # DiT needs the same treatment. If it does not, the fault is in the optimisation itself and
+        # no amount of per-domain capacity will reach a closed-form fit.
+        name="mot_jepa_policy_linear_perdomain",
+        encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
+        predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
+        head=ActionDiTConfig(objective="linear", per_domain_trunk=True),
+        data=DataConfig(index_step=4, num_workers=6),
+    ),
     "mot_jepa_policy_flowmatch": PolicyConfig(
         name="mot_jepa_policy_flowmatch",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
