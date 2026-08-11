@@ -27,6 +27,8 @@ else
   POLICY=(--run "${RUN:?set RUN or RIDGE}")
 fi
 
+[[ -n "${CONFIG:-}" ]] && POLICY+=(--config "${CONFIG}")
+
 srun "${REPO_ROOT}/.venv/bin/python" scripts/mot_jepa_policy_eval.py \
   "${POLICY[@]}" \
   --pretrained_run "${SNAP}" --pretrained_step "${STEP:-50000}" \

@@ -165,12 +165,18 @@ def main() -> int:
     elif args.ridge:
         # Only the layout and the horizon are read for a ridge; every preset shares them.
         preset = "mot_jepa_policy_linear"
-    elif "linear" in str(args.run):
-        preset = "mot_jepa_policy_linear"
-    elif "drifting" in str(args.run):
-        preset = "mot_jepa_policy_drifting"
+    elif args.run.parent.name in config_module.POLICY_CONFIGS:
+        # submit.sh builds RUN_DIR as <run_root>/<CONFIG_NAME>/<EXP_NAME>, so the parent directory
+        # IS the preset name. Exact, unlike the substring test this replaces -- which mapped
+        # `mot_jepa_policy_linear_perdomain` onto `mot_jepa_policy_linear`, a preset with a
+        # different trunk, and would have built a head whose weights could not load.
+        preset = args.run.parent.name
     else:
-        preset = "mot_jepa_policy_flowmatch"
+        raise SystemExit(
+            f"cannot infer the preset from {args.run}: its parent directory "
+            f"{args.run.parent.name!r} is not a known policy config. Pass --config explicitly. "
+            f"Known: {sorted(config_module.POLICY_CONFIGS)}"
+        )
     cfg = config_module.POLICY_CONFIGS[preset]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
