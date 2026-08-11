@@ -5,6 +5,7 @@ import torch
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionDiTConfig
 from openpi.mot_jepa.action_dit import LinearHead
+from openpi.mot_jepa.action_dit import PerDomainLinear
 from openpi.mot_jepa.config import CONFIGS
 from openpi.mot_jepa.drifting import DriftingConfig
 from openpi.mot_jepa.drifting import drifting_loss
@@ -203,10 +204,44 @@ def test_linear_head_also_routes_on_domain():
         num_domains=5,
     )
     with torch.no_grad():
-        head.proj.weight.normal_(std=0.01)  # zero-init would make every domain identical
+        head.proj.weight.normal_(std=0.05)  # zero-init would make every domain identical
 
     encoded = fake_encoded(batch, generator=generator)
     mask = torch.ones(batch, 120)
     first = head.sample(encoded, mask, torch.zeros(batch, dtype=torch.long))
     second = head.sample(encoded, mask, torch.full((batch,), 4, dtype=torch.long))
     assert not torch.allclose(first, second, atol=1e-6), "linear head ignores domain_id"
+
+
+def test_per_domain_linear_gives_weights_not_just_a_bias():
+    """The distinction the whole fix turns on.
+
+    A per-domain BIAS shifts every input by the same constant, so the DIFFERENCE between two
+    inputs is identical across domains. Per-domain WEIGHTS change that difference. Measured, a
+    shared map with per-domain normalised targets scores R^2 -0.0016 where eight per-domain maps
+    score 0.65-0.93, so a bias cannot be enough and this asserts we did not ship one.
+    """
+    torch.manual_seed(0)
+    layer = PerDomainLinear(num_domains=3, in_features=8, out_features=5)
+    x = torch.randn(4, 8)
+    a = torch.zeros(4, dtype=torch.long)
+    b = torch.full((4,), 2, dtype=torch.long)
+
+    delta_a = layer(x, a) - layer(torch.zeros_like(x), a)
+    delta_b = layer(x, b) - layer(torch.zeros_like(x), b)
+    assert not torch.allclose(delta_a, delta_b, atol=1e-6), (
+        "input-to-output MAP is identical across domains; this is a per-domain bias, not weights"
+    )
+
+
+def test_per_domain_linear_routes_each_row_to_its_own_domain():
+    """Mixed-domain batches occur at evaluation; each row must use its own weights."""
+    torch.manual_seed(1)
+    layer = PerDomainLinear(num_domains=4, in_features=6, out_features=3)
+    x = torch.randn(5, 6)
+    mixed = torch.tensor([0, 2, 0, 3, 2])
+
+    got = layer(x, mixed)
+    for row, domain in enumerate(mixed.tolist()):
+        expected = x[row] @ layer.weight[domain] + layer.bias[domain]
+        assert torch.allclose(got[row], expected, atol=1e-6), f"row {row} used the wrong domain"

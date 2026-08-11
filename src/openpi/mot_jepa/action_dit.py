@@ -98,6 +98,39 @@ class ActionNormalizer(nn.Module):
         return actions * self.scale[domain_id].unsqueeze(1) + self.mean[domain_id].unsqueeze(1)
 
 
+class PerDomainLinear(nn.Module):
+    """An affine map with its own weights per domain. The fix for the shared-map defect.
+
+    Measured: eight per-domain ridges on the frozen readout reach R^2 0.65-0.93 on held-out
+    UniVTAC, while ONE shared ridge on the same features -- even with per-domain z-scored targets,
+    exactly what ActionNormalizer provides -- scores -0.0016. A shared map simply cannot serve
+    eight embodiments, and a per-domain *bias* cannot close that gap either; it needs per-domain
+    *weights*.
+
+    Applied per unique domain in the batch rather than by gathering ``weight[domain_id]``. The
+    gather would materialise ``(B, in, out)``, which at batch 64 and a 4608->3840 map is 500 MB.
+    Batches are domain-pure during training, so the loop runs once; evaluation may mix, and the
+    loop stays correct there without any assumption.
+    """
+
+    def __init__(self, num_domains: int, in_features: int, out_features: int, *, zero_init: bool = False) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_domains, in_features, out_features))
+        self.bias = nn.Parameter(torch.zeros(num_domains, out_features))
+        if zero_init:
+            nn.init.zeros_(self.weight)
+        else:
+            # Per domain, the fan-in is in_features, so scale as a normal Linear would.
+            nn.init.normal_(self.weight, std=in_features**-0.5)
+
+    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        out = x.new_zeros(*x.shape[:-1], self.weight.shape[-1])
+        for domain in torch.unique(domain_id):
+            rows = domain_id == domain
+            out[rows] = x[rows] @ self.weight[domain] + self.bias[domain]
+        return out
+
+
 class DiTBlock(nn.Module):
     """Pre-norm self-attention + cross-attention + SwiGLU, with adaLN-Zero conditioning.
 
@@ -195,9 +228,8 @@ class ActionDiT(nn.Module):
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
         nn.init.zeros_(self.final_modulation[1].weight)
         nn.init.zeros_(self.final_modulation[1].bias)
-        self.action_out = nn.Linear(width, action_dim)
-        nn.init.zeros_(self.action_out.weight)
-        nn.init.zeros_(self.action_out.bias)
+        # Per-domain, for the reason in PerDomainLinear's docstring. Cheap here: 8 x 512 x 120.
+        self.action_out = PerDomainLinear(num_domains, width, action_dim, zero_init=True)
 
     def context_tokens(self, encoded: EncoderOutput) -> tuple[torch.Tensor, torch.Tensor]:
         """``(B, 2*num_steps, width)`` cross-attention memory and the ``(B, width)`` adaLN vector."""
@@ -240,7 +272,7 @@ class ActionDiT(nn.Module):
             h = block(h, context, cond)
 
         shift, scale = self.final_modulation(cond).chunk(2, dim=-1)
-        return self.action_out(_modulate(self.final_norm(h), shift, scale))
+        return self.action_out(_modulate(self.final_norm(h), shift, scale), domain_id)
 
     @torch.no_grad()
     def sample(
@@ -329,25 +361,20 @@ class LinearHead(nn.Module):
         self.config = config
         self.action_dim = action_dim
         features = layout.num_steps * (layout.video_width + layout.tactile_width)
-        # Concatenated rather than added: an affine map over [features | one-hot domain] can learn
-        # a per-domain bias but still shares its weights, which is exactly the comparison of
-        # interest against the per-domain ridge.
-        self.domain_embed = nn.Embedding(num_domains, config.width)
-        nn.init.normal_(self.domain_embed.weight, std=0.02)
-        features = features + config.width
         # Normalise the readout first. It is NOT unit scale -- measured std 5.19, max |.| 54.5 --
         # so an unnormalised affine map diverges at any learning rate that trains in reasonable
-        # time. The ridge this baseline is meant to reproduce standardises its features on train
-        # statistics before fitting, and the DiT normalises via context_norm, so without this the
-        # comparison would not be like-for-like either.
+        # time. The ridge this baseline reproduces standardises its features before fitting, and
+        # the DiT normalises via context_norm, so without this the comparison is not like-for-like.
         self.norm = nn.LayerNorm(features)
-        self.proj = nn.Linear(features, config.horizon * action_dim)
-        # Zero-init, like the DiT's output layer. Targets are normalised to unit variance, so a
-        # zero output IS the mean prediction and the loss starts at ~1.0. Default init instead
-        # starts it near 9 -- far worse than a constant -- and the first thousands of steps are
-        # spent climbing back to where zero-init begins.
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        # Shared trunk, PER-DOMAIN output. A full per-domain 4608->3840 map would be 141M
+        # parameters; factoring through `width` keeps the whole composition linear (rank `width`)
+        # while giving each domain its own output weights. That distinction is the entire point:
+        # a shared map with per-domain normalised targets measures R^2 -0.0016 where eight
+        # per-domain maps measure 0.65-0.93, and a per-domain *bias* cannot close that.
+        self.trunk = nn.Linear(features, config.width)
+        # Zero-init, like the DiT's output layer: targets are unit-variance, so a zero output IS
+        # the mean prediction and the loss starts at ~1.0 rather than near 9.
+        self.proj = PerDomainLinear(num_domains, config.width, config.horizon * action_dim, zero_init=True)
 
     def forward(
         self,
@@ -359,8 +386,8 @@ class LinearHead(nn.Module):
     ) -> torch.Tensor:
         del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
         flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
-        flat = torch.cat([flat, self.domain_embed(domain_id).to(flat.dtype)], dim=-1)
-        out = self.proj(self.norm(flat.to(self.proj.weight.dtype)))
+        hidden = self.trunk(self.norm(flat.to(self.trunk.weight.dtype)))
+        out = self.proj(hidden, domain_id)
         return out.reshape(out.shape[0], self.config.horizon, self.action_dim)
 
     @torch.no_grad()
