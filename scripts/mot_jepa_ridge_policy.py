@@ -121,6 +121,10 @@ def main() -> int:
     parser.add_argument("--batches", type=int, default=600)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument("--normalized-targets", action="store_true",
+                        help="Fit on per-domain z-scored actions the way the trained heads do, then "
+                             "denormalise before scoring. Isolates the target space as the cause of "
+                             "the ridge-vs-head gap.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -154,12 +158,28 @@ def main() -> int:
     held = gather("holdout")
     logger.info("collected %d train / %d holdout domains", len(train), len(held))
 
+    # The trained heads regress onto per-domain z-scored actions (mot_jepa_policy_train.py:300) and
+    # are scored after denormalising, while this ridge regresses onto raw ones. That is not a
+    # cosmetic difference: z-scoring divides each of the 120 slots by its own spread, so the
+    # training loss weights a slot that barely moves exactly as heavily as one that carries the
+    # motion, whereas the eval metric -- raw-unit RMSE -- weights by actual magnitude. A head can
+    # lower normalised MSE while raising the number we report. Fitting the ridge BOTH ways on
+    # identical data isolates that, since nothing else differs between the two runs.
+    action_stats: dict[int, tuple] = {}
     models: dict[int, tuple] = {}
     for domain, blob in sorted(train.items()):
         x, y = np.stack(blob["x"]), np.stack(blob["y"])
         if x.shape[0] < 40:
             logger.warning("%s has only %d train clips; skipping", names[domain], x.shape[0])
             continue
+        if args.normalized_targets:
+            # Per-slot over clips AND horizon steps, matching ActionNormalizer's (num_domains, 120).
+            chunks = y.reshape(y.shape[0], args.horizon, -1)
+            a_mean = chunks.mean(axis=(0, 1))
+            a_scale = chunks.std(axis=(0, 1))
+            a_scale = np.where(a_scale > 1e-6, a_scale, 1.0)
+            action_stats[domain] = (a_mean, a_scale)
+            y = ((chunks - a_mean) / a_scale).reshape(y.shape[0], -1)
         models[domain] = fit_one_domain(x, y)
         logger.info("%s: fitted on %d clips, lambda=%.0e", names[domain], x.shape[0], models[domain][3])
 
@@ -174,6 +194,11 @@ def main() -> int:
         x, y, m = np.stack(blob["x"]), np.stack(blob["y"]), np.stack(blob["m"])
         mean, scale, weights, _ = models[domain]
         pred = np.hstack([(x - mean) / scale, np.ones((x.shape[0], 1))]) @ weights
+        if args.normalized_targets:
+            # Back to raw units, exactly as mot_jepa_policy_eval.py does, so the RMSE below stays
+            # comparable to every other row in this table.
+            a_mean, a_scale = action_stats[domain]
+            pred = (pred.reshape(pred.shape[0], args.horizon, -1) * a_scale + a_mean).reshape(pred.shape[0], -1)
         err_r = float((((pred - y) * m) ** 2).sum())
         err_c = float((((y.mean(0) - y) * m) ** 2).sum())
         count = float(m.sum())
