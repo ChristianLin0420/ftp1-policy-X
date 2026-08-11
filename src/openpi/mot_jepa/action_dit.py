@@ -328,7 +328,7 @@ def flow_matching_loss(
 
     x_t = t_b * noise + (1.0 - t_b) * actions
     u_t = noise - actions
-    velocity = head(encoded, action_mask, noisy_actions=x_t, timestep=t)
+    velocity = head(encoded, action_mask, x_t, t, domain_id)
 
     error = (velocity - u_t) ** 2 * chunk_mask
     loss = error.sum() / chunk_mask.sum().clamp_min(1.0)

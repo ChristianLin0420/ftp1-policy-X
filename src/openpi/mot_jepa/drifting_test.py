@@ -6,6 +6,8 @@ from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionDiTConfig
 from openpi.mot_jepa.action_dit import LinearHead
 from openpi.mot_jepa.action_dit import PerDomainLinear
+from openpi.mot_jepa.action_dit import flow_matching_loss
+from openpi.mot_jepa.action_dit import regression_loss
 from openpi.mot_jepa.config import CONFIGS
 from openpi.mot_jepa.drifting import DriftingConfig
 from openpi.mot_jepa.drifting import drifting_loss
@@ -245,3 +247,45 @@ def test_per_domain_linear_routes_each_row_to_its_own_domain():
     for row, domain in enumerate(mixed.tolist()):
         expected = x[row] @ layer.weight[domain] + layer.bias[domain]
         assert torch.allclose(got[row], expected, atol=1e-6), f"row {row} used the wrong domain"
+
+
+def _loss_fixture(objective: str, *, batch: int = 6, horizon: int = 5):
+    head_cls = LinearHead if objective == "linear" else ActionDiT
+    head = head_cls(
+        ActionDiTConfig(width=64, depth=2, num_heads=4, horizon=horizon, objective=objective),
+        LAYOUT,
+        num_domains=4,
+    )
+    encoded = fake_encoded(batch, generator=torch.Generator().manual_seed(11))
+    actions = torch.randn(batch, horizon, 120)
+    action_mask = torch.zeros(batch, 120)
+    action_mask[:, :16] = 1.0
+    chunk_mask = action_mask[:, None, :].expand(batch, horizon, 120)
+    domain_id = torch.arange(batch) % 4
+    return head, encoded, actions, action_mask, chunk_mask, domain_id
+
+
+def test_every_loss_runs_end_to_end():
+    """All three losses, not just drifting.
+
+    The suite previously covered drifting_loss alone, so when flow_matching_loss was left calling
+    the head WITHOUT domain_id it stayed green -- and the break only surfaced on a GPU four minutes
+    into a real job. Each objective's loss is a distinct call path into the head and each needs its
+    own exercise.
+    """
+    for objective, loss_fn in (("flowmatch", flow_matching_loss), ("linear", regression_loss)):
+        head, encoded, actions, action_mask, chunk_mask, domain_id = _loss_fixture(objective)
+        loss, metrics = loss_fn(head, encoded, actions, action_mask, chunk_mask, domain_id)
+        assert torch.isfinite(loss), f"{objective} loss is not finite"
+        loss.backward()
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters()), objective
+        assert metrics, f"{objective} reported no metrics"
+
+
+def test_every_objective_samples_end_to_end():
+    """sample() is the deployment path for all three and must accept the same call."""
+    for objective in ("drifting", "flowmatch", "linear"):
+        head, encoded, _, action_mask, _, domain_id = _loss_fixture(objective)
+        out = head.sample(encoded, action_mask, domain_id, num_steps=2)
+        assert out.shape == (6, 5, 120), f"{objective} produced {tuple(out.shape)}"
+        assert torch.isfinite(out).all(), f"{objective} produced non-finite actions"
