@@ -69,7 +69,12 @@ split, never on the test split."""
 
 
 def r_squared(
-    features: np.ndarray, targets: np.ndarray, episodes: np.ndarray | None = None, *, holdout: float = 0.3
+    features: np.ndarray,
+    targets: np.ndarray,
+    episodes: np.ndarray | None = None,
+    *,
+    holdout: float = 0.3,
+    test_mean_baseline: bool = False,
 ) -> tuple[float, int, float]:
     """Held-out R^2 of a ridge fit ``targets ~ features``, penalty tuned on a validation split.
 
@@ -134,7 +139,12 @@ def r_squared(
         if val > best_val:
             best_lambda, best_val, best_weights = lam, val, weights
 
-    return score(x_test, y_test, best_weights, y_fit.mean(0)), count, best_lambda
+    # Two baselines. `y_fit.mean(0)` is the conventional R^2 denominator, but the policy
+    # evaluator scores against the HOLDOUT's own mean -- a strictly stronger constant. Reporting
+    # the ridge against the weaker one while the heads face the stronger one is not a comparison,
+    # so `test_mean_baseline` makes them agree.
+    baseline = y_test.mean(0) if test_mean_baseline else y_fit.mean(0)
+    return score(x_test, y_test, best_weights, baseline), count, best_lambda
 
 
 @torch.no_grad()
@@ -195,6 +205,15 @@ def main() -> int:
     parser.add_argument("--horizon", type=int, default=15)
     parser.add_argument("--batches", type=int, default=192)
     parser.add_argument(
+        "--test-mean-baseline",
+        action="store_true",
+        help=(
+            "Score R^2 against the holdout's own mean rather than the train mean. The policy "
+            "evaluator uses the holdout mean, a strictly stronger constant, so without this the "
+            "ridge and the heads are being judged against different yardsticks."
+        ),
+    )
+    parser.add_argument(
         "--layernorm-features",
         action="store_true",
         help=(
@@ -239,8 +258,8 @@ def main() -> int:
         targets = np.stack(collected[domain][1])
         control = np.stack(collected[domain][2])
         eps = np.asarray(collected[domain][3])
-        score, count, lam = r_squared(features, targets, eps)
-        ctl, _, _ = r_squared(features, control, eps)
+        score, count, lam = r_squared(features, targets, eps, test_mean_baseline=args.test_mean_baseline)
+        ctl, _, _ = r_squared(features, control, eps, test_mean_baseline=args.test_mean_baseline)
         rows.append((names[domain], score, count, ctl))
         all_x.append(features)
         all_y.append(targets)
@@ -248,11 +267,29 @@ def main() -> int:
         all_e.append(eps)
         print(f"{names[domain]:26s} {count:7d} {score:11.4f} {lam:9.0e} {ctl:14.4f}")
 
-    x, y, c = np.concatenate(all_x), np.concatenate(all_y), np.concatenate(all_c)
-    e = np.concatenate(all_e)
-    pooled, pooled_n, pooled_lam = r_squared(x, y, e)
-    pooled_ctl, _, _ = r_squared(x, c, e)
-    print(f"\n{'POOLED':26s} {pooled_n:7d} {pooled:11.4f} {pooled_lam:9.0e} {pooled_ctl:14.4f}")
+    x, e = np.concatenate(all_x), np.concatenate(all_e)
+    c = np.concatenate(all_c)
+    # THE CONTROL. Our heads fit ONE shared map, but they see per-domain z-scored targets via
+    # ActionNormalizer. A pooled ridge on RAW targets is handicapped by 8x scale differences the
+    # heads never face, so it overstates how hard the shared-map problem is. Normalising each
+    # domain's targets first makes the pooled ridge the honest analogue of our shared head.
+    all_y_norm = []
+    for targets in all_y:
+        mu, sd = targets.mean(0), targets.std(0)
+        all_y_norm.append((targets - mu) / np.where(sd > 1e-8, sd, 1.0))
+    y_raw, y_norm = np.concatenate(all_y), np.concatenate(all_y_norm)
+
+    pooled, pooled_n, pooled_lam = r_squared(x, y_raw, e, test_mean_baseline=args.test_mean_baseline)
+    pooled_norm, _, _ = r_squared(x, y_norm, e, test_mean_baseline=args.test_mean_baseline)
+    pooled_ctl, _, _ = r_squared(x, c, e, test_mean_baseline=args.test_mean_baseline)
+    print(f"\n{'POOLED (raw targets)':26s} {pooled_n:7d} {pooled:11.4f} {pooled_lam:9.0e} {pooled_ctl:14.4f}")
+    print(f"{'POOLED (per-domain norm)':26s} {pooled_n:7d} {pooled_norm:11.4f}")
+    print(
+        "\nThe second row is the honest analogue of our shared head: ONE map, but per-domain\n"
+        "z-scored targets, exactly what ActionNormalizer gives it. If it lands near the linear\n"
+        "head's ~0.22 the shared-map diagnosis holds; if near the per-domain ridge's 0.65-0.93,\n"
+        "the defect is elsewhere and a per-domain output layer would not fix it."
+    )
 
     solid = [(n, s, ctl) for n, s, cnt, ctl in rows if cnt >= MIN_CLIPS and np.isfinite(s)]
     best = max((s for _, s, _ in solid), default=float("nan"))
