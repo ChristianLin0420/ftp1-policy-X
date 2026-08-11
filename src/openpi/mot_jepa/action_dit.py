@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
@@ -433,3 +434,71 @@ def regression_loss(
     error = (predicted - actions) ** 2 * chunk_mask
     loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
     return loss, {"regress_mse": float(loss.detach())}
+
+
+class RidgeHead(nn.Module):
+    """The fitted per-domain ridge, wearing the same interface as a trained head.
+
+    The ridge is the only policy in this line of work that beats a constant: 0.00329 held-out RMSE
+    against the constant's 0.00435, ahead on all eight domains, where every trained head scores
+    0.00454-0.00484. That makes it the deployable floor -- but it was a bare `.npz` that only the
+    script which wrote it could read, and its score came from that same script's own inline
+    scoring loop.
+
+    Wrapping it here fixes both. Deployment gets ONE policy interface rather than a special case,
+    and the headline number can be re-derived by the canonical evaluator instead of resting on a
+    second implementation of the metric that happens to agree with itself.
+
+    **Emits raw actions, not normalised ones.** `mot_jepa_ridge_policy.py` regresses directly onto
+    `action_chunk` as the dataloader yields it, so there is no normaliser to invert. Pair it with a
+    default-constructed `ActionNormalizer`, whose mean 0 / scale 1 makes `denormalize` an exact
+    identity -- the ridge's "normalised space" IS raw space, so nothing is being papered over.
+
+    Deterministic, so `num_steps` and `generator` are accepted and ignored exactly as `LinearHead`
+    does. A domain with no fitted map returns zeros rather than guessing with another domain's
+    weights; `fitted_domains` says which are real.
+    """
+
+    def __init__(self, path, layout: TokenLayout, *, horizon: int, action_dim: int = ACTION_DIM) -> None:
+        super().__init__()
+        blob = np.load(path, allow_pickle=False)
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.names = [str(n) for n in blob["domains"]]
+        features = layout.num_steps * (layout.video_width + layout.tactile_width)
+
+        # Which keys exist is the source of truth for which domains were fitted -- the script skips
+        # any domain with under 40 training clips, and silently reusing a neighbour's map there
+        # would produce confident nonsense.
+        self.fitted_domains = sorted(int(k.removeprefix("weights_")) for k in blob if k.startswith("weights_"))
+        for domain in self.fitted_domains:
+            weights = torch.as_tensor(blob[f"weights_{domain}"], dtype=torch.float32)
+            expected = (features + 1, horizon * action_dim)
+            if tuple(weights.shape) != expected:
+                raise ValueError(f"domain {domain} weights are {tuple(weights.shape)}, expected {expected}")
+            self.register_buffer(f"mean_{domain}", torch.as_tensor(blob[f"mean_{domain}"], dtype=torch.float32))
+            self.register_buffer(f"scale_{domain}", torch.as_tensor(blob[f"scale_{domain}"], dtype=torch.float32))
+            self.register_buffer(f"weights_{domain}", weights)
+
+    def forward(self, encoded: EncoderOutput, action_mask, noisy_actions, timestep, domain_id) -> torch.Tensor:
+        del noisy_actions, timestep, action_mask
+        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1).float()
+        out = flat.new_zeros(flat.shape[0], self.horizon * self.action_dim)
+        for domain in torch.unique(domain_id).tolist():
+            if domain not in self.fitted_domains:
+                continue
+            rows = domain_id == domain
+            # Standardise with the FITTING split's statistics, then the appended 1 carries the
+            # intercept -- the exact composition mot_jepa_ridge_policy.py scores with.
+            standardised = (flat[rows] - getattr(self, f"mean_{domain}")) / getattr(self, f"scale_{domain}")
+            padded = torch.cat([standardised, standardised.new_ones(standardised.shape[0], 1)], dim=-1)
+            out[rows] = padded @ getattr(self, f"weights_{domain}")
+        return out.reshape(out.shape[0], self.horizon, self.action_dim)
+
+    @torch.no_grad()
+    def sample(self, encoded, action_mask, domain_id, *, num_steps: int = 10, generator=None) -> torch.Tensor:
+        del num_steps, generator
+        batch = encoded.sync_readout[0].shape[0]
+        device = encoded.sync_readout[0].device
+        zeros = torch.zeros(batch, self.horizon, self.action_dim, device=device)
+        return self(encoded, action_mask, zeros, torch.zeros(batch, device=device), domain_id)

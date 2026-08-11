@@ -14,11 +14,21 @@
 #
 #   REPO_ROOT=... RUN=<policy run dir> SNAP=<backbone> CLIPS=<univtac clips> OUT=<json> \
 #     sbatch scripts_exp_zarr/mot_jepa/policy_eval.sbatch
+#
+# Set RIDGE=<ridge_policy.npz> instead of RUN to score the fitted ridge through this same path,
+# which is how its number gets re-derived by the canonical metric rather than by the script that
+# produced it.
 set -uo pipefail
 cd "${REPO_ROOT}"
 export JAX_PLATFORMS=cpu USE_SWANLAB=false OMP_NUM_THREADS=8
+if [[ -n "${RIDGE:-}" ]]; then
+  POLICY=(--ridge "${RIDGE}")
+else
+  POLICY=(--run "${RUN:?set RUN or RIDGE}")
+fi
+
 srun "${REPO_ROOT}/.venv/bin/python" scripts/mot_jepa_policy_eval.py \
-  --run "${RUN}" \
+  "${POLICY[@]}" \
   --pretrained_run "${SNAP}" --pretrained_step "${STEP:-50000}" \
   --clips "${CLIPS}/*/*.zarr" \
   --holdout_mod "${HOLDOUT_MOD:-10}" \

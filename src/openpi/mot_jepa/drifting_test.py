@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionDiTConfig
+from openpi.mot_jepa.action_dit import ActionNormalizer
 from openpi.mot_jepa.action_dit import LinearHead
 from openpi.mot_jepa.action_dit import PerDomainLinear
+from openpi.mot_jepa.action_dit import RidgeHead
 from openpi.mot_jepa.action_dit import flow_matching_loss
 from openpi.mot_jepa.action_dit import regression_loss
 from openpi.mot_jepa.config import CONFIGS
@@ -316,6 +319,59 @@ def test_shared_trunk_remains_the_default():
     """The three shipped presets trained with a shared trunk; their checkpoints must still load."""
     head, *_ = _loss_fixture("linear")
     assert isinstance(head.trunk, torch.nn.Linear), "default head must keep the shared nn.Linear trunk"
+
+
+def test_ridge_head_reproduces_the_fitting_script_composition(tmp_path):
+    """The wrapper must compute what mot_jepa_ridge_policy.py scored, not merely something linear.
+
+    The ridge is the only policy on record that beats a constant, and the whole reason to load it
+    through the evaluator is to re-derive that number independently. A wrapper that standardised
+    with the wrong statistics, or reshaped column-major, would still produce plausible actions and
+    a plausible RMSE -- just not the ridge's. So this asserts against an explicit numpy reference
+    written the way the fitting script writes it, rather than against a shape.
+    """
+    horizon, action_dim, num_domains = 4, 120, 3
+    features = LAYOUT.num_steps * (LAYOUT.video_width + LAYOUT.tactile_width)
+    rng = np.random.default_rng(0)
+    blob = {"domains": np.array(["a", "b"])}
+    fitted = (0, 2)  # deliberately non-contiguous: domain 1 has no map
+    for domain in fitted:
+        blob[f"mean_{domain}"] = rng.normal(size=features).astype(np.float32)
+        blob[f"scale_{domain}"] = rng.uniform(0.5, 2.0, size=features).astype(np.float32)
+        blob[f"weights_{domain}"] = rng.normal(size=(features + 1, horizon * action_dim)).astype(np.float32)
+    path = tmp_path / "ridge.npz"
+    np.savez(path, **blob)
+
+    head = RidgeHead(path, LAYOUT, horizon=horizon)
+    assert head.fitted_domains == [0, 2]
+
+    encoded = fake_encoded(num_domains, generator=torch.Generator().manual_seed(3))
+    domain_id = torch.arange(num_domains)
+    out = head.sample(encoded, torch.ones(num_domains, action_dim), domain_id)
+    assert out.shape == (num_domains, horizon, action_dim)
+
+    x = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1).numpy()
+    for domain in fitted:
+        standardised = (x[domain] - blob[f"mean_{domain}"]) / blob[f"scale_{domain}"]
+        expected = np.hstack([standardised, [1.0]]) @ blob[f"weights_{domain}"]
+        torch.testing.assert_close(
+            out[domain], torch.tensor(expected.reshape(horizon, action_dim), dtype=torch.float32),
+            rtol=1e-4, atol=1e-4, msg=f"domain {domain} does not match the fitting script",
+        )
+    assert (out[1] == 0).all(), "an unfitted domain must predict zero, not another domain's map"
+
+
+def test_ridge_head_pairs_with_an_identity_normalizer():
+    """The evaluator denormalises every head's output; the ridge already predicts raw units.
+
+    A default ActionNormalizer is mean 0 / scale 1, so denormalize is exactly the identity. If that
+    ever stopped being true the evaluator would silently rescale the ridge's predictions and report
+    a wrong RMSE with no error.
+    """
+    normalizer = ActionNormalizer(4)
+    actions = torch.randn(6, 5, 120)
+    domain_id = torch.arange(6) % 4
+    torch.testing.assert_close(normalizer.denormalize(actions, domain_id), actions)
 
 
 def test_every_objective_samples_end_to_end():

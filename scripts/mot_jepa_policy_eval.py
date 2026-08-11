@@ -43,6 +43,7 @@ from openpi.mot_jepa import runtime
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionNormalizer
 from openpi.mot_jepa.action_dit import LinearHead
+from openpi.mot_jepa.action_dit import RidgeHead
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import split_clip_index
@@ -138,8 +139,11 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run", type=pathlib.Path, required=True, help="Policy run directory.")
+    parser.add_argument("--run", type=pathlib.Path, default=None, help="Policy run directory.")
     parser.add_argument("--step", type=int, default=None)
+    parser.add_argument("--ridge", type=pathlib.Path, default=None,
+                        help="Score a fitted ridge (.npz from mot_jepa_ridge_policy.py) instead of a "
+                             "trained run. Mutually exclusive with --run.")
     parser.add_argument("--pretrained_run", type=pathlib.Path, required=True)
     parser.add_argument("--pretrained_step", type=int, default=None)
     parser.add_argument("--clips", required=True)
@@ -153,8 +157,14 @@ def main() -> int:
     parser.add_argument("--out", type=pathlib.Path, default=None)
     args = parser.parse_args()
 
+    if bool(args.run) == bool(args.ridge):
+        parser.error("pass exactly one of --run (a trained head) or --ridge (a fitted .npz)")
+
     if args.config:
         preset = args.config
+    elif args.ridge:
+        # Only the layout and the horizon are read for a ridge; every preset shares them.
+        preset = "mot_jepa_policy_linear"
     elif "linear" in str(args.run):
         preset = "mot_jepa_policy_linear"
     elif "drifting" in str(args.run):
@@ -169,7 +179,19 @@ def main() -> int:
     domain_ids = [names.index(pathlib.Path(p).parent.name) for p in stores]
 
     backbone, backbone_step = runtime.load_frozen_backbone(args.pretrained_run, args.pretrained_step, cfg, device)
-    head, normalizer, step = load_head(args.run, args.step, cfg, len(names), device)
+    if args.ridge:
+        head = RidgeHead(args.ridge, cfg.layout, horizon=cfg.head.horizon).to(device)
+        # The ridge regresses onto raw action_chunk, so there is nothing to invert. A
+        # default-constructed ActionNormalizer is mean 0 / scale 1, making denormalize an exact
+        # identity -- the alternative, special-casing the scoring loop, would leave two code paths
+        # where the whole point of this flag is to have one.
+        normalizer = ActionNormalizer(len(names)).to(device)
+        step = -1
+        missing = sorted(set(range(len(names))) - set(head.fitted_domains))
+        if missing:
+            logger.warning("no ridge fitted for %s; those domains predict zero", [names[d] for d in missing])
+    else:
+        head, normalizer, step = load_head(args.run, args.step, cfg, len(names), device)
 
     dataset = MotJepaClipDataset(
         stores,
@@ -197,7 +219,8 @@ def main() -> int:
         return float("nan") if c <= 0 else float(np.sqrt(acc["sq"][name][group] / c))
 
     live = [g for g in (*GROUPS, "ALL") if any(acc["count"][n].get(g, 0.0) > 0 for n in acc["count"])]
-    print(f"\n{preset}  head step {step}  backbone step {backbone_step}  objective {cfg.head.objective}")
+    objective = "ridge" if args.ridge else cfg.head.objective
+    print(f"\n{preset}  head step {step}  backbone step {backbone_step}  objective {objective}")
     print(f"held-out clips: {len(dataset)}   samples/obs: {args.num_samples}   (every {args.holdout_mod}th episode)\n")
     header = f"{'domain':24s}" + "".join(f"{g[:14]:>16s}" for g in live)
     print(header)
@@ -218,7 +241,7 @@ def main() -> int:
             json.dumps(
                 {
                     "preset": preset,
-                    "objective": cfg.head.objective,
+                    "objective": objective,
                     "head_step": step,
                     "backbone_step": backbone_step,
                     "holdout_mod": args.holdout_mod,
