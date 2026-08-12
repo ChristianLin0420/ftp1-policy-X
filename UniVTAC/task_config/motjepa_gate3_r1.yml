@@ -1,0 +1,20 @@
+save_dir: ./data
+
+decimation: 1
+
+save_frequency: 2
+video_frequency: 2
+render_frequency: 1 # render EVERY step. The authors run render_frequency 0, which collect_data.py:85 converts to livestream=2 and renders continuously; 2 refreshes the gel cameras only every other step while the adaptive grasp polls tactile depth every step. 1 is the closest headless equivalent to their continuous render.
+
+random_texture: false # set to true to enable random texture
+
+use_seed: true
+episode_num: 10
+
+sensor_type: gsmini
+
+observations:
+  camera: ['rgb']
+  tactile: ['rgb', 'rgb_marker', 'marker', 'depth', 'pose']
+  embodiment: ['joint', 'ee']
+  actor: true
