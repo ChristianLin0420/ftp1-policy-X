@@ -1,15 +1,27 @@
 #!/bin/bash
 #SBATCH --account=edgeai_tao-ptm_image-foundation-model-clip
-#SBATCH --partition=backfill,batch
-#SBATCH --time=08:00:00
+#SBATCH --partition=batch,backfill,batch_long
+#SBATCH --time=03:55:00
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=0
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200G
 #SBATCH --job-name=uipc-build
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=logs/%x.%j.log
 #SBATCH --error=logs/%x.%j.log
+#SBATCH --open-mode=append
+#
+# RESUMABLE, and sized to SHARE a node rather than own one. The first attempt asked --mem=0 and
+# 8 hours: --mem=0 resolves to the node's full 2010G, so Slurm had to wait for an entirely empty
+# node (473 of 491 allocated, none idle) and reserved a start five hours out, while 4-hour jobs
+# submitted later ran immediately. 8 hours also excludes `batch`, whose cap is 4h.
+#
+# Nothing here needs a whole node. Under 4 hours it fits every partition, and both expensive
+# stages resume: vcpkg is cloned/bootstrapped only if absent, and `cmake --build` is incremental.
+# Both live on Lustre, so a cut-off attempt resumes on resubmit and only the apt/CUDA step (a few
+# minutes) repeats -- that runs in the container layer, which is lost unless --container-save is
+# reached.
 #
 # GATE 1 of the tacex_uipc plan: nvcc present, libuipc built, `import uipc` succeeds.
 #
