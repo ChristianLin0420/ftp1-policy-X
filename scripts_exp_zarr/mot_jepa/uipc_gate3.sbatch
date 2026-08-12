@@ -118,7 +118,10 @@ export ENABLE_CAMERAS=1
 # 20 minutes, not 3 hours. A device-side assert inside PhysX poisons the CUDA context and the
 # process HANGS instead of exiting -- job 6551309 burned 3h01m before the timeout fired, for a
 # failure that was fully diagnosable from output written in the first 15 seconds.
-timeout 1200 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
+# ~2h50m, inside the 3h55m job limit. The 20-minute cap was set after a CUDA-assert HANG; with
+# the real assets the sim genuinely progresses at roughly 67 s/seed, and 18 seeds is far too
+# few to conclude the scripted expert never succeeds.
+timeout 10200 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
   --episode_num "${EPISODES_IN}"
 echo "collect_data rc=$?"
 
