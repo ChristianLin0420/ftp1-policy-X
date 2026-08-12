@@ -1,0 +1,20 @@
+save_dir: ./data
+
+decimation: 1
+
+save_frequency: 2
+video_frequency: 2
+render_frequency: 2 # NOT 0 -- collect_data.py:85-86 turns 0 into livestream=2 (WebRTC), which has no place under SLURM. This key only controls the GUI window; cameras are forced on at :58 and video writing follows video_frequency.
+
+random_texture: false # set to true to enable random texture
+
+use_seed: true
+episode_num: 10
+
+sensor_type: gsmini
+
+observations:
+  camera: ['rgb']
+  tactile: ['rgb', 'rgb_marker', 'marker', 'depth', 'pose']
+  embodiment: ['joint', 'ee']
+  actor: true
