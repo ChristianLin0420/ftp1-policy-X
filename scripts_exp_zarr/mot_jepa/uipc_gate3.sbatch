@@ -70,7 +70,15 @@ PY=/isaac-sim/python.sh
 # tear out the torch stack Gates 1 and 2 validated. These are the packages the sim import chain
 # actually reaches, scanned from envs/ and collect_data.py; transforms3d is the one that stopped
 # the previous attempt. --no-deps throughout so nothing re-upgrades numpy behind Isaac's back.
+# UniVTAC's own imports PLUS cuRobo's declared runtime deps (setup.cfg install_requires, minus
+# numpy/torch which must not move). cuRobo was installed with --no-deps to keep pip away from
+# Isaac's torch, which is right, but its runtime needs are then unmet -- yourdfpy surfaced first
+# and one-module-per-run is a slow way to find the rest. Installing the declared set at once ends
+# that loop. Still --no-deps throughout: the protection that matters is numpy and torch, and one
+# careless install already broke Isaac silently tonight.
 "${PY}" -m pip install --no-deps transforms3d trimesh warp-lang tqdm scipy pydantic decorator \
+  yourdfpy numpy-quaternion pyyaml networkx pybind11 importlib_resources scikit-image \
+  setuptools_scm wheel lxml six \
   || { echo '{"gate3": false, "stage": "univtac_deps"}' > "${RESULT_IN}"; exit 1; }
 # torchvision must MATCH Isaac's torch; never install the pinned +cu128 build over it.
 "${PY}" -c "import torchvision; print('torchvision', torchvision.__version__)" \
