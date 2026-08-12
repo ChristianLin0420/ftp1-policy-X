@@ -51,7 +51,12 @@
 
 set -uo pipefail
 
-IMAGE_IN="${IMAGE_IN:-/lustre/fsw/portfolios/edgeai/users/chrislin/images/univtac.sqsh}"
+# Attempt 1 (job 6550554) failed at cmake_configure but its container WAS exported, so this
+# image already carries the CUDA 12.4 toolkit and re-running skips the apt stage entirely.
+# Falls back to the pre-CUDA image if that export is ever missing.
+DEFAULT_IN=/lustre/fsw/portfolios/edgeai/users/chrislin/images/univtac_uipc.sqsh
+[[ -f "${DEFAULT_IN}" ]] || DEFAULT_IN=/lustre/fsw/portfolios/edgeai/users/chrislin/images/univtac.sqsh
+IMAGE_IN="${IMAGE_IN:-${DEFAULT_IN}}"
 IMAGE_OUT="${IMAGE_OUT:-/lustre/fsw/portfolios/edgeai/users/chrislin/images/univtac_uipc.sqsh}"
 WORK="${SLURM_SUBMIT_DIR:-$PWD}"
 VCPKG_DIR="${VCPKG_DIR:-/lustre/fsw/portfolios/edgeai/users/chrislin/build/vcpkg}"
@@ -87,6 +92,22 @@ apt-get update -y || FAIL "apt_update"
 apt-get install -y --no-install-recommends git wget curl zip unzip tar pkg-config \
   build-essential ca-certificates gnupg || FAIL "apt_base"
 
+# urdfdom must come from VCPKG at 3.1.1, and the apt copy must NOT be present.
+#
+# tacex_uipc/overlay-ports/{urdfdom,urdfdom-headers} are one-line stubs -- VCPKG_POLICY_EMPTY_PACKAGE
+# -- that make vcpkg install nothing, so libuipc's find_package(urdfdom CONFIG REQUIRED) has to be
+# satisfied elsewhere. Attempt 9 tried apt: the config was found, cmake configured, and it still
+# failed at src/io/CMakeLists.txt:12 because libuipc links the NAMESPACED targets
+# urdfdom::urdf_parser / urdfdom_model / urdfdom_world / urdfdom_sensor. Ubuntu 22.04 ships
+# urdfdom 3.0.0, which exports them un-namespaced. That is exactly why the manifest pins 3.1.1 --
+# the version where the urdfdom:: namespace appears.
+#
+# So the stubs are dropped from VCPKG_OVERLAY_PORTS below and vcpkg builds urdfdom itself. Purge
+# the apt copy here so find_package cannot resolve against 3.0.0 and reintroduce the same error
+# one layer deeper; a previous attempt baked it into the saved image, so this must be explicit
+# rather than merely omitted.
+apt-get purge -y liburdfdom-dev liburdfdom-headers-dev 2>/dev/null || true
+
 # --- CUDA 12.4 toolkit (nvcc) -------------------------------------------------------------
 if ! command -v nvcc >/dev/null 2>&1; then
   wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBU}/x86_64/cuda-keyring_1.1-1_all.deb" \
@@ -102,17 +123,98 @@ export PATH="${CUDA_HOME}/bin:${PATH}"
 command -v nvcc || FAIL "nvcc_missing_after_install"
 nvcc --version
 
-# --- vcpkg --------------------------------------------------------------------------------
-if [[ ! -f "${VCPKG_DIR}/vcpkg" ]]; then
-  git clone https://github.com/microsoft/vcpkg.git "${VCPKG_DIR}" || FAIL "vcpkg_clone"
-  git -C "${VCPKG_DIR}" checkout 2024.11.16 || FAIL "vcpkg_checkout"
-  "${VCPKG_DIR}/bootstrap-vcpkg.sh" -disableMetrics || FAIL "vcpkg_bootstrap"
+# --- cmake >= 3.26 ---------------------------------------------------------------------------
+# Ubuntu 22.04 ships 3.22.1 and libuipc's CMakeLists.txt:1 demands 3.26, which is exactly how
+# attempt 1 died. Use the version and prefix libuipc's own installer uses
+# (artifacts/docker/installers/install_cmake.sh, mirrored by dev.dockerfile:29-31) rather than a
+# newer release: 3.26 is what this project is known to configure under.
+if ! /opt/cmake/bin/cmake --version >/dev/null 2>&1; then
+  wget -q https://github.com/Kitware/CMake/releases/download/v3.26.4/cmake-3.26.4-linux-x86_64.sh \
+    -O /tmp/cmake.sh || FAIL "cmake_download"
+  mkdir -p /opt/cmake
+  bash /tmp/cmake.sh --prefix=/opt/cmake --skip-license || FAIL "cmake_install"
 fi
+export PATH="/opt/cmake/bin:${PATH}"
+cmake --version | head -1
+case "$(cmake --version | head -1)" in *" 3.2"[0-5]*|*" 3.1"*) FAIL "cmake_too_old";; esac
+
+# --- vcpkg, pinned to the baseline the MANIFEST asks for -------------------------------------
+# Attempt 2 died here with "no version database entry for cpptrace at 0.8.3". The tag 2024.11.16
+# was wrong, and libuipc never asked for it: install_vcpkg.sh clones plain HEAD with no tag, while
+# gen_vcpkg_json.py writes `builtin-baseline` into the generated vcpkg.json. vcpkg resolves every
+# version against the registry AT THAT COMMIT, so the checkout must match the baseline or ports
+# newer than the tag simply do not exist.
+#
+# Read the commit out of the vendored script rather than copying it here, so the two cannot drift.
+BASELINE="$(grep -oE "VCPKG_BASE_LINE *= *'[0-9a-f]{40}'" "${UIPC_SRC}/libuipc/scripts/gen_vcpkg_json.py" \
+            | grep -oE "[0-9a-f]{40}")"
+[[ -n "${BASELINE}" ]] || FAIL "vcpkg_baseline_unreadable"
+echo "VCPKG_BASELINE=${BASELINE}"
+
+# Do NOT check out the baseline. It is dated 2024-11-15 and its version database tops out at
+# cpptrace 0.7.2, while the generated manifest demands version>=0.8.3 -- the manifest asks for a
+# version that did not exist when its own baseline was cut. Attempt 4 pinned the checkout there
+# and died on exactly that.
+#
+# vcpkg reads AVAILABLE versions from the `versions/` tree on disk and uses builtin-baseline only
+# to pin defaults, so the tree must be NEWER than the baseline. That is why install_vcpkg.sh
+# clones plain HEAD with no checkout at all. Follow it, and record the resolved SHA in the verdict
+# so the run stays reproducible despite tracking a moving branch.
+if [[ ! -d "${VCPKG_DIR}/.git" ]]; then
+  git clone https://github.com/microsoft/vcpkg.git "${VCPKG_DIR}" || FAIL "vcpkg_clone"
+fi
+git -C "${VCPKG_DIR}" fetch -q origin || FAIL "vcpkg_fetch"
+if [[ "$(git -C "${VCPKG_DIR}" rev-parse HEAD)" != "$(git -C "${VCPKG_DIR}" rev-parse origin/master)" ]]; then
+  git -C "${VCPKG_DIR}" checkout -q --detach origin/master || FAIL "vcpkg_checkout_master"
+  rm -f "${VCPKG_DIR}/vcpkg"  # the bootstrapped tool is tied to the tree it came from
+fi
+VCPKG_SHA="$(git -C "${VCPKG_DIR}" rev-parse HEAD)"
+echo "VCPKG_SHA=${VCPKG_SHA}"
+[[ -f "${VCPKG_DIR}/vcpkg" ]] || "${VCPKG_DIR}/bootstrap-vcpkg.sh" -disableMetrics || FAIL "vcpkg_bootstrap"
+
+# Assert the precondition rather than discovering it 20 lines into a cmake cascade: the port whose
+# absence killed attempts 2 and 4 must be resolvable at the version the manifest requires.
+WANT="$(grep -A2 "'name' *: *'cpptrace'" "${UIPC_SRC}/libuipc/scripts/gen_vcpkg_json.py" \
+        | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)"
+HAVE="$(git -C "${VCPKG_DIR}" show HEAD:versions/c-/cpptrace.json 2>/dev/null \
+        | grep -oE '"version"[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" \
+        | sort -V | tail -1)"
+echo "cpptrace wanted>=${WANT} available<=${HAVE}"
+[[ -n "${HAVE}" && "$(printf '%s\n%s\n' "${WANT}" "${HAVE}" | sort -V | tail -1)" == "${HAVE}" ]] \
+  || FAIL "vcpkg_tree_older_than_manifest"
 export VCPKG_ROOT="${VCPKG_DIR}"
 export CMAKE_TOOLCHAIN_FILE="${VCPKG_DIR}/scripts/buildsystems/vcpkg.cmake"
 [[ -f "${CMAKE_TOOLCHAIN_FILE}" ]] || FAIL "vcpkg_toolchain_missing"
 
+# --- overlay ports --------------------------------------------------------------------------
+# TWO sets, and neither was being applied before. tacex_uipc ships overlay-ports/ for urdfdom and
+# urdfdom-headers -- upstream's are incompatible -- but nothing in libuipc sets VCPKG_OVERLAY_PORTS,
+# so they were silently unused and urdfdom would have failed or built wrong later.
+#
+# Ours adds tinygltf 2.9.3 with a corrected source hash; see that portfile for why, and for the
+# verification that the content is genuine.
+# COLON, not semicolon. VCPKG_OVERLAY_PORTS uses the PLATFORM path-list separator, so ";" is
+# Windows-only; on Linux vcpkg read "pathA;pathB" as a single directory name and reported
+# `Overlay path "..." must be an existing directory`.
+# OURS ONLY. Including ${UIPC_SRC}/overlay-ports would reinstate the urdfdom stubs explained
+# above, which is what left find_package with nothing to link.
+export VCPKG_OVERLAY_PORTS="${WORK_IN}/scripts_exp_zarr/mot_jepa/vcpkg-overlays"
+echo "VCPKG_OVERLAY_PORTS=${VCPKG_OVERLAY_PORTS}"
+for d in ${VCPKG_OVERLAY_PORTS//:/ }; do [[ -d "$d" ]] || FAIL "overlay_missing:$d"; done
+
 # --- configure + build libuipc with all cores ---------------------------------------------
+# UIPC_GITHUB_ACTIONS=1 forces VCPKG_MANIFEST_INSTALL ON (uipc_utils.cmake:107-109), and it is the
+# only reliable way to run this repeatedly. libuipc otherwise decides whether to invoke vcpkg from
+# whether vcpkg.json CHANGED -- gen_vcpkg_json.py returns 1 for needs-install, 0 for no-change --
+# which assumes a configure never dies partway through installing. Attempts 2 and 6 both did, and
+# attempt 6 then skipped vcpkg entirely: 0 ports installed in 75 seconds, failing at
+# find_package(urdfdom) with 34 of 39 ports on disk.
+#
+# The earlier repair -- discard the build dir when a sentinel port is absent -- was wrong twice
+# over. eigen3 survived attempt 5's PARTIAL install, so it proved "some ports" rather than "all
+# ports" and never triggered; and vcpkg_installed lives inside the build dir, so triggering would
+# have thrown away 34 working ports to recover 5. Forcing the install on costs a few seconds of
+# ABI hashing when everything is already present and is correct in both states.
 BUILD="${UIPC_SRC}/build"
 mkdir -p "${BUILD}"
 cmake "${UIPC_SRC}/libuipc" -B "${BUILD}" \
@@ -126,6 +228,7 @@ cmake "${UIPC_SRC}/libuipc" -B "${BUILD}" \
   -DUIPC_BUILD_BENCHMARKS=0 \
   -DUIPC_BUILD_PYBIND=1 \
   -DUIPC_DEV_MODE=1 \
+  -DUIPC_GITHUB_ACTIONS=1 \
   -DUIPC_PYTHON_EXECUTABLE_PATH="${PY_EXE}" || FAIL "cmake_configure"
 
 cmake --build "${BUILD}" -j "$(nproc)" || FAIL "cmake_build"
@@ -156,6 +259,7 @@ INNER
 
 export VCPKG_DIR UIPC_SRC
 export RESULT_IN="${RESULT}"
+export WORK_IN="${WORK}"
 
 echo "[$(date -Is)] gate1: ${IMAGE_IN} -> ${IMAGE_OUT}"
 srun --container-image="${IMAGE_IN}" \
