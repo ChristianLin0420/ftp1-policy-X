@@ -37,6 +37,17 @@ TASK="${TASK:-lift_bottle}"
 CONFIG="${CONFIG:-motjepa_gate3}"
 EPISODES="${EPISODES:-10}"
 OUTDIR="${OUTDIR:-/lustre/fsw/portfolios/edgeai/users/chrislin/univtac-gate3}"
+# TacEx's USD assets are absent from this checkout -- zero .usd files under tacex_assets, no LFS,
+# no download script, never tracked here. They come from upstream github.com/DH-Ng/TacEx, staged on
+# Lustre and BIND-MOUNTED over the expected path so the repository stays untouched.
+#
+# One asset is a SUBSTITUTION: uipc_gelpads_high_res_wrist.usd, which UniVTAC's robot config
+# requires, exists in neither this checkout nor upstream. It is a copy of upstream's
+# uipc_gelpads.usd. The two robot configs are otherwise identical apart from variable names, so the
+# asset is the only difference -- but the gelpad FEM mesh is coarser than intended, and any
+# success rate measured against it is NOT comparable to UniVTAC's published numbers. See
+# ${ASSETS}/SUBSTITUTION_NOTE.md.
+ASSETS="${ASSETS:-/lustre/fsw/portfolios/edgeai/users/chrislin/tacex-assets}"
 RESULT="${WORK}/logs/_uipc_gate3_${SLURM_JOB_ID}.json"
 RUN_SH="${WORK}/logs/_uipc_gate3_${SLURM_JOB_ID}.sh"
 
@@ -104,7 +115,10 @@ cd "${UNIVTAC}" || { echo '{"gate3": false, "stage": "cd_univtac"}' > "${RESULT_
 export HEADLESS=1
 export LIVESTREAM=0
 export ENABLE_CAMERAS=1
-timeout 10800 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
+# 20 minutes, not 3 hours. A device-side assert inside PhysX poisons the CUDA context and the
+# process HANGS instead of exiting -- job 6551309 burned 3h01m before the timeout fired, for a
+# failure that was fully diagnosable from output written in the first 15 seconds.
+timeout 1200 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
   --episode_num "${EPISODES_IN}"
 echo "collect_data rc=$?"
 
@@ -168,7 +182,7 @@ echo "[$(date -Is)] gate3: ${TASK} x ${EPISODES} episodes, image=${IMAGE}"
 srun --container-image="${IMAGE}" \
      --container-remap-root --container-writable \
      --container-save="${IMAGE}" \
-     --container-mounts=/lustre:/lustre \
+     --container-mounts=/lustre:/lustre,${ASSETS}:${WORK}/UniVTAC/third_party/TacEx/source/tacex_assets/tacex_assets/data \
      bash "${RUN_SH}"
 
 echo "[$(date -Is)] srun rc=$?"
