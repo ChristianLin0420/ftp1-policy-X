@@ -89,10 +89,28 @@ def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device
 
 
 @torch.no_grad()
-def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: int, num_samples: int = 1) -> dict:
-    """Squared error accumulated per domain and per action group, over live slots only."""
+def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: int, num_samples: int = 1,
+             drift_ks: tuple[int, ...] = ()) -> dict:
+    """Squared error accumulated per domain and per action group, over live slots only.
+
+    ``drift_ks`` additionally measures INTEGRATED open-loop drift: the error in joint POSITION
+    after executing k predicted deltas, rather than the error in each delta. That is the quantity
+    the robot actually feels. MoT-JEPA emits per-step first differences and
+    ``deploy.chunk_to_absolute_qpos8`` integrates them with a cumsum, so a per-step RMSE is a rate
+    error whose integral over the chunk has never been computed.
+
+    The gap between the two possibilities is the whole point. At lift_bottle's 0.00109 rad per
+    step, 32 steps of INDEPENDENT error grow as sqrt(32) -> 0.0062 rad, about 3.7 mm at 0.6 m;
+    PERFECTLY CORRELATED error grows as 32 -> 0.035 rad, about 21 mm. The first might grasp a
+    bottle, the second misses it, and the per-step number is identical either way. Reporting the
+    measured curve against both bounds reads off the correlation directly.
+    """
     sq: dict = collections.defaultdict(lambda: collections.defaultdict(float))
     count: dict = collections.defaultdict(lambda: collections.defaultdict(float))
+    drift_sq: dict = collections.defaultdict(lambda: collections.defaultdict(float))
+    drift_n: dict = collections.defaultdict(lambda: collections.defaultdict(float))
+    drift_clips: dict = collections.defaultdict(float)
+    arm_lo, arm_hi = GROUPS["right-arm-joints"]
 
     for batch in loader:
         video = batch["video"].to(device).float().div_(127.5).sub_(1.0)
@@ -133,7 +151,38 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
                 count[name][group] += float(chunk_mask[row][:, lo:hi].sum())
             sq[name]["ALL"] += float(error[row].sum())
             count[name]["ALL"] += float(chunk_mask[row].sum())
-    return {"sq": {k: dict(v) for k, v in sq.items()}, "count": {k: dict(v) for k, v in count.items()}}
+
+        if drift_ks:
+            # Only the arm integrates. The gripper sits in ABSOLUTE_COLUMNS and is executed as a
+            # position, so cumsum-ing it would measure a quantity nothing computes.
+            pred_arm = predicted[:, :, arm_lo:arm_hi]
+            true_arm = (truth * chunk_mask)[:, :, arm_lo:arm_hi]
+            live = chunk_mask[:, :, arm_lo:arm_hi]
+            # A chunk that runs past the episode end has dead tail steps, and a cumsum through a
+            # zero-filled step silently reports the drift as having stopped growing. Restrict to
+            # clips whose arm slots are live at EVERY step, and report how many that drops.
+            whole = live.reshape(live.shape[0], -1).min(dim=1).values > 0
+            pred_cum = torch.cumsum(pred_arm, dim=1)
+            true_cum = torch.cumsum(true_arm, dim=1)
+            step_err = (pred_cum - true_cum) ** 2
+            for row, domain in enumerate(batch["domain_id"].tolist()):
+                if not bool(whole[row]):
+                    continue
+                name = names[domain]
+                drift_clips[name] += 1.0
+                for k in drift_ks:
+                    if k > step_err.shape[1]:
+                        continue
+                    drift_sq[name][k] += float(step_err[row, k - 1].sum())
+                    drift_n[name][k] += float(step_err.shape[2])
+
+    return {
+        "sq": {k: dict(v) for k, v in sq.items()},
+        "count": {k: dict(v) for k, v in count.items()},
+        "drift_sq": {k: dict(v) for k, v in drift_sq.items()},
+        "drift_n": {k: dict(v) for k, v in drift_n.items()},
+        "drift_clips": dict(drift_clips),
+    }
 
 
 def main() -> int:
@@ -155,7 +204,11 @@ def main() -> int:
     parser.add_argument("--num-samples", type=int, default=1,
                         help="Average K samples per observation to estimate the conditional mean.")
     parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument("--drift-ks", default="1,2,4,8,16,32",
+                        help="Truncation lengths for the integrated open-loop drift table. Empty "
+                             "string disables it.")
     args = parser.parse_args()
+    drift_ks = tuple(int(k) for k in args.drift_ks.split(",") if k.strip())
 
     if bool(args.run) == bool(args.ridge):
         parser.error("pass exactly one of --run (a trained head) or --ridge (a fitted .npz)")
@@ -218,7 +271,7 @@ def main() -> int:
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=6, collate_fn=collate_clips
     )
     acc = evaluate(backbone, head, normalizer, loader, device, names, num_steps=args.euler_steps,
-                   num_samples=args.num_samples)
+                   num_samples=args.num_samples, drift_ks=drift_ks)
 
     def rmse(name: str, group: str) -> float:
         c = acc["count"][name].get(group, 0.0)
@@ -241,6 +294,47 @@ def main() -> int:
     print(f"{'POOLED':24s}" + "".join(f"{pooled[g]:16.5f}" for g in live))
     print("\nRMSE in raw action units (radians for joints); live slots only.")
 
+    def drift(name: str, k: int) -> float:
+        n = acc["drift_n"].get(name, {}).get(k, 0.0)
+        return float("nan") if n <= 0 else float(np.sqrt(acc["drift_sq"][name][k] / n))
+
+    drift_table: dict = {}
+    if drift_ks and acc["drift_clips"]:
+        print("\n=== integrated open-loop drift: arm POSITION error after k executed deltas ===")
+        print("(what the robot feels. per-step RMSE is a rate; this is its integral.)\n")
+        header = f"{'domain':24s}{'clips':>7s}" + "".join(f"{'k=' + str(k):>11s}" for k in drift_ks)
+        print(header)
+        for name in sorted(acc["drift_clips"]):
+            row = "".join(f"{drift(name, k):11.5f}" for k in drift_ks)
+            print(f"{name:24s}{int(acc['drift_clips'][name]):7d}" + row)
+            drift_table[name] = {k: drift(name, k) for k in drift_ks}
+
+        pooled_drift = {}
+        for k in drift_ks:
+            s_k = sum(acc["drift_sq"][n].get(k, 0.0) for n in acc["drift_sq"])
+            n_k = sum(acc["drift_n"][n].get(k, 0.0) for n in acc["drift_n"])
+            pooled_drift[k] = float("nan") if n_k <= 0 else float(np.sqrt(s_k / n_k))
+        print(f"{'POOLED':24s}{int(sum(acc['drift_clips'].values())):7d}"
+              + "".join(f"{pooled_drift[k]:11.5f}" for k in drift_ks))
+
+        # The two bounds the measured curve must be read against. Independent per-step errors grow
+        # as sqrt(k); perfectly correlated ones grow as k. Where the measurement falls between them
+        # IS the error correlation, which is the thing no per-step metric can show.
+        per_step = pooled.get("right-arm-joints", float("nan"))
+        print(f"\n{'independent sqrt(k)':24s}{'':7s}"
+              + "".join(f"{per_step * np.sqrt(k):11.5f}" for k in drift_ks))
+        print(f"{'correlated k':24s}{'':7s}" + "".join(f"{per_step * k:11.5f}" for k in drift_ks))
+        worst = drift_ks[-1]
+        if np.isfinite(pooled_drift[worst]) and per_step > 0:
+            lo_b, hi_b = per_step * np.sqrt(worst), per_step * worst
+            frac = (pooled_drift[worst] - lo_b) / max(hi_b - lo_b, 1e-12)
+            print(f"\nat k={worst}: measured {pooled_drift[worst]:.5f} rad sits {frac:.0%} of the way "
+                  f"from independent ({lo_b:.5f}) to fully correlated ({hi_b:.5f}).")
+            print(f"as a reach error at 0.6 m that is about {pooled_drift[worst] * 600:.1f} mm.")
+        dropped = len(dataset) - int(sum(acc["drift_clips"].values()))
+        if dropped:
+            print(f"\n{dropped} of {len(dataset)} clips excluded: arm slots not live at every step.")
+
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(
@@ -254,6 +348,8 @@ def main() -> int:
                     "num_clips": len(dataset),
                     "pooled": pooled,
                     "per_domain": {n: {g: rmse(n, g) for g in live} for n in sorted(acc["count"])},
+                    "drift_ks": list(drift_ks),
+                    "integrated_drift": drift_table,
                 },
                 indent=2,
             )
