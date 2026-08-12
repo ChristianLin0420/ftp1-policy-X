@@ -50,14 +50,54 @@ export CUDA_HOME=/usr/local/cuda-12.4
 : "${UNIVTAC:?}"; : "${RESULT_IN:?}"; : "${TASK_IN:?}"; : "${CONFIG_IN:?}"; : "${EPISODES_IN:?}"; : "${OUTDIR_IN:?}"
 
 PY=/isaac-sim/python.sh
+
+# REPAIR numpy before anything else. Isaac Sim's extensions are prebuilt against numpy 1.x, and
+# the first Gate 3 run died with
+#   "numpy.dtype size changed ... Expected 96 from C header, got 88 from PyObject"
+#   -> isaacsim.core.simulation_manager failed to startup
+# i.e. a numpy 2.x ABI under modules compiled for 1.x. The culprit is Gate 1's
+# `pip install -e .` for tacex_uipc, the ONE install in this stack that omitted --no-deps, which
+# let wildmeshing's dependency chain upgrade numpy underneath Isaac.
+#
+# Nothing here notices until the app boots: pip is happy, every import outside Kit is happy, and
+# Gate 2 passed because AppLauncher tolerated the broken extensions. Pin it back.
+"${PY}" -c "import numpy; print('numpy_before', numpy.__version__)"
+"${PY}" -m pip install --no-deps "numpy<2" || { echo '{"gate3": false, "stage": "numpy_pin"}' > "${RESULT_IN}"; exit 1; }
+"${PY}" -c "import numpy; print('numpy_after', numpy.__version__)"
+
+# UniVTAC's own third-party imports. NOT requirements.txt: that file is a frozen full environment
+# pinning torch_scatter==2.1.2+pt28cu128, torchvision==0.22.0+cu128 and numpy==1.23.5, which would
+# tear out the torch stack Gates 1 and 2 validated. These are the packages the sim import chain
+# actually reaches, scanned from envs/ and collect_data.py; transforms3d is the one that stopped
+# the previous attempt. --no-deps throughout so nothing re-upgrades numpy behind Isaac's back.
+"${PY}" -m pip install --no-deps transforms3d trimesh warp-lang tqdm scipy pydantic decorator \
+  || { echo '{"gate3": false, "stage": "univtac_deps"}' > "${RESULT_IN}"; exit 1; }
+# torchvision must MATCH Isaac's torch; never install the pinned +cu128 build over it.
+"${PY}" -c "import torchvision; print('torchvision', torchvision.__version__)" \
+  || echo "WARNING: torchvision missing; leaving Isaac's stack alone rather than installing a pinned build"
+# Re-assert after the installs above -- the whole point of this block is that one careless
+# dependency already upgraded numpy once and broke Isaac's core extensions silently.
+"${PY}" -c "import numpy,sys; v=numpy.__version__; print('numpy_final',v); sys.exit(0 if v.startswith('1.') else 1)" \
+  || { echo '{"gate3": false, "stage": "numpy_regressed"}' > "${RESULT_IN}"; exit 1; }
+
 cd "${UNIVTAC}" || { echo '{"gate3": false, "stage": "cd_univtac"}' > "${RESULT_IN}"; exit 1; }
 
-# Every import the harness needs, checked BEFORE burning sim time on a missing module.
-"${PY}" -c "import uipc, tacex_uipc, curobo, isaaclab" \
-  || { echo '{"gate3": false, "stage": "imports"}' > "${RESULT_IN}"; exit 1; }
+# NO pre-flight import check here. tacex_uipc pulls in isaacsim.core, a Kit EXTENSION that only
+# exists once the Isaac app has booted, so `python -c "import tacex_uipc"` raises
+# ModuleNotFoundError however correctly everything is installed. A check like that killed the
+# first Gate 3 run before collect_data.py started -- the same mistake Gate 2 had just proven, and
+# the imports are Gate 2's job anyway. collect_data.py launches the app itself.
 
+# Headless via ENVIRONMENT, not a flag. collect_data.py calls parser.parse_args() at :50 and only
+# then calls AppLauncher.add_app_launcher_args(parser) at :55, so the launcher flags are never
+# registered and `--headless` is rejected outright -- "unrecognized arguments: --headless" ended
+# the previous attempt in 45 seconds. It sets enable_cameras itself at :58. AppLauncher reads
+# these env vars, which is the only channel left open.
+export HEADLESS=1
+export LIVESTREAM=0
+export ENABLE_CAMERAS=1
 timeout 10800 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
-  --episode_num "${EPISODES_IN}" --headless
+  --episode_num "${EPISODES_IN}"
 echo "collect_data rc=$?"
 
 # Artifacts, not exit codes.
@@ -119,6 +159,7 @@ export EPISODES_IN="${EPISODES}" OUTDIR_IN="${OUTDIR}"
 echo "[$(date -Is)] gate3: ${TASK} x ${EPISODES} episodes, image=${IMAGE}"
 srun --container-image="${IMAGE}" \
      --container-remap-root --container-writable \
+     --container-save="${IMAGE}" \
      --container-mounts=/lustre:/lustre \
      bash "${RUN_SH}"
 

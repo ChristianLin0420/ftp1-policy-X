@@ -101,9 +101,47 @@ done
 
 # --- cuRobo from source ----------------------------------------------------------------------
 # Imported unconditionally at envs/robot/robot.py:17, so it is mandatory even for a replay rollout.
-if ! "${PY}" -c "import curobo" >/dev/null 2>&1; then
-  [[ -d "${CUROBO_DIR}/.git" ]] || git clone https://github.com/NVlabs/curobo.git "${CUROBO_DIR}" \
-    || FAIL "curobo_clone"
+# PINNED to v0.7.6. Cloning HEAD gave a cuRobo whose package was restructured to
+# curobo/_src/geom, while UniVTAC does `from curobo.geom.transform import pose_multiply`
+# (envs/robot/curobo_planner.py:1). `import curobo` succeeded, so Gate 2 passed, and the mismatch
+# only surfaced when the sim actually imported the planner. v0.7.6 is the newest tag still using
+# the classic src/curobo/geom layout that UniVTAC was written against.
+[[ -d "${CUROBO_DIR}/.git" ]] || git clone https://github.com/NVlabs/curobo.git "${CUROBO_DIR}" \
+  || FAIL "curobo_clone"
+if [[ "$(git -C "${CUROBO_DIR}" describe --tags --exact-match 2>/dev/null)" != "v0.7.6" ]]; then
+  git -C "${CUROBO_DIR}" fetch --tags -q || FAIL "curobo_fetch"
+  git -C "${CUROBO_DIR}" checkout -q v0.7.6 || FAIL "curobo_checkout"
+  "${PY}" -m pip uninstall -y curobo >/dev/null 2>&1 || true
+fi
+# Assert the layout the caller needs BEFORE a 20-minute CUDA build.
+[[ -d "${CUROBO_DIR}/src/curobo/geom" ]] || FAIL "curobo_layout_missing_geom"
+
+# cuRobo v0.7.6 predates CUDA 13, which declares lerp(float,float,float) in its own math headers.
+# The build dies with "'float lerp(float, float, float)' conflicts with a previous declaration".
+# Guard ONLY the scalar overload -- CUDA provides that one, the float2/3/4 versions are still
+# needed. Idempotent, so a fresh clone is patched the same way rather than depending on a manual
+# edit surviving on Lustre.
+HM="${CUROBO_DIR}/src/curobo/curobolib/cpp/helper_math.h"
+if ! grep -q "CUDART_VERSION < 13000" "${HM}"; then
+  "${PY}" - "${HM}" <<'PATCH' || FAIL "curobo_lerp_patch"
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+needle = "inline __device__ __host__ float lerp(float a, float b, float t)\n{\n    return a + t*(b-a);\n}"
+if needle not in text:
+    raise SystemExit("scalar lerp overload not found; cuRobo layout changed")
+text = text.replace(
+    needle,
+    "#if !defined(CUDART_VERSION) || (CUDART_VERSION < 13000)\n" + needle + "\n#endif",
+    1,
+)
+path.write_text(text)
+print("patched helper_math.h for CUDA 13")
+PATCH
+fi
+if ! "${PY}" -c "import curobo.geom" >/dev/null 2>&1; then
   "${PY}" -m pip install --no-build-isolation --no-deps -e "${CUROBO_DIR}" || FAIL "curobo_build"
 fi
 
@@ -144,8 +182,17 @@ if out["app_launched"]:
         except Exception as exc:  # noqa: BLE001 -- reporting the failure IS the gate
             out[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+# curobo.geom explicitly, not just curobo: the top-level package imports fine even when the
+# subpackage UniVTAC actually calls is absent, which is exactly how the wrong version passed here.
+for name in ("curobo.geom.transform",):
+    try:
+        __import__(name)
+        out[name] = {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        out[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
 out["gate2"] = bool(out.get("app_launched")) and all(
-    out.get(n, {}).get("ok") for n in ("tacex", "tacex_uipc", "curobo")
+    out.get(n, {}).get("ok") for n in ("tacex", "tacex_uipc", "curobo", "curobo.geom.transform")
 )
 # Write BEFORE shutting the app down. Isaac runs with fastShutdown, which can _exit() and discard
 # anything still buffered -- an earlier probe in this project exited 0 with every print missing.
