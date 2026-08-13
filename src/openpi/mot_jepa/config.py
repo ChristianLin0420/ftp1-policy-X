@@ -13,7 +13,10 @@ import json
 import pathlib
 import typing
 
-import tyro
+# tyro is imported lazily inside the two CLI helpers below. It is a command-line concern only,
+# and importing it at module scope makes this file -- and therefore the whole deployment
+# path -- unimportable inside Isaac Sim's interpreter, which has no tyro and must not gain
+# packages that could disturb its numpy or torch.
 
 from openpi.mot_jepa.action_dit import ActionDiTConfig
 from openpi.mot_jepa.drifting import DriftingConfig
@@ -204,6 +207,8 @@ CONFIGS: dict[str, MotJepaTrainConfig] = {
 
 def cli() -> MotJepaTrainConfig:
     """Mirrors the repository's tyro entrypoint style (``training/config.py:1335``)."""
+    import tyro
+
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in CONFIGS.items()})
 
 
@@ -341,4 +346,6 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
 
 
 def policy_cli() -> PolicyConfig:
+    import tyro
+
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in POLICY_CONFIGS.items()})

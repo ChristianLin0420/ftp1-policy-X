@@ -47,7 +47,12 @@ import dataclasses
 import logging
 
 import numpy as np
-import zarr
+import typing
+
+if typing.TYPE_CHECKING:  # zarr appears ONLY in annotations, and
+    # `from __future__ import annotations` makes those strings, so the deployment path
+    # (deploy.py -> action_parse) can import inside Isaac's interpreter, which has no zarr.
+    import zarr
 
 from openpi.ftp1_action_groups import get_ftp1_action_group_slices
 from openpi.pose_utils import mat_to_pose9d

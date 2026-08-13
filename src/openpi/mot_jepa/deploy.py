@@ -158,14 +158,26 @@ class MotJepaRidgePolicy:
             gel=prep(gel, (0, 1, 4, 2, 3)),
             # UniVTAC populates no lowdim stream, and ~79% of the pretraining corpus zero-fills it
             # too, so zeros are what the encoder saw for most of training rather than a stand-in.
-            lowdim=torch.zeros(1, self.num_frames, 1, 1, device=self.device),
+            # Shape must be the layout's (B, T, lowdim_slots, lowdim_channels): the embedder
+            # asserts the slot count, so a (1, T, 1, 1) placeholder fails with "expected 8 slots,
+            # got 1" rather than being broadcast.
+            lowdim=torch.zeros(
+                1, self.num_frames, self.layout.lowdim_slots, self.layout.lowdim_channels,
+                device=self.device,
+            ),
         )
 
     @torch.no_grad()
     def act(self, observation: dict, prompt: str | None = None) -> np.ndarray:
         del prompt  # accepted and ignored; see set_task
         self.observe(observation)
-        encoded = self.backbone.encode_full(self._clip_inputs())
+        # bf16 autocast, as the trainer and the offline evaluator both run this encoder. Deploying
+        # it in fp32 was not just slower: Isaac's renderer shares this GPU and died with
+        # VkResult ERROR_DEVICE_LOST / "Failure to upload Texture" after 60 s semaphore waits,
+        # i.e. the compute was blocking texture uploads. It also keeps the closed-loop numerics
+        # identical to the offline RMSE the policy was selected on.
+        with torch.autocast(self.device.type, torch.bfloat16, enabled=self.device.type == "cuda"):
+            encoded = self.backbone.encode_full(self._clip_inputs())
         encoded = type(encoded)(
             tokens=[t.float() for t in encoded.tokens],
             sync_readout=[t.float() for t in encoded.sync_readout],
@@ -174,12 +186,16 @@ class MotJepaRidgePolicy:
         action_mask = torch.ones(1, ACTION_DIM, device=self.device)
         chunk = self.head.sample(encoded, action_mask, domain).float().cpu().numpy()[0]
 
-        qpos8 = np.asarray(observation["embodiment"]["joint"][:8]).reshape(-1)
+        # Detach BEFORE np.asarray, not after: the observation carries a CUDA tensor and
+        # np.asarray() on one raises rather than converting. Mirrors eval_ftp1._get_qpos8, which
+        # tests for a tensor first.
+        qpos8 = observation["embodiment"]["joint"][:8]
         if hasattr(qpos8, "detach"):
             qpos8 = qpos8.detach().cpu().numpy()
-        targets = chunk_to_absolute_qpos8(chunk, np.asarray(qpos8, dtype=np.float32))
+        qpos8 = np.asarray(qpos8, dtype=np.float32).reshape(-1)
+        targets = chunk_to_absolute_qpos8(chunk, qpos8)
 
-        self._chunk_history.append((chunk, len(self._chunk_history), np.asarray(qpos8)))
+        self._chunk_history.append((chunk, len(self._chunk_history), qpos8.copy()))
         self._last_debug = {
             "arm_delta_step0": chunk[0, ARM_JOINT_SLICE].tolist(),
             "gripper_step0": float(chunk[0, GRIPPER_SLOT]),
