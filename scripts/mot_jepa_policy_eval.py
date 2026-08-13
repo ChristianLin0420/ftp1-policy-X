@@ -126,6 +126,7 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
         encoded = type(encoded)(
             tokens=[t.float() for t in encoded.tokens],
             sync_readout=[t.float() for t in encoded.sync_readout],
+            final_readout=[t.float() for t in encoded.final_readout],
         )
 
         # The deployment path, not the training path: 1 NFE under drifting, Euler under flowmatch.

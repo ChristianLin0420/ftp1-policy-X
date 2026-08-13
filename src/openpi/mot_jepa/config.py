@@ -38,7 +38,20 @@ class DataConfig:
     """Path to an FTP-1 domain-config JSON (``dataset_zarr.py:2409-2427`` schema)."""
     store_glob: str = ""
     """Alternative to ``domain_config``: a glob matching ``*.zarr`` stores directly."""
-    strides: tuple[int, ...] = (1, 2)
+    strides: tuple[int, ...] = (2, 4)
+    """Frame stride per clip. Widened from ``(1, 2)`` together with ``MaskMode.F``.
+
+    Only **2.2%** of the gel tensor's magnitude varies within a 16-frame clip at stride 1
+    (measured on both pretrained backbones), so a forecast one or two tubelet steps ahead is close
+    to a copy of the last context step -- and a copy solution teaches no dynamics. At 30 Hz,
+    stride 2-4 makes a clip span 1.07-2.13 s and one tubelet step 267-533 ms, which puts the
+    forecast target beyond copy range.
+
+    COUPLED to ``deploy.MotJepaRidgePolicy.frame_stride``: deployment must sample at a stride this
+    set brackets. RoPE ``t`` is the tubelet index and carries no rate, so an encoder handed a
+    different frame rate cannot tell -- it simply sees a slower or faster world than it trained
+    on, silently.
+    """
     index_step: int = 1
     """Stride between enumerated clip starts. Raise it to shrink the index on huge corpora."""
     num_workers: int = 12
@@ -64,6 +77,10 @@ class MaskConfig:
     tactile_window_steps: tuple[int, ...] = (2, 3, 4)
     video_window_steps: tuple[int, ...] = (2, 3, 4)
     min_targets_per_stream: int = 8
+    forecast_horizon_steps: tuple[int, ...] = (2, 3)
+    """Trailing-window lengths for ``MaskMode.F``. Never ``(1,)``: one step ahead is close
+    enough to the last context step that copying it is a viable shortcut, and a copy solution
+    would teach no dynamics."""
 
 
 @dataclasses.dataclass(frozen=True)

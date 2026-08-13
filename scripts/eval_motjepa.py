@@ -59,6 +59,14 @@ def _build_policy_class():
             cfg = config_module.CONFIGS[os.environ.get("MOTJEPA_CONFIG", "mot_jepa_pilot")]
 
             dev = torch.device(device if isinstance(device, str) else "cuda")
+            # Isaac's RTX renderer shares this GPU and died with ERROR_DEVICE_LOST / "Failure to
+            # upload Texture" -- the renderer could not allocate while torch's caching allocator
+            # held the device. Cap our share; the encoder is 30M params and the ridge 566 MB, so a
+            # small fraction of an 80 GB H100 is ample.
+            if dev.type == "cuda":
+                frac = float(os.environ.get("TORCH_MEM_FRAC", "0.15"))
+                torch.cuda.set_per_process_memory_fraction(frac, dev.index or 0)
+                print(f"[eval_motjepa] torch memory fraction {frac} on {dev}", flush=True)
             backbone, _ = runtime.load_frozen_backbone(pathlib.Path(snapshot), step, cfg, dev)
             head = RidgeHead(ridge_path, cfg.layout, horizon=32).to(dev)
 

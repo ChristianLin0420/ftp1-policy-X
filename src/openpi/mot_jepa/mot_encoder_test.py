@@ -186,7 +186,16 @@ def test_model_modules_contain_no_rng_calls(module):
 
 
 def test_predictor_shapes_match_encoder_widths():
-    spec = MaskSpec(layout=TINY_LAYOUT, tactile_window_steps=(1,), video_window_steps=(1,), min_targets_per_stream=2)
+    # Forecast params scaled to TINY_LAYOUT the same way the windows are: num_steps is 2 here,
+    # so the production defaults (horizon 2-3, min_context 4) cannot fit.
+    spec = MaskSpec(
+        layout=TINY_LAYOUT,
+        tactile_window_steps=(1,),
+        video_window_steps=(1,),
+        forecast_horizon_steps=(1,),
+        min_context_steps=1,
+        min_targets_per_stream=2,
+    )
     masks = build_batch_masks(spec, step=0, batch_size=BATCH, base_seed=7)
 
     embed = StreamEmbed(TINY_LAYOUT)

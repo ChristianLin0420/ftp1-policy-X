@@ -7,7 +7,7 @@
 # VkResult ERROR_DEVICE_LOST and 60 s waits on "Failure to upload Texture", and bf16 did not
 # help -- it is a context collision, not compute time. eval_ftp1 separates them by design via
 # --ftp1_device (:70) and --sim_device, so give it two devices to separate onto.
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=200G
 #SBATCH --job-name=motjepa-closedloop
@@ -77,6 +77,7 @@ if [[ "${POLICY_IN}" == "motjepa" ]]; then
   # _infer_action_rep_from_checkpoint is bypassed because eval_motjepa forces --action_rep absolute.
   EXTRA=(--checkpoint_dir "${SNAP}")
 else
+  export PYTHONPATH="${WORK_IN}/src"
   SCRIPT="${WORK_IN}/UniVTAC/scripts/eval_ftp1.py"
   EXTRA=(--checkpoint_dir "${CKPT_IN}")
 fi
@@ -85,7 +86,6 @@ timeout "${RUN_SECONDS_IN}" "${PY}" "${SCRIPT}" \
   --task_list "${TASK_IN}" \
   --domain_name "${DOMAIN_IN}" \
   --ftp1_device "${POLICY_DEVICE_IN}" \
-  --gpu "" \
   --task_config demo.yml \
   --total_num "${TOTAL_IN}" \
   --start_seed "${START_SEED_IN}" \
@@ -98,9 +98,15 @@ import glob, json, os, pathlib, re
 out = {"policy": os.environ["POLICY_IN"], "task": os.environ["TASK_IN"]}
 # Newest run directory only. A wall-clock window over eval_result/ picked up videos from
 # earlier runs and would have reported another run's episodes as this one's.
+# The run directory must have been created BY THIS JOB. Falling back to "newest on disk" made a
+# failed FTP-1 run report the MoT-JEPA run's directory -- mid-write, at 2/2 -- as its own baseline.
+# A fabricated number is worse than a missing one, so a job that produced no directory reports null.
 base = pathlib.Path(os.environ["WORK_IN"]) / "UniVTAC" / "eval_result"
-runs = sorted((d for d in base.glob("*/*/*") if d.is_dir()), key=lambda d: d.stat().st_mtime)
+started = float(os.environ["JOB_START_EPOCH_IN"])
+runs = sorted((d for d in base.glob("*/*/*") if d.is_dir() and d.stat().st_mtime >= started),
+              key=lambda d: d.stat().st_mtime)
 out["run_dir"] = str(runs[-1]) if runs else None
+out["own_run_dir"] = bool(runs)
 succ = fail = err = 0
 for p in (runs[-1].rglob("*.mp4") if runs else []):
     b = p.name
@@ -111,7 +117,7 @@ out.update(success=succ, fail=fail, error=err, total=succ + fail + err)
 # Rate over COMPLETED episodes; harness "error" episodes are crashes, not policy failures,
 # and counting them as failures would understate the policy for the wrong reason.
 out["success_rate"] = (succ / (succ + fail)) if (succ + fail) else None
-out["ok"] = out["total"] > 0
+out["ok"] = bool(runs) and out["total"] > 0
 with open(os.environ["RESULT_IN"], "w") as h:
     json.dump(out, h, indent=2)
 print("CLOSEDLOOP", json.dumps(out), flush=True)
@@ -123,6 +129,7 @@ export TOTAL_IN="${TOTAL}" START_SEED_IN="${START_SEED}" CKPT_IN="${CKPT}" RUN_S
 # eval_ftp1.main() enforces exactly three required args (:1285, :1287, :1314):
 # --checkpoint_dir, --domain_name and --task_list. All three are now supplied for both arms.
 export DOMAIN_IN="${DOMAIN}"
+export JOB_START_EPOCH_IN="$(date +%s)"
 # --gpu "" is REQUIRED to keep both GPUs visible. It defaults to $CUDA_VISIBLE_DEVICES, which
 # SLURM sets to "0,1", and _split_devices(:1006) then hands the worker exactly ONE device and
 # rewrites CUDA_VISIBLE_DEVICES to it -- so cuda:1 disappears and the policy load dies with

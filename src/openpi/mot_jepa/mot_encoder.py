@@ -179,6 +179,22 @@ class EncoderOutput:
 
     tokens: list[torch.Tensor]  # indexed by ExpertId, each (B, L_e, width_e)
     sync_readout: list[torch.Tensor]  # indexed by ExpertId, each (B, num_steps, width_e)
+    final_readout: list[torch.Tensor]  # indexed by ExpertId, each (B, num_steps, width_e)
+    """The POLICY feature. Same pooling as ``sync_readout`` but taken from the final normed
+    tokens instead of the layer-``num_local_layers`` snapshot.
+
+    The distinction decides whether a dynamics-aware objective reaches a policy at all. The
+    forecasting gradient (``MaskMode.F``) arrives through ``tokens`` -- the output of the LAST
+    block -- while ``sync_readout`` is snapshotted before the first *global* layer. Nothing
+    stops the encoder from satisfying forecasting inside the global layers and leaving the
+    early snapshot a per-step appearance code, in which case a policy reading ``sync_readout``
+    would see no benefit and the run would be misread as "forecasting does not help".
+
+    ``sync_readout`` stays the right input for the cross-modal retrieval probe, where mixing the
+    two modalities inflates the score by self-matching. It is the wrong input for a policy, where
+    mixing is exactly what is wanted. Deliberately has no default: a stale caller must fail loudly
+    rather than silently feed a head the wrong tensor.
+    """
 
     def expert(self, expert: ExpertId) -> torch.Tensor:
         return self.tokens[int(expert)]
@@ -257,9 +273,13 @@ class MoTEncoder(nn.Module):
         if readout is None:  # num_local_layers == depth
             readout = [_pool_by_step(x, s, self.layout.num_steps) for x, s in zip(xs, steps, strict=True)]
 
+        normed = [norm(x) for norm, x in zip(self.norms, xs, strict=True)]
         return EncoderOutput(
-            tokens=[norm(x) for norm, x in zip(self.norms, xs, strict=True)],
+            tokens=normed,
             sync_readout=readout,
+            # Zero new parameters, and identical shape to sync_readout, so every consumer's
+            # feature width is unchanged.
+            final_readout=[_pool_by_step(x, s, self.layout.num_steps) for x, s in zip(normed, steps, strict=True)],
         )
 
 

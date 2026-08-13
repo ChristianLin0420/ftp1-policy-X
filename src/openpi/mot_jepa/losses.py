@@ -376,6 +376,21 @@ class MotJepaLoss(nn.Module):
             lowdim_gate_frac = torch.zeros((), device=device)
 
         # -- synchrony ------------------------------------------------------------------
+        # Drop steps that have no context token. Only mode F creates any: its trailing forecast
+        # window leaves those steps empty in BOTH experts, and `_pool_by_step` divides by a
+        # count clamped to 1, so the readout there is exactly zero.
+        #
+        # Level A would survive that -- `F.normalize` absorbs the rescale -- but level B would
+        # not. `projector(0)` is the projector's bias, the SAME vector for every sample and every
+        # empty step, so after normalisation those rows are bit-identical and the cross-entropy
+        # below would be asking the model to tell them apart. That is an irreducible floor plus a
+        # real gradient pushing the bias around, and it would have been misread as mode F hurting
+        # synchrony.
+        #
+        # Mode and horizon are pure functions of `step`, so every rank slices identically and DDP
+        # stays in lockstep.
+        valid_steps = int(masks.num_context_steps)
+        student_readout = [readout[:, :valid_steps] for readout in student_readout]
         projected = [proj(readout) for proj, readout in zip(self.projectors, student_readout, strict=True)]
         video_steps, tactile_steps = projected
         loss_a, metrics_a = sync_loss_level_a(

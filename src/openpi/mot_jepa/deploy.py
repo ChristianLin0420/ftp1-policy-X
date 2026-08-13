@@ -83,13 +83,23 @@ class MotJepaRidgePolicy:
     plus a CLOSED-FORM head recovers. Not that it beats FTP-1.
     """
 
-    def __init__(self, backbone, head, layout, domain_id: int, device, *, num_frames: int = 16):
+    def __init__(
+        self, backbone, head, layout, domain_id: int, device, *, num_frames: int = 16, frame_stride: int = 2
+    ):
         self.backbone = backbone
         self.head = head
         self.layout = layout
         self.domain_id = int(domain_id)
         self.device = device
         self.num_frames = num_frames
+        # COUPLED to DataConfig.strides, which is (2, 4). The encoder must be handed frames at a
+        # rate the training set brackets: RoPE `t` is the tubelet index and carries no rate, so an
+        # encoder fed a different frame rate cannot tell -- it just sees a slower or faster world
+        # than it trained on, with no error anywhere. Buffering every control step (stride 1) while
+        # training on (2, 4) would put deployment a factor of two outside the trained range.
+        self.frame_stride = int(frame_stride)
+        if self.frame_stride < 1:
+            raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
         # Attributes eval_ftp1.py reads off the policy object.
         self.action_rep = "relative"
         self.action_dim = ACTION_DIM
@@ -134,18 +144,23 @@ class MotJepaRidgePolicy:
                 "gel": np.stack(pads, axis=0),
             }
         )
-        # Cold start. Training REJECTS short windows rather than padding
-        # (clip_dataset.py:9-13), so edge-padding here is a deliberate deviation, recorded as one:
-        # for the first 15 steps the oldest frame is repeated rather than the episode skipped.
-        if len(self._frames) > self.num_frames:
+        # Keep enough CONTROL steps to subsample `num_frames` at `frame_stride`. The policy still
+        # acts every control step; only the frames handed to the encoder are decimated.
+        if len(self._frames) > (self.num_frames - 1) * self.frame_stride + 1:
             self._frames.pop(0)
 
     def _clip_inputs(self):
-        frames = self._frames
-        if not frames:
+        if not self._frames:
             raise RuntimeError("observe() must be called before act()")
+        # Subsample at the trained stride, newest-last. `[::-1][::stride][::-1]` anchors the
+        # decimation to the MOST RECENT frame: the policy's action depends on where the motion is
+        # now, so the newest observation must always be in the window regardless of buffer length.
+        frames = self._frames[::-1][:: self.frame_stride][::-1]
+        # Cold start. Training REJECTS short windows rather than padding (clip_dataset.py:9-13),
+        # so edge-padding here is a deliberate deviation, recorded as one: until the buffer fills,
+        # the oldest frame is repeated rather than the episode skipped.
         pad = [frames[0]] * (self.num_frames - len(frames))
-        window = pad + frames
+        window = (pad + frames)[-self.num_frames :]
         video = np.stack([f["video"] for f in window])           # (T, H, W, 3)
         gel = np.stack([f["gel"] for f in window])               # (T, N, h, w, 3)
 
@@ -181,6 +196,7 @@ class MotJepaRidgePolicy:
         encoded = type(encoded)(
             tokens=[t.float() for t in encoded.tokens],
             sync_readout=[t.float() for t in encoded.sync_readout],
+            final_readout=[t.float() for t in encoded.final_readout],
         )
         domain = torch.tensor([self.domain_id], device=self.device)
         action_mask = torch.ones(1, ACTION_DIM, device=self.device)

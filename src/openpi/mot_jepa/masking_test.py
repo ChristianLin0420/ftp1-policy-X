@@ -181,9 +181,10 @@ def test_expected_target_counts_matches_realized_counts(mode):
     assert total == masks.tgt_index.shape[1]
     # The analytic helper must agree for at least one legal window pair.
     ok = any(
-        expected_target_counts(spec, mode, wt, wv) == realized
+        expected_target_counts(spec, mode, wt, wv, wf) == realized
         for wt in spec.tactile_window_steps
         for wv in spec.video_window_steps
+        for wf in spec.forecast_horizon_steps
     )
     assert ok, f"{mode.name}: realized {realized} matches no analytic count"
 
@@ -222,7 +223,14 @@ def test_invalid_specs_raise():
     with pytest.raises(ValueError, match="must have"):
         MaskSpec(layout=LAYOUT_PILOT, mode_probs=(0.5, 0.5, 0.0, 0.0))
     with pytest.raises(ValueError, match="must sum to"):
-        MaskSpec(layout=LAYOUT_PILOT, mode_probs=(0.5, 0.1, 0.1, 0.1, 0.1))
+        # Must be len(MaskMode) entries or the LENGTH check fires first and the sum is never read,
+        # and must actually miss 1.0 -- the obvious six-tuple (0.5, 0.1, 0.1, 0.1, 0.1, 0.1) sums
+        # to exactly 1.0 and passes.
+        MaskSpec(layout=LAYOUT_PILOT, mode_probs=(0.5, 0.1, 0.1, 0.1, 0.1, 0.2))
+    with pytest.raises(ValueError, match="min_context_steps"):
+        # A forecast window long enough to starve the context of the instants needed to see a
+        # direction. This is a separate failure from the survival check below.
+        MaskSpec(layout=LAYOUT_PILOT, forecast_horizon_steps=(LAYOUT_PILOT.num_steps - 1,))
     with pytest.raises(ValueError, match="at least one instant survives"):
         # A window as long as the clip would leave no surviving instant.
         MaskSpec(layout=LAYOUT_PILOT, tactile_window_steps=(LAYOUT_PILOT.num_steps,))

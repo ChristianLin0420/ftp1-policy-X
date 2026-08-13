@@ -49,10 +49,24 @@ class MaskMode(enum.IntEnum):
     T_HARD = 2
     V_HARD = 3
     X = 4
+    F = 5
 
 
 #: Design-document mode probabilities, indexed by :class:`MaskMode`.
-DEFAULT_MODE_PROBS: tuple[float, float, float, float, float] = (0.35, 0.20, 0.10, 0.10, 0.25)
+#:
+#: ``F`` takes 0.30, drawn mostly from ``V`` and ``V_HARD``, and that share is the point rather
+#: than a tuning choice. Every other mode masks a window whose context survives on BOTH temporal
+#: sides, so the objective is interpolation, and interpolation is invariant to reversing the time
+#: axis -- as are both levels of ``L_sync`` (a mean over time, and a set-matching InfoNCE that is
+#: unchanged when the same permutation is applied to both modalities). With no term anywhere in
+#: the objective that reads the sign of time, the encoder was free to represent a clip as a SET of
+#: instants, and measurably did: shuffling frames displaces the input by 1.01 of the between-clip
+#: spread and the representation by 0.005.
+#:
+#: On ``F`` steps the FULL objective becomes "predict the future from strictly earlier context",
+#: which no permutation of time leaves unchanged. There is no new loss term and no new weight --
+#: the break is structural, in which indices reach the encoder.
+DEFAULT_MODE_PROBS: tuple[float, ...] = (0.20, 0.15, 0.10, 0.05, 0.20, 0.30)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,6 +85,11 @@ class MaskSpec:
         block_aspect: Min/max block aspect ratio.
         min_targets_per_stream: Target floor so every prediction head gets a gradient and
             the loss dict never reports a structurally-absent term.
+        forecast_horizon_steps: Allowed trailing-window lengths for mode ``F``, in tubelet steps.
+            Never ``(1,)``: a one-step forecast is close enough to the last context step that
+            copying it is a viable shortcut.
+        min_context_steps: Floor on surviving context steps in mode ``F``. Estimating a direction
+            needs more than two instants -- at ``num_steps=8`` a horizon of 2-3 leaves 5-6.
     """
 
     layout: TokenLayout
@@ -83,6 +102,8 @@ class MaskSpec:
     block_scale: tuple[float, float] = (0.15, 0.35)
     block_aspect: tuple[float, float] = (0.66, 1.5)
     min_targets_per_stream: int = 8
+    forecast_horizon_steps: tuple[int, ...] = (2, 3)
+    min_context_steps: int = 4
 
     def __post_init__(self) -> None:
         if len(self.mode_probs) != len(MaskMode):
@@ -96,6 +117,16 @@ class MaskSpec:
             raise ValueError(
                 f"window length {max_window} must be < num_steps={self.layout.num_steps} "
                 "so that at least one instant survives"
+            )
+        # Separate from the check above: mode F needs enough SURVIVING context to estimate a
+        # direction, not merely one instant. Its horizon is validated against min_context_steps.
+        if min(self.forecast_horizon_steps) < 1:
+            raise ValueError("forecast_horizon_steps must be >= 1")
+        max_forecast = max(self.forecast_horizon_steps)
+        if max_forecast > self.layout.num_steps - self.min_context_steps:
+            raise ValueError(
+                f"forecast horizon {max_forecast} leaves fewer than min_context_steps="
+                f"{self.min_context_steps} of num_steps={self.layout.num_steps}"
             )
 
 
@@ -117,6 +148,12 @@ class ClipMasks:
     ctx_expert_bounds: torch.Tensor  # (2, 2) int64, per ExpertId
     tgt_expert_bounds: torch.Tensor  # (2, 2) int64, per ExpertId
     seeds: torch.Tensor  # (B,) int64, echoed so tests can recompute the batch
+    num_context_steps: torch.Tensor  # () int64, tubelet steps with any context token
+    """Equals ``layout.num_steps`` for every mode except ``F``, where the trailing forecast
+    window leaves those steps with no context in either expert. ``losses`` needs it: pooling a
+    step with zero context yields exactly zero (``mot_encoder._pool_by_step`` divides by a
+    clamped count), and feeding those zeros to the time-local sync InfoNCE would ask the model
+    to separate rows that are bit-identical by construction."""
 
     @property
     def batch_size(self) -> int:
@@ -237,6 +274,7 @@ def _targets_for_mode(
     mode: MaskMode,
     window_tac: int,
     window_vid: int,
+    window_fcst: int,
 ) -> dict[StreamId, np.ndarray]:
     """Target token indices per stream for one clip."""
     layout = spec.layout
@@ -276,13 +314,28 @@ def _targets_for_mode(
         out[StreamId.VIDEO] = _video_target_indices(rng, layout, spec, spec.x_video_mask_frac)
         out[StreamId.GEL], out[StreamId.LOWDIM] = tactile_window(window_tac)
 
+    elif mode is MaskMode.F:
+        # The TRAILING window, deliberately not _window_start: pinning it to the end is what makes
+        # every surviving context token strictly earlier than every target, and that is the whole
+        # mode. No _floor_targets either -- a floor would scatter targets across the context steps
+        # and destroy the causal split.
+        #
+        # All THREE streams over the SAME steps. If video context extended past the tactile target
+        # window, predicting future touch from future sight would solve it: cross-modal transfer,
+        # not forecasting.
+        steps = np.arange(layout.num_steps - window_fcst, layout.num_steps, dtype=np.int64)
+        for stream in STREAM_ORDER:
+            out[stream] = layout.step_token_indices(stream, steps)
+
     else:  # pragma: no cover - exhaustive over MaskMode
         raise ValueError(f"unhandled mode {mode}")
 
     return out
 
 
-def expected_target_counts(spec: MaskSpec, mode: MaskMode, window_tac: int, window_vid: int) -> dict[StreamId, int]:
+def expected_target_counts(
+    spec: MaskSpec, mode: MaskMode, window_tac: int, window_vid: int, window_fcst: int
+) -> dict[StreamId, int]:
     """Per-stream target counts for a mode. Identical for every clip in the batch."""
     layout = spec.layout
     floor = spec.min_targets_per_stream
@@ -320,6 +373,12 @@ def expected_target_counts(spec: MaskSpec, mode: MaskMode, window_tac: int, wind
             StreamId.VIDEO: video_from_frac(spec.x_video_mask_frac),
             StreamId.GEL: window_tac * layout.gel_tokens_per_step,
             StreamId.LOWDIM: window_tac * layout.lowdim_slots,
+        }
+    if mode is MaskMode.F:
+        return {
+            StreamId.VIDEO: window_fcst * layout.video_tokens_per_step,
+            StreamId.GEL: window_fcst * layout.gel_tokens_per_step,
+            StreamId.LOWDIM: window_fcst * layout.lowdim_slots,
         }
     raise ValueError(f"unhandled mode {mode}")  # pragma: no cover
 
@@ -362,8 +421,11 @@ def build_batch_masks(
     shape_rng = np.random.Generator(np.random.PCG64(derive_mask_seed(base_seed, step, -2)))
     window_tac = int(shape_rng.choice(np.asarray(spec.tactile_window_steps)))
     window_vid = int(shape_rng.choice(np.asarray(spec.video_window_steps)))
+    # Drawn AFTER the two above so the window_tac/window_vid streams stay bit-identical to runs
+    # that predate mode F -- a third draw inserted earlier would reshuffle every existing mode.
+    window_fcst = int(shape_rng.choice(np.asarray(spec.forecast_horizon_steps)))
 
-    tgt_counts = expected_target_counts(spec, mode, window_tac, window_vid)
+    tgt_counts = expected_target_counts(spec, mode, window_tac, window_vid, window_fcst)
     ctx_counts = {s: layout.stream_counts()[s] - tgt_counts[s] for s in STREAM_ORDER}
 
     num_tgt = sum(tgt_counts.values())
@@ -377,7 +439,7 @@ def build_batch_masks(
         sample_index = rank * batch_size + row + step * world_size * batch_size
         seed = derive_mask_seed(base_seed, step, sample_index)
         rng = np.random.Generator(np.random.PCG64(seed))
-        per_stream = _targets_for_mode(rng, spec, mode, window_tac, window_vid)
+        per_stream = _targets_for_mode(rng, spec, mode, window_tac, window_vid, window_fcst)
 
         tgt = np.concatenate([np.sort(per_stream[s]) for s in STREAM_ORDER])
         if tgt.size != num_tgt:
@@ -403,6 +465,10 @@ def build_batch_masks(
         ctx_expert_bounds=ctx_expert_bounds,
         tgt_expert_bounds=tgt_expert_bounds,
         seeds=seeds,
+        num_context_steps=torch.tensor(
+            layout.num_steps - window_fcst if mode is MaskMode.F else layout.num_steps,
+            dtype=torch.int64,
+        ),
     )
 
 
@@ -449,3 +515,23 @@ def assert_mask_invariants(masks: ClipMasks, spec: MaskSpec) -> None:
         lo, hi = (int(v) for v in masks.ctx_expert_bounds[int(expert)])
         if hi - lo < 1 and not (mode is MaskMode.T_HARD and expert is ExpertId.TACTILE):
             raise AssertionError(f"expert {expert.name} has no context tokens in mode {mode.name}")
+
+    if mode is MaskMode.F:
+        # THE property mode F exists for. The encoder never sees mask tokens -- model.py gathers
+        # only ctx_index before attention -- so causality is enforced purely by which indices land
+        # in that row. Nothing else in the file checks it, and if it silently broke, mode F would
+        # quietly become another interpolation mode and the whole retrain would be void.
+        step_ids = layout.step_ids
+        latest_context = int(step_ids[masks.ctx_index].max())
+        earliest_target = int(step_ids[masks.tgt_index].min())
+        if latest_context >= earliest_target:
+            raise AssertionError(
+                f"mode F is not causal: context reaches step {latest_context} but the earliest "
+                f"target is step {earliest_target}; context must be strictly earlier"
+            )
+        expected_context_steps = earliest_target
+        if int(masks.num_context_steps) != expected_context_steps:
+            raise AssertionError(
+                f"num_context_steps={int(masks.num_context_steps)} disagrees with the mask "
+                f"(targets begin at step {expected_context_steps})"
+            )

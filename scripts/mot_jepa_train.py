@@ -44,7 +44,9 @@ from openpi.mot_jepa.clip_dataset import load_domain_config
 from openpi.mot_jepa.ema import EmaTeacher
 from openpi.mot_jepa.losses import MotJepaLoss
 from openpi.mot_jepa.losses import normalize_targets
+from openpi.mot_jepa.masking import MaskMode
 from openpi.mot_jepa.masking import MaskSpec
+from openpi.mot_jepa.masking import assert_mask_invariants
 from openpi.mot_jepa.masking import build_batch_masks
 from openpi.mot_jepa.model import ClipInputs
 from openpi.mot_jepa.model import MotJepaStudent
@@ -341,6 +343,7 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
         tactile_window_steps=cfg.masking.tactile_window_steps,
         video_window_steps=cfg.masking.video_window_steps,
         min_targets_per_stream=cfg.masking.min_targets_per_stream,
+        forecast_horizon_steps=cfg.masking.forecast_horizon_steps,
     )
     probes = ProbeSuite(layout, max_batches=cfg.probe_batches)
     monitor = runtime.PreemptionMonitor(run_dir / "PREEMPT_REQUEST", device)
@@ -358,14 +361,34 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
 
         batch = next(loader_iter)
         inputs = to_inputs(batch, device)
-        masks = build_batch_masks(
+        cpu_masks = build_batch_masks(
             mask_spec,
             step=global_step,
             batch_size=cfg.local_batch_size,
             base_seed=cfg.seed,
             rank=rank,
             world_size=world_size,
-        ).to(device)
+        )
+        if global_step == 0:
+            # Checked in the run that depends on it, not only in the test suite. The whole premise
+            # of MaskMode.F is that its context is strictly earlier than its targets, and that is
+            # enforced only by which indices reach `ctx_index` -- if it silently broke, F would
+            # quietly become another interpolation mode and the entire pretrain would be void.
+            # One call over one batch; free relative to a 100k-step run.
+            for probe_step in range(len(MaskMode) * 8):
+                assert_mask_invariants(
+                    build_batch_masks(
+                        mask_spec,
+                        step=probe_step,
+                        batch_size=min(2, cfg.local_batch_size),
+                        base_seed=cfg.seed,
+                        rank=rank,
+                        world_size=world_size,
+                    ),
+                    mask_spec,
+                )
+            logger.info("mask invariants hold for every mode, including F's causal split")
+        masks = cpu_masks.to(device)
 
         lr = lr_at(global_step, peak=cfg.lr_peak, end=cfg.lr_end, warmup=cfg.lr_warmup_steps, total=cfg.num_train_steps)
         for group in optimizer.param_groups:

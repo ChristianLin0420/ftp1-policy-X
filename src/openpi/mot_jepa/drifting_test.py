@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from openpi.mot_jepa.action_dit import ActionDiT
@@ -23,13 +24,13 @@ LAYOUT = CONFIGS["mot_jepa_pilot"].layout
 
 
 def fake_encoded(batch: int, *, generator: torch.Generator | None = None) -> EncoderOutput:
-    return EncoderOutput(
-        tokens=[],
-        sync_readout=[
-            torch.randn(batch, LAYOUT.num_steps, LAYOUT.video_width, generator=generator),
-            torch.randn(batch, LAYOUT.num_steps, LAYOUT.tactile_width, generator=generator),
-        ],
-    )
+    readout = [
+        torch.randn(batch, LAYOUT.num_steps, LAYOUT.video_width, generator=generator),
+        torch.randn(batch, LAYOUT.num_steps, LAYOUT.tactile_width, generator=generator),
+    ]
+    # Heads read final_readout; sync_readout is the loss/probe tensor. Same shape, so the fixture
+    # can share one draw -- but both must be present, because final_readout has no default.
+    return EncoderOutput(tokens=[], sync_readout=readout, final_readout=readout)
 
 
 def test_observation_constrained_dimensions_get_the_extra_pull():
@@ -340,7 +341,7 @@ def test_ridge_head_reproduces_the_fitting_script_composition(tmp_path):
         blob[f"scale_{domain}"] = rng.uniform(0.5, 2.0, size=features).astype(np.float32)
         blob[f"weights_{domain}"] = rng.normal(size=(features + 1, horizon * action_dim)).astype(np.float32)
     path = tmp_path / "ridge.npz"
-    np.savez(path, **blob)
+    np.savez(path, readout=np.array("final_readout"), **blob)
 
     head = RidgeHead(path, LAYOUT, horizon=horizon)
     assert head.fitted_domains == [0, 2]
@@ -359,6 +360,26 @@ def test_ridge_head_reproduces_the_fitting_script_composition(tmp_path):
             rtol=1e-4, atol=1e-4, msg=f"domain {domain} does not match the fitting script",
         )
     assert (out[1] == 0).all(), "an unfitted domain must predict zero, not another domain's map"
+
+
+def test_ridge_fitted_on_the_other_readout_is_refused(tmp_path):
+    """A stale ridge must not load. sync_readout and final_readout have IDENTICAL widths, so the
+    shape check passes and the head would silently score a model fitted on a different tensor --
+    the one place in this pipeline where a stale artifact produces a plausible wrong number.
+    """
+    features = LAYOUT.num_steps * (LAYOUT.video_width + LAYOUT.tactile_width)
+    rng = np.random.default_rng(1)
+    path = tmp_path / "stale.npz"
+    np.savez(
+        path,
+        domains=np.array(["a"]),
+        readout=np.array("sync_readout"),
+        mean_0=rng.normal(size=features).astype(np.float32),
+        scale_0=np.ones(features, dtype=np.float32),
+        weights_0=rng.normal(size=(features + 1, 4 * 120)).astype(np.float32),
+    )
+    with pytest.raises(ValueError, match="fitted on"):
+        RidgeHead(path, LAYOUT, horizon=4)
 
 
 def test_ridge_head_pairs_with_an_identity_normalizer():

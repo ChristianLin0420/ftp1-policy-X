@@ -68,7 +68,7 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, dict[str, l
         lowdim = batch["lowdim"].to(device).float()
         with torch.autocast(device.type, torch.bfloat16, enabled=device.type == "cuda"):
             encoded = backbone.encode_full(ClipInputs(video=video, gel=gel, lowdim=lowdim))
-        features = torch.cat([r.float().flatten(start_dim=1) for r in encoded.sync_readout], dim=-1).cpu().numpy()
+        features = torch.cat([r.float().flatten(start_dim=1) for r in encoded.final_readout], dim=-1).cpu().numpy()
         chunk = batch["action_chunk"].numpy()
         mask = batch["chunk_mask"].numpy()
         for row, domain in enumerate(batch["domain_id"].tolist()):
@@ -220,6 +220,11 @@ def main() -> int:
         np.savez(
             args.out,
             domains=np.array([names[d] for d in sorted(models)]),
+            # Which encoder tensor these weights were fitted on. The policy feature moved from
+            # sync_readout (layer-S snapshot) to final_readout (last block) and the WIDTH is
+            # identical, so without this stamp a ridge fitted on the old tensor loads against the
+            # new one with no error and quietly scores a different model.
+            readout=np.array("final_readout"),
             **{f"mean_{d}": models[d][0] for d in models},
             **{f"scale_{d}": models[d][1] for d in models},
             **{f"weights_{d}": models[d][2] for d in models},

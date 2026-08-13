@@ -73,3 +73,63 @@ def test_rejects_wrong_shapes():
         chunk_to_absolute_qpos8(np.zeros((4, 7), dtype=np.float32), np.zeros(8, dtype=np.float32))
     with pytest.raises(ValueError, match="qpos8_base must be"):
         chunk_to_absolute_qpos8(np.zeros((4, ACTION_DIM), dtype=np.float32), np.zeros(7, dtype=np.float32))
+
+
+def _stub_policy(frame_stride: int, num_frames: int = 4):
+    """A policy with no backbone or head: only the ring buffer is under test."""
+    from openpi.mot_jepa.config import CONFIGS
+    from openpi.mot_jepa.deploy import MotJepaRidgePolicy
+
+    policy = MotJepaRidgePolicy.__new__(MotJepaRidgePolicy)
+    policy.layout = CONFIGS["mot_jepa_pilot"].layout
+    policy.num_frames = num_frames
+    policy.frame_stride = frame_stride
+    policy._frames = []
+    return policy
+
+
+def _push(policy, tag: int) -> None:
+    policy._frames.append({"video": tag, "gel": tag})
+    if len(policy._frames) > (policy.num_frames - 1) * policy.frame_stride + 1:
+        policy._frames.pop(0)
+
+
+def _window_tags(policy) -> list[int]:
+    frames = policy._frames[::-1][:: policy.frame_stride][::-1]
+    pad = [frames[0]] * (policy.num_frames - len(frames))
+    return [f["video"] for f in (pad + frames)[-policy.num_frames :]]
+
+
+def test_frame_stride_decimates_and_always_keeps_the_newest_observation():
+    """The encoder must see the trained frame RATE, anchored to now.
+
+    RoPE `t` is the tubelet index and carries no rate, so an encoder handed a different frame
+    spacing than it trained on cannot tell -- it silently sees a slower or faster world. And the
+    newest frame must always survive decimation: the action depends on where the motion is *now*,
+    so anchoring the subsample to the oldest frame would act on stale observations forever.
+    """
+    policy = _stub_policy(frame_stride=2, num_frames=4)
+    for tag in range(20):
+        _push(policy, tag)
+        window = _window_tags(policy)
+        assert len(window) == policy.num_frames, f"window is {len(window)}, expected {policy.num_frames}"
+        assert window[-1] == tag, f"newest frame {tag} missing from window {window}"
+    # Once warm, spacing is exactly frame_stride control steps.
+    assert _window_tags(policy) == [13, 15, 17, 19]
+
+
+def test_stride_one_reproduces_consecutive_frames():
+    """The widened stride must not change behaviour when it is set back to 1."""
+    policy = _stub_policy(frame_stride=1, num_frames=4)
+    for tag in range(10):
+        _push(policy, tag)
+    assert _window_tags(policy) == [6, 7, 8, 9]
+
+
+def test_cold_start_pads_with_the_oldest_frame_and_still_ends_at_now():
+    """Before the buffer fills, edge-padding is a documented deviation -- but not at the tail."""
+    policy = _stub_policy(frame_stride=2, num_frames=4)
+    _push(policy, 0)
+    assert _window_tags(policy) == [0, 0, 0, 0]
+    _push(policy, 1)
+    assert _window_tags(policy)[-1] == 1

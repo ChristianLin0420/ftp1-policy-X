@@ -308,6 +308,7 @@ def train(cfg: config_module.PolicyConfig) -> None:
         encoded = type(encoded)(
             tokens=[t.float() for t in encoded.tokens],
             sync_readout=[t.float() for t in encoded.sync_readout],
+            final_readout=[t.float() for t in encoded.final_readout],
         )
 
         if cfg.head.objective == "drifting":

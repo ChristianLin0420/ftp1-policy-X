@@ -42,6 +42,11 @@ def tiny_spec(mode: MaskMode | None = None) -> MaskSpec:
         mode_probs=tuple(probs),
         tactile_window_steps=(1,),
         video_window_steps=(1,),
+        # Scaled to TINY_LAYOUT exactly as the windows above are. num_steps is 2 here, so the
+        # production defaults (horizon 2-3, min_context 4) cannot fit -- and should not: the
+        # guard that rejects them is the one that keeps a real run from starving its own context.
+        forecast_horizon_steps=(1,),
+        min_context_steps=1,
         min_targets_per_stream=2,
     )
 

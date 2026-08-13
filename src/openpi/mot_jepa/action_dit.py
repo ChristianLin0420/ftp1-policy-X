@@ -188,7 +188,7 @@ def timestep_embedding(t: torch.Tensor, width: int, *, max_period: float = 10_00
 class ActionDiT(nn.Module):
     """Frozen encoder readout -> future action chunk.
 
-    The head owns no encoder. It consumes :attr:`EncoderOutput.sync_readout`, the per-tubelet
+    The head owns no encoder. It consumes :attr:`EncoderOutput.final_readout`, the per-tubelet
     unimodal readout, because that is the representation the viability gate measured -- the ridge
     that recovered the action chunk at R^2 0.32 pooled read exactly these tokens. Conditioning on
     the final tokens instead would condition on something never gated.
@@ -238,7 +238,7 @@ class ActionDiT(nn.Module):
 
     def context_tokens(self, encoded: EncoderOutput) -> tuple[torch.Tensor, torch.Tensor]:
         """``(B, 2*num_steps, width)`` cross-attention memory and the ``(B, width)`` adaLN vector."""
-        projected = [proj(readout.to(proj.weight.dtype)) for proj, readout in zip(self.context_proj, encoded.sync_readout, strict=True)]
+        projected = [proj(readout.to(proj.weight.dtype)) for proj, readout in zip(self.context_proj, encoded.final_readout, strict=True)]
         context = self.context_norm(torch.cat(projected, dim=1))
         return context, context.mean(dim=1)
 
@@ -294,8 +294,8 @@ class ActionDiT(nn.Module):
         The 1-NFE claim is the headline reason to prefer drifting for a high-rate controller, so
         it is asserted by a test rather than left as a comment.
         """
-        batch = encoded.sync_readout[0].shape[0]
-        device = encoded.sync_readout[0].device
+        batch = encoded.final_readout[0].shape[0]
+        device = encoded.final_readout[0].device
         x = torch.randn(batch, self.config.horizon, self.action_dim, device=device, generator=generator)
 
         if self.config.objective == "drifting":
@@ -401,7 +401,7 @@ class LinearHead(nn.Module):
         domain_id: torch.Tensor,
     ) -> torch.Tensor:
         del noisy_actions, timestep, action_mask  # deterministic: conditioning is the readout alone
-        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1)
+        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.final_readout], dim=-1)
         normed = self.norm(flat.to(self.trunk.weight.dtype))
         hidden = self.trunk(normed, domain_id) if self.config.per_domain_trunk else self.trunk(normed)
         out = self.proj(hidden, domain_id)
@@ -410,8 +410,8 @@ class LinearHead(nn.Module):
     @torch.no_grad()
     def sample(self, encoded, action_mask, domain_id, *, num_steps: int = 10, generator=None) -> torch.Tensor:
         del num_steps, generator
-        batch = encoded.sync_readout[0].shape[0]
-        device = encoded.sync_readout[0].device
+        batch = encoded.final_readout[0].shape[0]
+        device = encoded.final_readout[0].device
         zeros = torch.zeros(batch, self.config.horizon, self.action_dim, device=device)
         return self(encoded, action_mask, zeros, torch.zeros(batch, device=device), domain_id)
 
@@ -465,6 +465,15 @@ class RidgeHead(nn.Module):
         self.horizon = horizon
         self.action_dim = action_dim
         self.names = [str(n) for n in blob["domains"]]
+        # The shape check below cannot catch a ridge fitted on the OTHER readout: sync_readout and
+        # final_readout have identical widths, so a stale .npz loads clean and silently evaluates
+        # a different model. Refuse it by name instead.
+        fitted_on = str(blob["readout"]) if "readout" in blob else "sync_readout"
+        if fitted_on != "final_readout":
+            raise ValueError(
+                f"{path} was fitted on {fitted_on!r}, but heads read final_readout. The two have "
+                "the same width, so this would load silently -- refit the ridge."
+            )
         features = layout.num_steps * (layout.video_width + layout.tactile_width)
 
         # Which keys exist is the source of truth for which domains were fitted -- the script skips
@@ -482,7 +491,7 @@ class RidgeHead(nn.Module):
 
     def forward(self, encoded: EncoderOutput, action_mask, noisy_actions, timestep, domain_id) -> torch.Tensor:
         del noisy_actions, timestep, action_mask
-        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.sync_readout], dim=-1).float()
+        flat = torch.cat([r.flatten(start_dim=1) for r in encoded.final_readout], dim=-1).float()
         out = flat.new_zeros(flat.shape[0], self.horizon * self.action_dim)
         for domain in torch.unique(domain_id).tolist():
             if domain not in self.fitted_domains:
@@ -498,7 +507,7 @@ class RidgeHead(nn.Module):
     @torch.no_grad()
     def sample(self, encoded, action_mask, domain_id, *, num_steps: int = 10, generator=None) -> torch.Tensor:
         del num_steps, generator
-        batch = encoded.sync_readout[0].shape[0]
-        device = encoded.sync_readout[0].device
+        batch = encoded.final_readout[0].shape[0]
+        device = encoded.final_readout[0].device
         zeros = torch.zeros(batch, self.horizon, self.action_dim, device=device)
         return self(encoded, action_mask, zeros, torch.zeros(batch, device=device), domain_id)
