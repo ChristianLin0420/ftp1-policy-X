@@ -48,6 +48,15 @@ OUTDIR="${OUTDIR:-/lustre/fsw/portfolios/edgeai/users/chrislin/univtac-gate3}"
 # success rate measured against it is NOT comparable to UniVTAC's published numbers. See
 # ${ASSETS}/SUBSTITUTION_NOTE.md.
 ASSETS="${ASSETS:-/lustre/fsw/portfolios/edgeai/users/chrislin/tacex-assets}"
+# Optional single-file overlay for diagnostics. Set PATCH_BASE_TASK to a modified copy of
+# envs/_base_task.py and it is mounted over the original INSIDE the container only -- the working
+# tree keeps no diff, which matters because these prints are for one investigation and must not
+# survive into a result run by accident.
+PATCH_MOUNT=""
+if [[ -n "${PATCH_BASE_TASK:-}" ]]; then
+  PATCH_MOUNT=",${PATCH_BASE_TASK}:${WORK}/UniVTAC/envs/_base_task.py"
+  echo "PATCHED _base_task.py <- ${PATCH_BASE_TASK}"
+fi
 RESULT="${WORK}/logs/_uipc_gate3_${SLURM_JOB_ID}.json"
 RUN_SH="${WORK}/logs/_uipc_gate3_${SLURM_JOB_ID}.sh"
 
@@ -121,7 +130,10 @@ export ENABLE_CAMERAS=1
 # ~2h50m, inside the 3h55m job limit. The 20-minute cap was set after a CUDA-assert HANG; with
 # the real assets the sim genuinely progresses at roughly 67 s/seed, and 18 seeds is far too
 # few to conclude the scripted expert never succeeds.
-timeout 10200 "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
+# episode_num counts SUCCESSES, not attempts, so with a 0% expert it never returns on its own;
+# the inner timeout is the only bound and MUST stay below the SLURM --time or the job dies before
+# writing its verdict.
+timeout "${RUN_SECONDS:-10200}" "${PY}" scripts/collect_data.py "${TASK_IN}" "${CONFIG_IN}" \
   --episode_num "${EPISODES_IN}"
 echo "collect_data rc=$?"
 
@@ -180,12 +192,13 @@ INNER
 export UNIVTAC="${WORK}/UniVTAC"
 export RESULT_IN="${RESULT}" TASK_IN="${TASK}" CONFIG_IN="${CONFIG}"
 export EPISODES_IN="${EPISODES}" OUTDIR_IN="${OUTDIR}"
+export RUN_SECONDS="${RUN_SECONDS:-10200}"
 
 echo "[$(date -Is)] gate3: ${TASK} x ${EPISODES} episodes, image=${IMAGE}"
 srun --container-image="${IMAGE}" \
      --container-remap-root --container-writable \
      --container-save="${IMAGE}" \
-     --container-mounts=/lustre:/lustre,${ASSETS}:${WORK}/UniVTAC/third_party/TacEx/source/tacex_assets/tacex_assets/data \
+     --container-mounts=/lustre:/lustre,${ASSETS}:${WORK}/UniVTAC/third_party/TacEx/source/tacex_assets/tacex_assets/data${PATCH_MOUNT} \
      bash "${RUN_SH}"
 
 echo "[$(date -Is)] srun rc=$?"
