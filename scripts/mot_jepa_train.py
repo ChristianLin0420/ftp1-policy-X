@@ -349,6 +349,9 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
     monitor = runtime.PreemptionMonitor(run_dir / "PREEMPT_REQUEST", device)
 
     records: list[dict[str, float]] = []
+    # Last probe result, carried so the step log can print a fixed-reference signal. Empty
+    # until the first probe, which prints as nan rather than a misleading zero.
+    last_probe: dict[str, float] = {}
     loader_iter = iter(loader)
     preempted = False
     window_start = time.time()
@@ -436,13 +439,27 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
             elapsed = time.time() - window_start
             metrics["clips_per_second"] = cfg.log_interval * cfg.local_batch_size * world_size / max(elapsed, 1e-6)
             if runtime.is_main_process():
+                # `loss` RISES for the first ~10k steps of a healthy run and that is not a fault.
+                # The JEPA target is an EMA of the student, so the loss measures the distance to a
+                # LAGGING COPY OF ITSELF, and that distance grows mechanically as lr and the
+                # teacher's lag grow. Measured across three runs (probe2, probe3, forecast100k) the
+                # minimum lands at step 1050 every time and is never revisited -- probe2's global
+                # minimum over all 50k steps is at step 1050, and probe2 is the backbone that went
+                # on to produce a working policy.
+                #
+                # `rank` is the fixed-reference signal to read instead: RankMe over the video
+                # stream, carried from the last probe. It rises monotonically while the loss
+                # doubles. Printing it on every log line means nobody has to infer training health
+                # from a quantity that cannot show it.
                 logger.info(
-                    "step %d loss %.4f grad %.3f lr %.2e drift %.3e %.1f clips/s",
+                    "step %d loss %.4f grad %.3f lr %.2e drift %.3e rank %.0f/%.0f %.1f clips/s",
                     global_step,
                     metrics.get("loss", float("nan")),
                     metrics.get("grad_norm", float("nan")),
                     lr,
                     metrics.get("ema_drift_rel", 0.0),
+                    last_probe.get("rankme_video", float("nan")),
+                    last_probe.get("rankme_tactile", float("nan")),
                     metrics["clips_per_second"],
                 )
                 if cfg.wandb_enabled:
@@ -476,6 +493,8 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
             except Exception:
                 logger.exception("probes failed at step %d; continuing", global_step)
 
+            if probe_metrics:
+                last_probe = dict(probe_metrics)
             if probe_metrics and runtime.is_main_process():
                 logger.info("probes @%d: %s", global_step, probe_metrics)
                 if cfg.wandb_enabled:

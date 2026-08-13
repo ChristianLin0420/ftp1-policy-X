@@ -64,7 +64,15 @@ class DataConfig:
 class EmaConfig:
     decay_start: float = 0.998
     decay_end: float = 0.99999
-    warmup_steps: int = 30_000
+    warmup_steps: int = 16_000
+    """ALIGNED with ``lr_warmup_steps``. They previously ran 8k and 30k, so the student reached
+    full speed at 8k while the teacher was only 3% through its ramp, and the teacher then kept
+    slowing for another 22k steps. Both ends of the moving target moved on different clocks, and
+    the training loss rose from step ~1050 until well past 10k as a result.
+
+    I-JEPA ramps learning rate and EMA momentum over the same window. Finishing both at 16k gives
+    a genuinely stationary objective afterwards, so a loss change past that point means something
+    about the model rather than about the schedule."""
     sync_check_interval: int = 5_000
     """How often ranks compare shadow checksums; a silent divergence is otherwise invisible."""
 
@@ -104,9 +112,14 @@ class MotJepaTrainConfig:
     seed: int = 42
     local_batch_size: int = 8
     num_train_steps: int = 200_000
-    lr_peak: float = 1.5e-3
+    lr_peak: float = 1.0e-3
+    """Lowered from 1.5e-3. The loss rise tracks lr almost exactly over the warmup, and the run was
+    stable at the old peak (grad norms 0.13-0.79), so this is a modest trade of headroom for a
+    gentler ramp rather than a stability fix."""
     lr_end: float = 1e-6
-    lr_warmup_steps: int = 8_000
+    lr_warmup_steps: int = 16_000
+    """Doubled from 8k, and matched to ``EmaConfig.warmup_steps`` so the two schedules end
+    together."""
     weight_decay: float = 0.04
     beta1: float = 0.9
     beta2: float = 0.95
