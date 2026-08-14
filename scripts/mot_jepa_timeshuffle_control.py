@@ -141,13 +141,29 @@ def _time_residual(tensor: torch.Tensor) -> torch.Tensor:
     return (tensor - tensor.mean(dim=1, keepdim=True)).flatten(start_dim=1)
 
 
+#: Both readouts, measured on the SAME clips in one pass so they are directly comparable.
+#:
+#: ``sync_readout`` is snapshotted at layer 4 of 12 (``mot_encoder.py:249``), before the first
+#: global layer; ``final_readout`` is the layer-12 pooled output and is what every downstream
+#: consumer deploys. Measuring only ``sync`` would risk a false null on the one number that gates
+#: everything else: the forecasting gradient arrives via layer-12 tokens, and nothing forbids the
+#: encoder from satisfying mode F inside layers 5-11 while leaving the layer-4 readout a pure
+#: per-step appearance code. That would read as "forecasting did nothing" about a change that
+#: worked. ``sync`` is kept because the pre-registered 0.005 baseline was measured on it.
+READOUTS = ("sync", "final")
+
+
 @torch.no_grad()
 def collect(backbone, loader, device, num_batches: int) -> dict[str, list[float]]:
-    """Displacement under each shuffle, pooled and unpooled, in units of between-clip spread."""
+    """Displacement under each shuffle, per readout and pooled/unpooled, in units of spread."""
+    keys = [
+        f"{readout}_{pooling}_{suffix}"
+        for readout in READOUTS
+        for pooling in ("pooled", "unpooled")
+        for suffix in ("shared", "persample", "spread")
+    ]
     out: dict[str, list[float]] = {key: [] for key in (
-        "pooled_shared", "pooled_persample", "unpooled_shared", "unpooled_persample",
-        "pooled_spread", "unpooled_spread",
-        "input_persample", "input_spread", "gel_temporal_variation",
+        *keys, "input_persample", "input_spread", "gel_temporal_variation",
     )}
 
     for index, batch in enumerate(loader):
@@ -159,35 +175,43 @@ def collect(backbone, loader, device, num_batches: int) -> dict[str, list[float]
             lowdim=batch["lowdim"].to(device).float(),
         )
 
-        def tactile_readout(clip: ClipInputs) -> torch.Tensor:
-            # Expert 1 is the tactile expert; (B, num_steps, width).
-            return backbone.encode_full(clip).sync_readout[1].float()
+        def tactile_readouts(clip: ClipInputs) -> dict[str, torch.Tensor]:
+            # Expert 1 is the tactile expert; each is (B, num_steps, width). One forward, both
+            # readouts, so sync and final are never compared across different clips.
+            encoded = backbone.encode_full(clip)
+            return {
+                "sync": encoded.sync_readout[1].float(),
+                "final": encoded.final_readout[1].float(),
+            }
 
-        real = tactile_readout(inputs)
-        shared = tactile_readout(
-            ClipInputs(inputs.video, permute_time_shared(inputs.gel, seed=0),
-                       permute_time_shared(inputs.lowdim, seed=0))
-        )
-        per_sample = tactile_readout(
-            ClipInputs(inputs.video, permute_time_per_sample(inputs.gel, seed=0),
-                       permute_time_per_sample(inputs.lowdim, seed=0))
-        )
+        variants = {
+            "real": tactile_readouts(inputs),
+            "shared": tactile_readouts(
+                ClipInputs(inputs.video, permute_time_shared(inputs.gel, seed=0),
+                           permute_time_shared(inputs.lowdim, seed=0))
+            ),
+            "per_sample": tactile_readouts(
+                ClipInputs(inputs.video, permute_time_per_sample(inputs.gel, seed=0),
+                           permute_time_per_sample(inputs.lowdim, seed=0))
+            ),
+        }
 
-        # Pooled: exactly what the probe compares -- mean over the time axis.
-        pooled = {name: value.mean(dim=1) for name, value in
-                  (("real", real), ("shared", shared), ("per_sample", per_sample))}
-        # Unpooled: the same content with the time axis kept, flattened so a single cosine sees
-        # per-step structure. This is what the encoder produced before the readout averaged it.
-        flat = {name: value.flatten(start_dim=1) for name, value in
-                (("real", real), ("shared", shared), ("per_sample", per_sample))}
+        for readout in READOUTS:
+            # Pooled: exactly what the probe compares -- mean over the time axis.
+            pooled = {name: v[readout].mean(dim=1) for name, v in variants.items()}
+            # Unpooled: the same content with the time axis kept, flattened so a single cosine
+            # sees per-step structure -- what the encoder produced before the readout averaged it.
+            flat = {name: v[readout].flatten(start_dim=1) for name, v in variants.items()}
 
-        pooled_spread = between_clip_distance(pooled["real"])
-        flat_spread = between_clip_distance(flat["real"])
-        out["pooled_spread"].append(pooled_spread)
-        out["unpooled_spread"].append(flat_spread)
-        for tag, name in (("shared", "shared"), ("persample", "per_sample")):
-            out[f"pooled_{tag}"].append(float((1.0 - _cosine_rows(pooled["real"], pooled[name])).mean()))
-            out[f"unpooled_{tag}"].append(float((1.0 - _cosine_rows(flat["real"], flat[name])).mean()))
+            out[f"{readout}_pooled_spread"].append(between_clip_distance(pooled["real"]))
+            out[f"{readout}_unpooled_spread"].append(between_clip_distance(flat["real"]))
+            for tag, name in (("shared", "shared"), ("persample", "per_sample")):
+                out[f"{readout}_pooled_{tag}"].append(
+                    float((1.0 - _cosine_rows(pooled["real"], pooled[name])).mean())
+                )
+                out[f"{readout}_unpooled_{tag}"].append(
+                    float((1.0 - _cosine_rows(flat["real"], flat[name])).mean())
+                )
 
         # Input side, on the same clips and the same per-sample permutation: how much does the
         # SHUFFLE ITSELF change what the encoder was given? This is the denominator for every
@@ -201,8 +225,8 @@ def collect(backbone, loader, device, num_batches: int) -> dict[str, list[float]
         )
 
         if index == 0:
-            logger.info("readout %s -> pooled %s, flat %s",
-                        tuple(real.shape), tuple(pooled["real"].shape), tuple(flat["real"].shape))
+            for readout in READOUTS:
+                logger.info("%s readout %s", readout, tuple(variants["real"][readout].shape))
             logger.info("gel %s", tuple(inputs.gel.shape))
     return out
 
@@ -233,18 +257,17 @@ def main() -> int:
 
     results = collect(backbone, loader, device, args.batches)
 
-    pooled_spread = float(np.mean(results["pooled_spread"]))
-    flat_spread = float(np.mean(results["unpooled_spread"]))
     print(f"\nbackbone step {step}, {args.batches} batches of {args.batch_size}")
-    print(f"between-clip spread (1-cos):  pooled {pooled_spread:.5f}   unpooled {flat_spread:.5f}")
-    print(f"\n{'readout':12s} {'shuffle':12s} {'displacement':>14s} {'/ spread':>12s}")
+    print(f"\n{'layer':7s} {'pooling':10s} {'shuffle':11s} {'displacement':>14s} {'/ spread':>12s}")
     verdict: dict[str, float] = {}
-    for readout, spread in (("pooled", pooled_spread), ("unpooled", flat_spread)):
-        for shuffle in ("shared", "persample"):
-            value = float(np.mean(results[f"{readout}_{shuffle}"]))
-            ratio = value / spread if spread > 0 else float("nan")
-            verdict[f"{readout}_{shuffle}"] = ratio
-            print(f"{readout:12s} {shuffle:12s} {value:14.5f} {ratio:12.3f}")
+    for readout in READOUTS:
+        for pooling in ("pooled", "unpooled"):
+            spread = float(np.mean(results[f"{readout}_{pooling}_spread"]))
+            for shuffle in ("shared", "persample"):
+                value = float(np.mean(results[f"{readout}_{pooling}_{shuffle}"]))
+                ratio = value / spread if spread > 0 else float("nan")
+                verdict[f"{readout}_{pooling}_{shuffle}"] = ratio
+                print(f"{readout:7s} {pooling:10s} {shuffle:11s} {value:14.5f} {ratio:12.3f}")
 
     # The input side, on the same clips and the same permutation: the denominator for all of the
     # above. A latent that does not move is only evidence about the ENCODER if the shuffle moved
@@ -254,15 +277,23 @@ def main() -> int:
     input_ratio = input_displacement / input_spread if input_spread > 0 else float("nan")
     variation = float(np.mean(results["gel_temporal_variation"]))
     verdict["input_persample"] = input_ratio
-    print(f"{'input(gel)':12s} {'persample':12s} {input_displacement:14.5f} {input_ratio:12.3f}")
+    print(f"{'input':7s} {'(gel)':10s} {'persample':11s} {input_displacement:14.5f} {input_ratio:12.3f}")
     print(f"\ngel temporal variation ||x - mean_t x|| / ||x||:  {variation:.5f}")
 
     # Below ~0.1 a quantity has barely budged relative to the natural spread, so no
     # retrieval-based probe could have resolved a gap in it whatever the encoder learned.
+    #
+    # Judged on the BEST of the two readouts, not on `sync` alone. The question is whether the
+    # ENCODER represents order anywhere; if only the layer-12 readout moves, order is present and
+    # the layer-4 snapshot is simply the wrong place to look for it. Reporting the sync number
+    # alone would turn that into a false null on the measurement that gates everything else.
     input_moves = input_ratio >= 0.1
-    pooled_blind = verdict["pooled_persample"] < 0.1
-    encoder_sees = verdict["unpooled_persample"] >= 0.1
+    pooled_blind = max(verdict[f"{r}_pooled_persample"] for r in READOUTS) < 0.1
+    encoder_sees = max(verdict[f"{r}_unpooled_persample"] for r in READOUTS) >= 0.1
+    moved = [r for r in READOUTS if verdict[f"{r}_unpooled_persample"] >= 0.1]
     print("\nverdict:")
+    if moved:
+        print(f"  order is visible in: {', '.join(moved)} (of {', '.join(READOUTS)})")
     if not input_moves:
         print("  THE INPUT ITSELF BARELY CHANGES under a full temporal scramble. The frames in a")
         print("  clip are near-duplicates, so an order-blind encoder is the CORRECT answer and")
