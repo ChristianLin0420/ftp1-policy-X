@@ -64,15 +64,36 @@ class DataConfig:
 class EmaConfig:
     decay_start: float = 0.998
     decay_end: float = 0.99999
-    warmup_steps: int = 16_000
-    """ALIGNED with ``lr_warmup_steps``. They previously ran 8k and 30k, so the student reached
-    full speed at 8k while the teacher was only 3% through its ramp, and the teacher then kept
-    slowing for another 22k steps. Both ends of the moving target moved on different clocks, and
-    the training loss rose from step ~1050 until well past 10k as a result.
+    warmup_steps: int | None = None
+    """``None`` means ramp across the WHOLE run (``num_train_steps``); see
+    :meth:`MotJepaTrainConfig.ema_warmup_steps`. Do not set this to a short window.
 
-    I-JEPA ramps learning rate and EMA momentum over the same window. Finishing both at 16k gives
-    a genuinely stationary objective afterwards, so a loss change past that point means something
-    about the model rather than about the schedule."""
+    ``decay_end`` is 0.99999, a half-life of 69,314 steps. Whenever the ramp finishes, the teacher
+    stops being a moving average and becomes a fixed snapshot -- and a teacher that tracks the
+    student is the entire collapse-prevention mechanism in JEPA. Once it stops tracking, nothing
+    re-anchors the student and its between-clip dispersion decays.
+
+    Measured on three runs, each turning at *its own* ramp end and nowhere else. The number is
+    ``student_dispersion / teacher_dispersion`` on the tactile expert; the teacher's own dispersion
+    stays flat throughout, so this is the student leaving, not the target moving:
+
+    ===============  ==============  ===================================
+    run              ramp ends       ratio after
+    ===============  ==============  ===================================
+    probe2           30k of 50k      0.86 -> 0.83, rankme_tactile held
+    probe3           30k of 50k      0.93 -> 0.37 by 38k -> 0.24 by 50k
+    forecast100k     16k of 100k     0.97 -> 0.69 by 34k
+    ===============  ==============  ===================================
+
+    forecast100k is the one this note exists for. Aligning the ramp to ``lr_warmup_steps`` was a
+    fix for the loss curve rising over warmup; it worked (the minimum moved from step 1050 to
+    1850) but it moved the freeze from 60% of a 50k run to 16% of a 100k one, and the tactile
+    representation collapsed from step ~26k: RankMe 108 -> 66, gradient norm 0.19 -> 2.66 against
+    a clip of 1.0, with loss flat at 0.81 throughout. A flat loss hides this completely.
+
+    BYOL, DINO, I-JEPA and V-JEPA all ramp momentum toward 1.0 over the full training length, so
+    the teacher's tracking rate always matches how much training remains. Reaching the terminal
+    momentum early is the bug; reaching it at the last step is the design."""
     sync_check_interval: int = 5_000
     """How often ranks compare shadow checksums; a silent divergence is otherwise invisible."""
 
@@ -118,8 +139,10 @@ class MotJepaTrainConfig:
     gentler ramp rather than a stability fix."""
     lr_end: float = 1e-6
     lr_warmup_steps: int = 16_000
-    """Doubled from 8k, and matched to ``EmaConfig.warmup_steps`` so the two schedules end
-    together."""
+    """Doubled from 8k. This is the LEARNING RATE warmup and is deliberately no longer tied to
+    ``EmaConfig.warmup_steps``: the two schedules answer different questions. The lr ramp protects
+    the first few thousand steps; the EMA ramp has to span the run, because its end point is where
+    the teacher stops tracking. Tying them made the teacher freeze at 16% of training."""
     weight_decay: float = 0.04
     beta1: float = 0.9
     beta2: float = 0.95
@@ -146,6 +169,20 @@ class MotJepaTrainConfig:
     find_unused_parameters: bool = True
     """Required: mask mode ``T_HARD`` removes tactile entirely, so the student's tactile
     encoder legitimately receives no gradient on ~10% of steps."""
+
+    @property
+    def ema_warmup_steps(self) -> int:
+        """Resolved EMA ramp length: ``ema.warmup_steps`` if set, else the whole run.
+
+        Spanning the run is the default because the ramp's END is where the teacher stops
+        tracking the student, and a teacher that has stopped tracking cannot prevent collapse.
+        Resolved from ``num_train_steps`` rather than baked into each preset so a
+        ``--num_train_steps`` override on the command line moves the EMA schedule with it -- the
+        failure this replaces was exactly a run whose length changed while the teacher's did not.
+        """
+        if self.ema.warmup_steps is not None:
+            return self.ema.warmup_steps
+        return self.num_train_steps
 
     @property
     def layout(self) -> TokenLayout:

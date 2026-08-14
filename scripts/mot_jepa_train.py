@@ -296,7 +296,9 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
         student.backbone,
         decay_start=cfg.ema.decay_start,
         decay_end=cfg.ema.decay_end,
-        warmup_steps=cfg.ema.warmup_steps,
+        # Resolved, not raw: `None` means "ramp across the whole run". See
+        # MotJepaTrainConfig.ema_warmup_steps for the three runs that established why.
+        warmup_steps=cfg.ema_warmup_steps,
         device=device,
         # bf16 runtime weights only pay off under CUDA autocast; on CPU there is no autocast
         # to promote them, so bf16 parameters would meet fp32 activations. The fp32 *shadow*

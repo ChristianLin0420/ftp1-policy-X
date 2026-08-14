@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
@@ -95,6 +96,51 @@ def test_decay_schedule_is_a_pure_function_of_step():
 
 def test_zero_warmup_returns_the_final_decay():
     assert ema_decay_at(0, decay_start=0.1, decay_end=0.9, warmup_steps=0) == 0.9
+
+
+def test_ema_ramp_spans_the_run_and_follows_num_train_steps():
+    """The ramp's end is where the teacher stops tracking, so it must not land mid-run.
+
+    Guards the failure that collapsed forecast100k: the ramp was pinned to a fixed 16k while the
+    run was 100k, so the teacher reached a 69,314-step half-life at 16% of training and the
+    student's tactile representation decayed away from it (RankMe 108 -> 66).
+    """
+    from openpi.mot_jepa.config import CONFIGS
+    from openpi.mot_jepa.config import EmaConfig
+
+    for name, cfg in CONFIGS.items():
+        assert cfg.ema.warmup_steps is None, f"{name} pins the EMA ramp; it must span the run"
+        assert cfg.ema_warmup_steps == cfg.num_train_steps, name
+
+    # An overridden run length must carry the EMA schedule with it -- the exact coupling that
+    # was missing. A preset is 50k; asking for 100k must move the teacher's ramp to 100k too.
+    stretched = dataclasses.replace(CONFIGS["mot_jepa_pilot"], num_train_steps=100_000)
+    assert stretched.ema_warmup_steps == 100_000
+
+    # An explicit value still wins, so smoke tests can pin a short ramp on purpose.
+    pinned = dataclasses.replace(stretched, ema=EmaConfig(warmup_steps=32))
+    assert pinned.ema_warmup_steps == 32
+
+
+def test_terminal_decay_is_only_reached_at_the_very_end_of_training():
+    """At decay_end the half-life (69,314 steps) exceeds any run we train, so reaching it early
+    turns the teacher from a moving average into a fixed snapshot."""
+    from openpi.mot_jepa.config import CONFIGS
+
+    cfg = dataclasses.replace(CONFIGS["mot_jepa_pilot"], num_train_steps=100_000)
+    kwargs = {
+        "decay_start": cfg.ema.decay_start,
+        "decay_end": cfg.ema.decay_end,
+        "warmup_steps": cfg.ema_warmup_steps,
+    }
+    half_life = lambda step: math.log(2) / -math.log(ema_decay_at(step, **kwargs))  # noqa: E731
+
+    # Mid-run the teacher must still track on a timescale far shorter than the steps remaining,
+    # or it cannot re-anchor the student. At the old 16k ramp this was already 69,314.
+    assert half_life(34_000) < 1_000
+    assert half_life(50_000) < 5_000
+    # It is allowed -- and intended -- to become slow only as training ends.
+    assert half_life(100_000) > 50_000
 
 
 def test_state_dict_roundtrip_resumes_the_trajectory_bitwise():
