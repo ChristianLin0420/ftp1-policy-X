@@ -141,11 +141,22 @@ def _watch_attention_logits(student):
     def make_hook(site: str, num_heads: int, head_dim: int):
         def hook(module, inputs, output):
             batch, length, _ = output.shape
+            # An expert can legitimately hold ZERO tokens: MaskMode.T_HARD removes the tactile
+            # stream entirely on ~10% of steps, and torch.max on an empty tensor raises rather
+            # than returning -inf. Skipping is correct -- an expert with no tokens computes no
+            # attention and so has no logit to report. Getting this wrong took down the WHOLE
+            # probe dict, not just this metric: the trainer catches probe exceptions and
+            # continues, so the run trains on with rank, dispersion and retrieval all absent.
+            if length == 0:
+                return
             qkv = output.reshape(batch, length, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
             # float32 for the reduction: in bf16 a large logit rounds coarsely, which is exactly
             # the regime this is meant to report.
             logits = (qkv[0].float() @ qkv[1].float().transpose(-1, -2)) / math.sqrt(head_dim)
-            tracker.record(site, float(logits.abs().max()))
+            worst = logits.abs().max()
+            # A non-finite logit IS the failure being watched for, so surface it as inf rather
+            # than letting a nan silently lose the running maximum comparison.
+            tracker.record(site, float(worst) if torch.isfinite(worst) else float("inf"))
 
         return hook
 

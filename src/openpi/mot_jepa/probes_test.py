@@ -10,14 +10,21 @@ reproduces it in under a second.
 
 from __future__ import annotations
 
-import pytest
 import dataclasses
+import math
+
+import pytest
 import torch
 
+from openpi.mot_jepa.config import CONFIGS
 from openpi.mot_jepa.ema import EmaTeacher
 from openpi.mot_jepa.losses import LossConfig
 from openpi.mot_jepa.losses import MotJepaLoss
 from openpi.mot_jepa.losses import normalize_targets
+from openpi.mot_jepa.masking import MaskMode
+from openpi.mot_jepa.masking import MaskSpec
+from openpi.mot_jepa.masking import build_batch_masks
+from openpi.mot_jepa.model import ClipInputs
 from openpi.mot_jepa.model import MotJepaStudent
 from openpi.mot_jepa.mot_encoder import MoTEncoderConfig
 from openpi.mot_jepa.mot_encoder_test import TINY_LAYOUT
@@ -26,14 +33,10 @@ from openpi.mot_jepa.predictor import MoTPredictorConfig
 from openpi.mot_jepa.probes import ProbeSuite
 from openpi.mot_jepa.probes import _between_clip_dispersion
 from openpi.mot_jepa.probes import _permute_time
+from openpi.mot_jepa.probes import _watch_attention_logits
 from openpi.mot_jepa.probes import cross_modal_retrieval
 from openpi.mot_jepa.probes import donor_ratio
 from openpi.mot_jepa.probes import rankme
-from openpi.mot_jepa.config import CONFIGS
-from openpi.mot_jepa.masking import MaskSpec
-from openpi.mot_jepa.masking import build_batch_masks
-from openpi.mot_jepa.model import ClipInputs
-from openpi.mot_jepa.probes import _watch_attention_logits
 
 BATCH = 4
 
@@ -237,3 +240,36 @@ def test_attention_logit_probe_reports_growth_that_the_loss_cannot():
         model(inputs, masks)
     assert tracker.summary()["attn_logit_max"] > 100.0 * healthy
     assert tracker.worst_site.startswith("pred0.e1"), tracker.worst_site
+
+
+def test_attention_logit_probe_survives_every_mask_mode_including_empty_experts():
+    """Regression: the hook raised on an expert holding zero tokens.
+
+    MaskMode.T_HARD removes the tactile stream entirely, so that expert's qkv output is
+    (B, 0, 3*attn_dim) and torch.max on it raises. The trainer catches probe exceptions and
+    continues, so this did not stop training -- it silently emptied the ENTIRE probe dict, and
+    job 6585654 ran with rank, dispersion, retrieval and the logit all nan. Exercising one
+    arbitrary mask missed it; this walks every mode.
+    """
+    cfg = dataclasses.replace(CONFIGS["mot_jepa_debug"])
+    layout = cfg.layout
+    model = MotJepaStudent(
+        layout, cfg.encoder, cfg.predictor, lowdim_channels=cfg.data.lowdim_channels
+    ).eval()
+    inputs = ClipInputs(
+        video=torch.randn(2, layout.num_frames, 3, layout.video_size, layout.video_size),
+        gel=torch.randn(2, layout.num_frames, layout.num_gel_pads, 3, layout.gel_size, layout.gel_size),
+        lowdim=torch.zeros(2, layout.num_frames, layout.lowdim_slots, cfg.data.lowdim_channels),
+    )
+    spec = MaskSpec(layout=layout)
+
+    seen = set()
+    for step in range(400):
+        masks = build_batch_masks(spec, step=step, batch_size=2, base_seed=7, rank=0, world_size=1)
+        seen.add(int(masks.mode))
+        with torch.no_grad(), _watch_attention_logits(model) as tracker:
+            model(inputs, masks)
+        value = tracker.summary()["attn_logit_max"]
+        assert math.isfinite(value) and value > 0.0, f"mode {masks.mode} at step {step} gave {value}"
+
+    assert len(seen) == len(MaskMode), f"only exercised modes {sorted(seen)}; all must be covered"
