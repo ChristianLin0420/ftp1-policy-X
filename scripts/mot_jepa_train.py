@@ -460,7 +460,8 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
                 # doubles. Printing it on every log line means nobody has to infer training health
                 # from a quantity that cannot show it.
                 logger.info(
-                    "step %d loss %.4f grad %.3f lr %.2e drift %.3e rank %.0f/%.0f %.1f clips/s",
+                    "step %d loss %.4f grad %.3f lr %.2e drift %.3e rank %.0f/%.0f "
+                    "disp %.2f logit %.3g %.1f clips/s",
                     global_step,
                     metrics.get("loss", float("nan")),
                     metrics.get("grad_norm", float("nan")),
@@ -468,6 +469,14 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
                     metrics.get("ema_drift_rel", 0.0),
                     last_probe.get("rankme_video", float("nan")),
                     last_probe.get("rankme_tactile", float("nan")),
+                    # The two quantities that caught the last two failures, carried from the most
+                    # recent probe. `disp` is student/teacher dispersion -- it falls when the
+                    # student drifts off a teacher that stopped tracking. `logit` is the largest
+                    # attention logit -- it grows for thousands of steps before anything else
+                    # reacts, and neither is visible in the loss, which FELL during both failures.
+                    last_probe.get("student_dispersion", float("nan"))
+                    / max(last_probe.get("teacher_dispersion", float("nan")), 1e-9),
+                    last_probe.get("attn_logit_max", float("nan")),
                     metrics["clips_per_second"],
                 )
                 if cfg.wandb_enabled:

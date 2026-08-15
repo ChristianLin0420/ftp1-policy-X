@@ -19,6 +19,7 @@ here is driven by these probes, never by the loss curve.
 from __future__ import annotations
 
 import contextlib
+import math
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -105,6 +106,66 @@ def _permute_time(tensor: torch.Tensor, *, seed: int, time_dim: int = 1) -> torc
     generator = torch.Generator(device="cpu").manual_seed(seed)
     order = torch.randperm(tensor.shape[time_dim], generator=generator).to(tensor.device)
     return tensor.index_select(time_dim, order).contiguous()
+
+
+class _AttentionLogits:
+    """Largest pre-softmax logit seen in any block/expert during one forward.
+
+    This exists because the failure it measures was invisible everywhere else. Job 6569421
+    diverged with predictor block 3's tactile expert reaching a max logit of 164,247,568; the
+    loss FELL to 0.497 while it happened, the dispersion ratio only moved after the gradient had
+    already exploded, and RankMe only moved once the representation was gone. The logit is the
+    quantity that actually grows, and it grows for ~5k steps before anything else reacts.
+
+    Healthy is O(1-100). Anything past ~1e3 means the softmax is saturating toward one-hot.
+    """
+
+    def __init__(self) -> None:
+        self.worst = 0.0
+        self.worst_site = ""
+
+    def record(self, site: str, value: float) -> None:
+        if value > self.worst:
+            self.worst, self.worst_site = value, site
+
+    def summary(self) -> dict[str, float]:
+        return {"attn_logit_max": self.worst}
+
+
+@contextlib.contextmanager
+def _watch_attention_logits(student):
+    """Hook every expert's qkv projection for the duration of one forward."""
+    tracker = _AttentionLogits()
+    handles = []
+
+    def make_hook(site: str, num_heads: int, head_dim: int):
+        def hook(module, inputs, output):
+            batch, length, _ = output.shape
+            qkv = output.reshape(batch, length, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            # float32 for the reduction: in bf16 a large logit rounds coarsely, which is exactly
+            # the regime this is meant to report.
+            logits = (qkv[0].float() @ qkv[1].float().transpose(-1, -2)) / math.sqrt(head_dim)
+            tracker.record(site, float(logits.abs().max()))
+
+        return hook
+
+    module = student.module if hasattr(student, "module") else student
+    for name, stack, cfg in (
+        ("enc", module.backbone.encoder.blocks, module.backbone.encoder.config),
+        ("pred", module.predictor.blocks, module.predictor.blocks[0].config),
+    ):
+        for index, block in enumerate(stack):
+            for expert_id, expert in enumerate(block.experts):
+                handles.append(
+                    expert.qkv.register_forward_hook(
+                        make_hook(f"{name}{index}.e{expert_id}", cfg.num_heads, cfg.head_dim)
+                    )
+                )
+    try:
+        yield tracker
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def _between_clip_dispersion(tokens: torch.Tensor) -> float:
@@ -321,8 +382,9 @@ class ProbeSuite:
             metrics["donor_ratio"] = float("nan")
             metrics["donor_ratio_video"] = float("nan")
             if masks is not None:
-                with amp():
+                with _watch_attention_logits(student) as logits, amp():
                     out = student(inputs, masks)
+                metrics.update(logits.summary())
                 targets = [
                     normalize_targets(_gather_targets(tokens, masks, layout, expert))
                     for expert, tokens in enumerate(teacher_out.tokens)

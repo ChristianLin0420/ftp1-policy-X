@@ -11,6 +11,7 @@ reproduces it in under a second.
 from __future__ import annotations
 
 import pytest
+import dataclasses
 import torch
 
 from openpi.mot_jepa.ema import EmaTeacher
@@ -28,6 +29,11 @@ from openpi.mot_jepa.probes import _permute_time
 from openpi.mot_jepa.probes import cross_modal_retrieval
 from openpi.mot_jepa.probes import donor_ratio
 from openpi.mot_jepa.probes import rankme
+from openpi.mot_jepa.config import CONFIGS
+from openpi.mot_jepa.masking import MaskSpec
+from openpi.mot_jepa.masking import build_batch_masks
+from openpi.mot_jepa.model import ClipInputs
+from openpi.mot_jepa.probes import _watch_attention_logits
 
 BATCH = 4
 
@@ -196,3 +202,38 @@ def test_donor_ratio_is_one_when_the_prediction_ignores_the_clip():
     # Near-perfect rather than exact: an exact match makes true_error zero, which the
     # div-by-zero guard reports as NaN by design.
     assert donor_ratio(target + 1e-3 * torch.randn_like(target), target) > 5.0
+
+
+def test_attention_logit_probe_reports_growth_that_the_loss_cannot():
+    """Guards the early-warning signal for the divergence that killed job 6569421.
+
+    That run's max logit reached 1.6e8 while the loss FELL to 0.497. RankMe and the dispersion
+    ratio only moved after the gradient had already exploded, so this is the only probe that
+    leads the failure rather than trailing it.
+    """
+    cfg = dataclasses.replace(CONFIGS["mot_jepa_debug"])
+    layout = cfg.layout
+    model = MotJepaStudent(
+        layout, cfg.encoder, cfg.predictor, lowdim_channels=cfg.data.lowdim_channels
+    ).eval()
+    inputs = ClipInputs(
+        video=torch.randn(2, layout.num_frames, 3, layout.video_size, layout.video_size),
+        gel=torch.randn(2, layout.num_frames, layout.num_gel_pads, 3, layout.gel_size, layout.gel_size),
+        lowdim=torch.zeros(2, layout.num_frames, layout.lowdim_slots, cfg.data.lowdim_channels),
+    )
+    masks = build_batch_masks(MaskSpec(layout=layout), step=3, batch_size=2, base_seed=1, rank=0, world_size=1)
+
+    with torch.no_grad(), _watch_attention_logits(model) as tracker:
+        model(inputs, masks)
+    healthy = tracker.summary()["attn_logit_max"]
+    assert 0.0 < healthy < 100.0, f"a fresh model should sit at O(1-100), got {healthy}"
+
+    # Inflate one expert the way the diverged run did, and the probe must show it.
+    with torch.no_grad():
+        expert = model.predictor.blocks[0].experts[1]
+        expert.norm1.weight.mul_(50.0)
+        expert.qkv.weight.mul_(50.0)
+    with torch.no_grad(), _watch_attention_logits(model) as tracker:
+        model(inputs, masks)
+    assert tracker.summary()["attn_logit_max"] > 100.0 * healthy
+    assert tracker.worst_site.startswith("pred0.e1"), tracker.worst_site
