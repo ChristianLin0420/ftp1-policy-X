@@ -45,6 +45,10 @@ class MoTPredictorConfig:
     head_dim: int = 64
     mlp_ratio: float = 4.0
     rope: Rope3DConfig = dataclasses.field(default_factory=Rope3DConfig)
+    qk_norm: bool = True
+    """See ``MoTEncoderConfig.qk_norm``. It matters MORE here than in the encoder: with
+    ``num_local_layers = 0`` every predictor block is global, so all three experts share one
+    softmax, and the divergence that made this non-optional was in a predictor block."""
 
     def __post_init__(self) -> None:
         if not 0 <= self.num_local_layers <= self.depth:
@@ -60,6 +64,7 @@ class MoTPredictorConfig:
             head_dim=self.head_dim,
             mlp_ratio=self.mlp_ratio,
             rope=self.rope,
+            qk_norm=self.qk_norm,
         )
 
 

@@ -4,6 +4,8 @@ import ast
 import pathlib
 
 import pytest
+import math
+
 import torch
 
 from openpi.mot_jepa.embed import StreamEmbed
@@ -14,6 +16,7 @@ from openpi.mot_jepa.masking import MaskMode
 from openpi.mot_jepa.masking import MaskSpec
 from openpi.mot_jepa.masking import build_batch_masks
 from openpi.mot_jepa.mot_encoder import MoTEncoder
+from openpi.mot_jepa.mot_encoder import ExpertLayer
 from openpi.mot_jepa.mot_encoder import MoTEncoderConfig
 from openpi.mot_jepa.mot_encoder import gather_tokens
 from openpi.mot_jepa.mot_encoder import split_index_by_expert
@@ -245,3 +248,43 @@ def test_parameter_counts_are_in_the_designed_range():
     assert 100 < encoder_params < 220, f"encoder {encoder_params:.1f}M outside ViT-B range"
     assert 20 < predictor_params < 70, f"predictor {predictor_params:.1f}M outside designed range"
     assert predictor_params < encoder_params / 2, "predictor must stay narrow relative to the encoder"
+
+
+def test_qk_norm_bounds_attention_logits_under_adversarial_weight_growth():
+    """The guard for the failure that destroyed job 6569421.
+
+    Without QK-norm nothing bounds ``q.k``: growth in ``norm1``'s gain and ``qkv``'s weights
+    multiplies straight into the logits. That run reached a max logit of 1.6e8 in predictor
+    block 3's tactile expert and the representation collapsed (RankMe 147 -> 11) while the loss
+    FELL, so no loss-based check could have caught it. This inflates the weights the same way
+    and asserts the logits stay bounded.
+    """
+    torch.manual_seed(0)
+    rope = Rope3DConfig(head_dim=16, dim_t=8, dim_h=4, dim_w=4)
+
+    def max_logit(*, qk_norm: bool) -> float:
+        cfg = MoTEncoderConfig(depth=1, num_local_layers=0, num_heads=2, head_dim=16, rope=rope, qk_norm=qk_norm)
+        layer = ExpertLayer(32, cfg)
+        with torch.no_grad():  # the observed divergence: LN gain/bias and qkv weights blown up
+            layer.norm1.weight.mul_(50.0)
+            layer.norm1.bias.add_(20.0)
+            layer.qkv.weight.mul_(50.0)
+        q, k, _ = layer.project_qkv(torch.randn(2, 12, 32), cfg)
+        return float(((q @ k.transpose(-1, -2)) / math.sqrt(cfg.head_dim)).abs().max())
+
+    without, with_norm = max_logit(qk_norm=False), max_logit(qk_norm=True)
+    # Softmax saturates to one-hot well before this; the unnormalised path blows past it.
+    assert without > 1e4, f"expected the unguarded path to diverge, got {without}"
+    assert with_norm < 100.0, f"qk_norm must bound the logits, got {with_norm}"
+
+
+def test_qk_norm_false_keeps_the_original_parameter_count():
+    """Old checkpoints must still load: disabled QK-norm must add no parameters at all."""
+    rope = Rope3DConfig(head_dim=16, dim_t=8, dim_h=4, dim_w=4)
+    counts = {
+        flag: sum(p.numel() for p in ExpertLayer(32, MoTEncoderConfig(
+            depth=1, num_local_layers=0, num_heads=2, head_dim=16, rope=rope, qk_norm=flag)).parameters())
+        for flag in (False, True)
+    }
+    assert counts[True] > counts[False], "qk_norm=True should add the q/k norms"
+    assert counts[True] - counts[False] == 4 * 16, "exactly weight+bias for q and k over head_dim"

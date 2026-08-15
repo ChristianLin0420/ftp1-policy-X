@@ -55,6 +55,38 @@ class MoTEncoderConfig:
     head_dim: int = 64
     mlp_ratio: float = 4.0
     rope: Rope3DConfig = dataclasses.field(default_factory=Rope3DConfig)
+    qk_norm: bool = True
+    """LayerNorm q and k over ``head_dim`` before the dot product. Bounds the attention logits.
+
+    Set ``False`` ONLY to load a checkpoint trained without it -- it changes the parameter count,
+    and ``load_frozen_backbone`` checks that count rather than failing silently.
+
+    Without this, nothing bounds ``q.k``: ``project_qkv`` feeds ``qkv(norm1(x))`` straight into
+    ``scaled_dot_product_attention``, whose only scaling is the constant ``1/sqrt(head_dim)``.
+    Growth in ``norm1``'s gain and ``qkv``'s weights multiplies into the logits, the softmax
+    saturates toward one-hot, gradients spike, and the growth feeds itself.
+
+    Measured on job 6569421, predictor block 3, tactile expert -- the run that made this
+    non-optional::
+
+        step 40000   max|q|    42.6   max logit         2,680
+        step 60000   max|q| 4,998.8   max logit   164,247,568
+
+    Diverged at ~45k of 100k with gradient norms to 546 against a clip of 1.0, and the tactile
+    representation was destroyed (RankMe 147 -> 11) while the LOSS FELL to 0.497, because a
+    collapsed representation is trivially predictable. Weight growth was confined to
+    ``predictor.blocks.3.experts.1``: ``norm1.bias`` 36x, ``qkv.weight`` 16x, everything else
+    under 2x.
+
+    This is the documented failure mode of mixed-modal transformers, and the reason it bites
+    *here* specifically: ``MoTPredictorConfig.num_local_layers`` is 0, so every predictor block is
+    global and all three experts' q/k are concatenated into ONE softmax (``MoTBlock.forward``).
+    The modalities compete inside a single normalisation, which is exactly the setting where
+    Chameleon (arXiv:2405.09818) reports logit drift and norm growth beyond bf16's range, and
+    adopts QK-norm as the remedy; ViT-22B (arXiv:2302.05442) reports the same divergence from
+    "extremely large values in attention logits" giving near-zero-entropy attention. FTP-1's own
+    Gemma in this repo carries no softcap or QK-norm, so there was no in-house precedent to
+    inherit."""
 
     def __post_init__(self) -> None:
         if not 0 <= self.num_local_layers <= self.depth:
@@ -94,13 +126,19 @@ class ExpertLayer(nn.Module):
         self.out_proj = nn.Linear(attn_dim, width, bias=False)
         self.norm2 = nn.LayerNorm(width)
         self.mlp = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, width))
+        # Per-head, over head_dim. Identity (parameter-free) when disabled, so a config with
+        # qk_norm=False has exactly the parameter count it had before this existed.
+        self.q_norm = nn.LayerNorm(config.head_dim) if config.qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(config.head_dim) if config.qk_norm else nn.Identity()
 
     def project_qkv(self, x: torch.Tensor, config: MoTEncoderConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, length, _ = x.shape
         qkv = self.qkv(self.norm1(x))
         qkv = qkv.reshape(batch, length, 3, config.num_heads, config.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        return qkv[0], qkv[1], qkv[2]
+        # Before RoPE, which is a rotation and so norm-preserving -- normalising here therefore
+        # bounds the logits after RoPE too, and matches the usual placement.
+        return self.q_norm(qkv[0]), self.k_norm(qkv[1]), qkv[2]
 
 
 class MoTBlock(nn.Module):

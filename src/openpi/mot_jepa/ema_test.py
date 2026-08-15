@@ -7,6 +7,8 @@ import pytest
 import torch
 from torch import nn
 
+from openpi.mot_jepa.config import CONFIGS
+from openpi.mot_jepa.config import EmaConfig
 from openpi.mot_jepa.ema import EmaTeacher
 from openpi.mot_jepa.ema import ema_decay_at
 
@@ -105,9 +107,6 @@ def test_ema_ramp_spans_the_run_and_follows_num_train_steps():
     run was 100k, so the teacher reached a 69,314-step half-life at 16% of training and the
     student's tactile representation decayed away from it (RankMe 108 -> 66).
     """
-    from openpi.mot_jepa.config import CONFIGS
-    from openpi.mot_jepa.config import EmaConfig
-
     for name, cfg in CONFIGS.items():
         assert cfg.ema.warmup_steps is None, f"{name} pins the EMA ramp; it must span the run"
         assert cfg.ema_warmup_steps == cfg.num_train_steps, name
@@ -125,8 +124,6 @@ def test_ema_ramp_spans_the_run_and_follows_num_train_steps():
 def test_terminal_decay_is_only_reached_at_the_very_end_of_training():
     """At decay_end the half-life (69,314 steps) exceeds any run we train, so reaching it early
     turns the teacher from a moving average into a fixed snapshot."""
-    from openpi.mot_jepa.config import CONFIGS
-
     cfg = dataclasses.replace(CONFIGS["mot_jepa_pilot"], num_train_steps=100_000)
     kwargs = {
         "decay_start": cfg.ema.decay_start,

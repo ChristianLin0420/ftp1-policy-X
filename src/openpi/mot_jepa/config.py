@@ -58,6 +58,11 @@ class DataConfig:
     prefetch_factor: int = 4
     lowdim_channels: int = 48
     """Widest low-dim unit in the release is uSkin at 4x4x3; a 6-D wrench uses 6."""
+    lowdim_log_compress: bool = True
+    """Compress lowdim to ~[-1, 1] before the Fourier lift. See ``embed.LowDimEmbed``.
+
+    Unlike video and gel, this stream arrives RAW: it reaches |x| = 51,287 in the corpus, with
+    |x| > 1000 in 2.7% of clips. Set ``False`` only to reproduce a run trained without it."""
 
 
 @dataclasses.dataclass(frozen=True)

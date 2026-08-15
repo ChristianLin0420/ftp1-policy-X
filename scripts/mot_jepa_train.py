@@ -288,7 +288,13 @@ def train(cfg: config_module.MotJepaTrainConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
     )
 
-    student = MotJepaStudent(layout, cfg.encoder, cfg.predictor, lowdim_channels=cfg.data.lowdim_channels).to(device)
+    student = MotJepaStudent(
+        layout,
+        cfg.encoder,
+        cfg.predictor,
+        lowdim_channels=cfg.data.lowdim_channels,
+        lowdim_log_compress=cfg.data.lowdim_log_compress,
+    ).to(device)
     student.set_gradient_checkpointing(enabled=cfg.gradient_checkpointing)
     # Teacher is built from the *unwrapped* backbone, never DDP-wrapped: it has no gradients
     # and registering it would make the reducer wait for buckets that never fire.

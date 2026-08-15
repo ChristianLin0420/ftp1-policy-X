@@ -5,6 +5,7 @@ All three exist because a long run here is a *chain* of 4-hour jobs, not one pro
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
 import logging
@@ -20,7 +21,11 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
+from openpi.mot_jepa.config import DataConfig
+from openpi.mot_jepa.config import _from_dict
 from openpi.mot_jepa.model import MotJepaStudent
+from openpi.mot_jepa.mot_encoder import MoTEncoderConfig
+from openpi.mot_jepa.predictor import MoTPredictorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +310,38 @@ def load_checkpoint(
     return int(metadata["global_step"])
 
 
+def architecture_from_run(run: pathlib.Path, cfg):
+    """Rebuild ``cfg``'s encoder/predictor shape from the run's own frozen ``run_config.json``.
+
+    A checkpoint can only be loaded into the architecture it was trained with, and the live
+    dataclass defaults drift away from old runs over time. ``qk_norm`` is the case that forced
+    this: it defaults to ``True`` now, but every config written before it existed describes a
+    model trained WITHOUT it, and ``_from_dict`` skips absent keys -- so an old run would be
+    rebuilt with q/k LayerNorms its checkpoint cannot fill. Absent means ``False`` here, which is
+    what those checkpoints actually are.
+
+    Returns ``cfg`` unchanged when the run has no stored config.
+    """
+    path = pathlib.Path(run) / "run_config.json"
+    if not path.exists():
+        return cfg
+    payload = json.loads(path.read_text())
+    encoder, predictor = dict(payload.get("encoder", {})), dict(payload.get("predictor", {}))
+    if not encoder and not predictor:
+        return cfg
+    encoder.setdefault("qk_norm", False)
+    predictor.setdefault("qk_norm", False)
+    # Same rule for the lowdim input transform: absent means the run predates it.
+    data = dict(payload.get("data", {}))
+    data.setdefault("lowdim_log_compress", False)
+    return dataclasses.replace(
+        cfg,
+        encoder=_from_dict(MoTEncoderConfig, encoder),
+        predictor=_from_dict(MoTPredictorConfig, predictor),
+        data=_from_dict(DataConfig, data) if data else cfg.data,
+    )
+
+
 def load_frozen_backbone(run: pathlib.Path, step: int | None, cfg, device: torch.device):
     """Load a pretrained EMA teacher as a frozen backbone. Returns ``(backbone, step)``.
 
@@ -322,7 +359,15 @@ def load_frozen_backbone(run: pathlib.Path, step: int | None, cfg, device: torch
     if step is None:
         raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
     shadow = torch.load(checkpoint_dir / str(step) / "teacher_ema.pt", map_location="cpu", weights_only=True)
-    student = MotJepaStudent(cfg.layout, cfg.encoder, cfg.predictor, lowdim_channels=cfg.data.lowdim_channels)
+    # Build the architecture the checkpoint was TRAINED with, not today's defaults.
+    cfg = architecture_from_run(run, cfg)
+    student = MotJepaStudent(
+        cfg.layout,
+        cfg.encoder,
+        cfg.predictor,
+        lowdim_channels=cfg.data.lowdim_channels,
+        lowdim_log_compress=cfg.data.lowdim_log_compress,
+    )
     params = list(student.backbone.parameters())
     if len(shadow) != len(params):
         raise RuntimeError(f"{len(shadow)} shadow tensors for {len(params)} parameters; config mismatch")

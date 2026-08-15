@@ -59,10 +59,16 @@ class MotJepaBackbone(nn.Module):
         *,
         lowdim_channels: int = 1,
         num_sensor_types: int = 16,
+        lowdim_log_compress: bool = True,
     ) -> None:
         super().__init__()
         self.layout = layout
-        self.embed = StreamEmbed(layout, lowdim_channels=lowdim_channels, num_sensor_types=num_sensor_types)
+        self.embed = StreamEmbed(
+            layout,
+            lowdim_channels=lowdim_channels,
+            num_sensor_types=num_sensor_types,
+            lowdim_log_compress=lowdim_log_compress,
+        )
         self.encoder = MoTEncoder(encoder_config, layout)
 
     def set_gradient_checkpointing(self, *, enabled: bool) -> None:
@@ -113,6 +119,7 @@ class MotJepaStudent(nn.Module):
         *,
         lowdim_channels: int = 1,
         num_sensor_types: int = 16,
+        lowdim_log_compress: bool = True,
     ) -> None:
         super().__init__()
         self.layout = layout

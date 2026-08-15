@@ -13,6 +13,8 @@ purpose -- position encodes *when and where*, the additive embedding encodes *wh
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -99,10 +101,27 @@ class LowDimEmbed(nn.Module):
         in_channels: int = 1,
         fourier_dim: int = 16,
         num_sensor_types: int = 16,
+        log_compress: bool = True,
     ) -> None:
         super().__init__()
         self.layout = layout
         self.in_channels = in_channels
+        # Compress the raw value before the Fourier lift. Parameter-free and stateless, so it
+        # cannot drift between student and teacher, and it maps 0 -> 0 exactly -- which matters
+        # because ~90% of the corpus zero-fills this stream and must stay inert.
+        #
+        # Without it the RAW value is concatenated as feature 0 below and handed to `proj`, while
+        # every other feature is a sin/cos in [-1, 1] and both image streams arrive in [-1, 1].
+        # Measured over the corpus this stream reaches |x| = 51,287, with |x| > 1000 in 2.7% of
+        # clips -- so at a global batch of 512 it is in essentially every batch, a chronic source
+        # of large activations rather than a rare spike. It also breaks the lift itself:
+        # `scaled` reaches 51,287 * 2^15 = 1.7e9, where sin/cos under bf16 autocast carry no
+        # information at all. `backbone.embed.lowdim.proj.bias` was among the fastest-growing
+        # parameters in the run that diverged (see MoTEncoderConfig.qk_norm).
+        self.log_compress = log_compress
+        # log1p(1e4) = 9.21, so 51,287 -> 1.18 and 1000 -> 0.75: back inside the range the
+        # Fourier frequencies were chosen for.
+        self.log_reference = math.log1p(1e4)
         # Fixed, not learned, so the feature basis cannot drift between student and teacher.
         self.register_buffer(
             "fourier_freqs",
@@ -122,6 +141,9 @@ class LowDimEmbed(nn.Module):
             raise ValueError(f"expected {self.layout.num_frames} frames, got {frames}")
         if slots != self.layout.lowdim_slots:
             raise ValueError(f"expected {self.layout.lowdim_slots} slots, got {slots}")
+
+        if self.log_compress:
+            lowdim = torch.sign(lowdim) * torch.log1p(lowdim.abs()) / self.log_reference
 
         scaled = lowdim[..., None] * self.fourier_freqs
         features = torch.cat([lowdim[..., None], torch.sin(scaled), torch.cos(scaled)], dim=-1)
@@ -154,12 +176,18 @@ class StreamEmbed(nn.Module):
         gel_channels: int = 3,
         lowdim_channels: int = 1,
         num_sensor_types: int = 16,
+        lowdim_log_compress: bool = True,
     ) -> None:
         super().__init__()
         self.layout = layout
         self.video = VideoPatchEmbed(layout, in_channels=video_channels)
         self.gel = GelPatchEmbed(layout, in_channels=gel_channels, num_sensor_types=num_sensor_types)
-        self.lowdim = LowDimEmbed(layout, in_channels=lowdim_channels, num_sensor_types=num_sensor_types)
+        self.lowdim = LowDimEmbed(
+            layout,
+            in_channels=lowdim_channels,
+            num_sensor_types=num_sensor_types,
+            log_compress=lowdim_log_compress,
+        )
 
     def forward(
         self,
