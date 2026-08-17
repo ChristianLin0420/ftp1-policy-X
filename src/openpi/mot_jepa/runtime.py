@@ -310,8 +310,8 @@ def load_checkpoint(
     return int(metadata["global_step"])
 
 
-def architecture_from_run(run: pathlib.Path, cfg):
-    """Rebuild ``cfg``'s encoder/predictor shape from the run's own frozen ``run_config.json``.
+def architecture_from_run(run: pathlib.Path, cfg, step: int | None = None):
+    """Rebuild ``cfg``'s encoder/predictor shape from the config stored with the checkpoint.
 
     A checkpoint can only be loaded into the architecture it was trained with, and the live
     dataclass defaults drift away from old runs over time. ``qk_norm`` is the case that forced
@@ -320,10 +320,22 @@ def architecture_from_run(run: pathlib.Path, cfg):
     rebuilt with q/k LayerNorms its checkpoint cannot fill. Absent means ``False`` here, which is
     what those checkpoints actually are.
 
-    Returns ``cfg`` unchanged when the run has no stored config.
+    Two locations are tried, because a *run* directory and an extracted *backbone snapshot* are
+    laid out differently. Snapshots under ``ftp1-runs/backbones/`` carry only
+    ``checkpoints/<step>/train_config.json`` -- ``save_checkpoint`` writes it there -- and no
+    top-level ``run_config.json``. Reading only the latter made all three released backbones fail
+    with "254 shadow tensors for 350 parameters" the moment qk_norm defaulted on, which would
+    have blocked every downstream evaluation.
+
+    Returns ``cfg`` unchanged when neither file exists.
     """
-    path = pathlib.Path(run) / "run_config.json"
-    if not path.exists():
+    run = pathlib.Path(run)
+    candidates = [run / "run_config.json"]
+    resolved = step if step is not None else find_latest_step(run / "checkpoints")
+    if resolved is not None:
+        candidates.append(run / "checkpoints" / str(resolved) / "train_config.json")
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
         return cfg
     payload = json.loads(path.read_text())
     encoder, predictor = dict(payload.get("encoder", {})), dict(payload.get("predictor", {}))
@@ -360,7 +372,7 @@ def load_frozen_backbone(run: pathlib.Path, step: int | None, cfg, device: torch
         raise FileNotFoundError(f"no checkpoint under {checkpoint_dir}")
     shadow = torch.load(checkpoint_dir / str(step) / "teacher_ema.pt", map_location="cpu", weights_only=True)
     # Build the architecture the checkpoint was TRAINED with, not today's defaults.
-    cfg = architecture_from_run(run, cfg)
+    cfg = architecture_from_run(run, cfg, step)
     student = MotJepaStudent(
         cfg.layout,
         cfg.encoder,
