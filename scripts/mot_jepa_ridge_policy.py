@@ -108,6 +108,40 @@ def fit_one_domain(x: np.ndarray, y: np.ndarray, *, val_frac: float = 0.2) -> tu
     return mean, scale, best[1], best[2]
 
 
+def feature_share(weights: np.ndarray, x_std: np.ndarray) -> tuple[float, float]:
+    """How much of the commanded action responds to the OBSERVATION, two ways.
+
+    ``weights`` is ``(p + 1, out)`` with the intercept as its last row, and the features were
+    standardised before fitting, so the two blocks' norms are directly comparable.
+
+    This is the measurement that explains every other number in the offline evaluation. At 33% on
+    ``lift_bottle`` two thirds of the command is a learned constant, and then: the ridge beats a
+    per-domain constant by only 24%, no trained head beats the constant at all, integrated drift is
+    89% correlated (a constant bias integrates linearly), and closed-loop failures retract away
+    from the object and time out while successes are fast. An order-blind representation cannot
+    separate approach from lift from retract at one visual pose, so the best available policy is
+    the AVERAGE action at that pose -- which is what an intercept is.
+
+    Returns ``(by_weight_norm, by_prediction)``:
+
+    * ``by_weight_norm`` -- ||W_features|| / (||W_features|| + ||intercept||). The quantity the
+      plan pre-registered, so this is the one to compare against the 33% baseline.
+    * ``by_prediction`` -- ||pred - intercept|| / ||pred|| on the holdout itself. Less
+      assumption-laden: it asks what fraction of the ACTUAL commanded magnitude moved in response
+      to input, rather than what fraction of the weight budget was allocated to it.
+    """
+    w_features, w_intercept = weights[:-1], weights[-1]
+    norm_f = float(np.linalg.norm(w_features))
+    norm_i = float(np.linalg.norm(w_intercept))
+    by_weight = norm_f / (norm_f + norm_i) if (norm_f + norm_i) > 0 else float("nan")
+
+    pred = np.hstack([x_std, np.ones((x_std.shape[0], 1))]) @ weights
+    driven = pred - w_intercept[None, :]
+    total = float(np.linalg.norm(pred))
+    by_pred = float(np.linalg.norm(driven)) / total if total > 0 else float("nan")
+    return by_weight, by_pred
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -188,6 +222,7 @@ def main() -> int:
     print(f"\nridge policy on backbone step {step}, horizon {args.horizon}\n")
     print(f"{'domain':24s} {'clips':>7s} {'RMSE':>11s} {'constant':>11s} {'better?':>9s}")
     sq_r = sq_c = n_tot = 0.0
+    shares: dict[int, tuple[float, float]] = {}
     for domain, blob in sorted(held.items()):
         if domain not in models:
             continue
@@ -206,7 +241,22 @@ def main() -> int:
         sq_c += err_c
         n_tot += count
         rmse, const = np.sqrt(err_r / count), np.sqrt(err_c / count)
+        shares[domain] = feature_share(weights, (x - mean) / scale)
         print(f"{names[domain]:24s} {x.shape[0]:7d} {rmse:11.5f} {const:11.5f} {'YES' if rmse < const else 'no':>9s}")
+
+    if n_tot <= 0:
+        # No domain ended up with BOTH a fitted model and holdout clips. Almost always too few
+        # batches to reach every domain (the loader shuffles across 8 stores), which used to
+        # surface as ZeroDivisionError three screens below the actual cause.
+        logger.error(
+            "no domain has both a fitted model and holdout clips: %d fitted, %d with holdout. "
+            "Raise --batches (the index holds %s clips at the current --index-step) or lower "
+            "--holdout_mod.",
+            len(models),
+            len(held),
+            "unknown",
+        )
+        return 1
 
     pooled_r, pooled_c = np.sqrt(sq_r / n_tot), np.sqrt(sq_c / n_tot)
     print(f"{'POOLED':24s} {'':7s} {pooled_r:11.5f} {pooled_c:11.5f} {'YES' if pooled_r < pooled_c else 'no':>9s}")
@@ -214,6 +264,22 @@ def main() -> int:
         "\nCompare against the trained heads on the same holdout: linear 0.00462, drifting 0.00463,\n"
         "flowmatch 0.00484, best weight-decay 0.00454, constant 0.00436."
     )
+
+    # The decomposition that interprets the table above. A ridge can only beat a constant by as
+    # much as its features carry, so this bounds what any head on these features could do.
+    if shares:
+        print(f"\n{'domain':24s} {'obs-driven (weights)':>21s} {'obs-driven (pred)':>19s}")
+        for domain, (by_weight, by_pred) in sorted(shares.items(), key=lambda kv: kv[1][0]):
+            print(f"{names[domain]:24s} {by_weight:20.0%} {by_pred:18.0%}")
+        mean_w = float(np.mean([v[0] for v in shares.values()]))
+        print(f"{'MEAN':24s} {mean_w:20.0%}")
+        print(
+            "\nPre-registered baseline on the order-blind backbone (by weights): grasp_classify 5%,\n"
+            "insert_HDMI 5%, insert_hole 22%, lift_can 28%, lift_bottle 33%, insert_tube 39%,\n"
+            "pull_out_key 40%, put_bottle_in_shelf 70%. Thresholds: >= 50% the frozen features are\n"
+            "load-bearing; 15-50% the features carry signal and the head is the ceiling; < 15%\n"
+            "pretraining does not transfer to control on this corpus."
+        )
 
     if args.out and models:
         args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -240,6 +240,10 @@ def main() -> int:
     parser.add_argument("--config", default="mot_jepa_pilot")
     parser.add_argument("--batches", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--strides", type=int, nargs="+", default=None,
+        help="Frame strides to probe at. Defaults to the run's own training strides.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -249,7 +253,14 @@ def main() -> int:
     stores = sorted(glob.glob(args.clips))
     names = sorted({pathlib.Path(p).parent.name for p in stores})
     domain_ids = [names.index(pathlib.Path(p).parent.name) for p in stores]
-    dataset = MotJepaClipDataset(stores, cfg.layout, domain_ids=domain_ids, strides=(1,), index_step=97)
+    # MUST match the stride the backbone was TRAINED at. RoPE `t` is the tubelet index and
+    # carries no rate, so an encoder handed a different frame rate cannot tell -- it simply sees
+    # a slower or faster world, with no error anywhere. Probing a (2,4)-trained encoder at stride
+    # 1 puts it 2-4x outside its training distribution, and a null there says nothing about
+    # whether it represents dynamics at the rate it actually saw.
+    strides = args.strides or tuple(runtime.architecture_from_run(args.pretrained_run, cfg).data.strides)
+    logger.info("probing at strides %s (training strides for this run)", strides)
+    dataset = MotJepaClipDataset(stores, cfg.layout, domain_ids=domain_ids, strides=strides, index_step=97)
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=6, collate_fn=collate_clips
     )
