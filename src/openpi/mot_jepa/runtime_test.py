@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,7 +12,9 @@ from torch import nn
 
 from openpi.mot_jepa import runtime
 from openpi.mot_jepa.config import CONFIGS
+from openpi.mot_jepa.config import POLICY_CONFIGS
 from openpi.mot_jepa.config import MotJepaTrainConfig
+from openpi.mot_jepa.config import PolicyConfig
 from openpi.mot_jepa.ema import EmaTeacher
 from scripts.mot_jepa_train import InfiniteBatchSampler
 
@@ -95,6 +98,54 @@ def test_checkpoint_roundtrip_restores_loss_module_state(tmp_path):
     )
     assert torch.equal(loss_fn.projector.weight, original)
     assert float(loss_fn.lowdim_scale) == 3.5
+
+
+def test_checkpoint_roundtrip_restores_named_extra_module(tmp_path):
+    model = nn.Linear(4, 4)
+    backbone = nn.Linear(4, 3)
+    optimizer = torch.optim.AdamW((*model.parameters(), *backbone.parameters()), lr=1e-3)
+    runtime.save_checkpoint(
+        tmp_path,
+        9,
+        student=model,
+        teacher=None,
+        optimizer=optimizer,
+        config_json="{}",
+        extra_modules={"backbone": backbone},
+    )
+    original = backbone.weight.detach().clone()
+    with torch.no_grad():
+        backbone.weight.add_(10)
+
+    step = runtime.load_checkpoint(
+        tmp_path,
+        9,
+        student=model,
+        teacher=None,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        extra_modules={"backbone": backbone},
+    )
+
+    assert step == 9
+    assert torch.equal(backbone.weight, original)
+
+
+def test_checkpoint_refuses_missing_required_extra_module(tmp_path):
+    model = nn.Linear(4, 4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    runtime.save_checkpoint(tmp_path, 4, student=model, teacher=None, optimizer=optimizer, config_json="{}")
+
+    with pytest.raises(FileNotFoundError, match="cannot resume module 'backbone'"):
+        runtime.load_checkpoint(
+            tmp_path,
+            4,
+            student=model,
+            teacher=None,
+            optimizer=optimizer,
+            device=torch.device("cpu"),
+            extra_modules={"backbone": nn.Linear(4, 3)},
+        )
 
 
 def test_checkpoint_without_loss_state_still_loads(tmp_path):
@@ -204,6 +255,103 @@ def test_named_configs_roundtrip_through_json(name):
     assert restored.data.num_workers == original.data.num_workers
     assert isinstance(restored.masking.mode_probs, tuple)
     assert restored.layout.num_tokens == original.layout.num_tokens
+
+
+@pytest.mark.parametrize("name", sorted(POLICY_CONFIGS))
+def test_named_policy_configs_roundtrip_through_json(name):
+    original = POLICY_CONFIGS[name]
+    restored = PolicyConfig.from_json(original.to_json())
+
+    assert restored == original
+    assert restored.backbone_train_mode == "frozen"
+
+
+def test_historical_policy_config_defaults_to_a_frozen_backbone():
+    payload = json.loads(POLICY_CONFIGS["mot_jepa_policy_flowmatch"].to_json())
+    for field in (
+        "backbone_train_mode",
+        "backbone_last_n_blocks",
+        "backbone_lr_multiplier",
+        "gradient_checkpointing",
+    ):
+        payload.pop(field)
+
+    restored = PolicyConfig.from_json(json.dumps(payload))
+
+    assert restored.backbone_train_mode == "frozen"
+    assert restored.backbone_last_n_blocks == 2
+    assert restored.backbone_lr_multiplier == 0.1
+    assert restored.gradient_checkpointing is False
+
+
+def _stub_source_backbone(monkeypatch, source_step: int = 100):
+    def load_frozen_backbone(run, step, cfg, device):
+        del run, step, cfg, device
+        backbone = nn.Linear(2, 2)
+        with torch.no_grad():
+            backbone.weight.zero_()
+            backbone.bias.zero_()
+        return backbone, source_step
+
+    monkeypatch.setattr(runtime, "load_frozen_backbone", load_frozen_backbone)
+
+
+def _policy_cfg(tmp_path, mode: str):
+    return SimpleNamespace(
+        backbone_train_mode=mode,
+        pretrained_run=str(tmp_path / "source"),
+        pretrained_step=100,
+    )
+
+
+def test_policy_backbone_loader_overlays_the_adapted_artifact(tmp_path, monkeypatch):
+    _stub_source_backbone(monkeypatch)
+    cfg = _policy_cfg(tmp_path, "last_blocks")
+    checkpoint = tmp_path / "policy" / "checkpoints" / "25"
+    checkpoint.mkdir(parents=True)
+    adapted = nn.Linear(2, 2)
+    with torch.no_grad():
+        adapted.weight.fill_(3.0)
+        adapted.bias.fill_(4.0)
+    torch.save(adapted.state_dict(), checkpoint / "backbone.pt")
+    torch.save(
+        {
+            "global_step": 25,
+            "backbone_train_mode": "last_blocks",
+            "source_backbone_run": str((tmp_path / "source").resolve()),
+            "source_backbone_step": 100,
+        },
+        checkpoint / "metadata.pt",
+    )
+
+    loaded = runtime.load_policy_backbone(tmp_path / "policy", 25, cfg, torch.device("cpu"))
+
+    assert loaded.mode == "last_blocks"
+    assert loaded.source_step == 100
+    assert loaded.adapted_step == 25
+    assert loaded.checkpoint == checkpoint / "backbone.pt"
+    assert torch.equal(loaded.backbone.weight, adapted.weight)
+    assert not loaded.backbone.training
+    assert not any(parameter.requires_grad for parameter in loaded.backbone.parameters())
+
+
+def test_adapted_policy_refuses_to_fall_back_when_backbone_artifact_is_missing(tmp_path, monkeypatch):
+    _stub_source_backbone(monkeypatch)
+    cfg = _policy_cfg(tmp_path, "full")
+
+    with pytest.raises(FileNotFoundError, match="refuse to evaluate the frozen source backbone"):
+        runtime.load_policy_backbone(tmp_path / "policy", 25, cfg, torch.device("cpu"))
+
+
+def test_legacy_frozen_policy_uses_the_source_backbone_without_an_artifact(tmp_path, monkeypatch):
+    _stub_source_backbone(monkeypatch)
+    cfg = _policy_cfg(tmp_path, "frozen")
+
+    loaded = runtime.load_policy_backbone(tmp_path / "policy", 25, cfg, torch.device("cpu"))
+
+    assert loaded.mode == "frozen"
+    assert loaded.checkpoint is None
+    assert loaded.adapted_step is None
 
 
 def test_config_diff_reports_changed_fields():

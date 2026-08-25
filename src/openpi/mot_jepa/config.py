@@ -17,7 +17,6 @@ import typing
 # and importing it at module scope makes this file -- and therefore the whole deployment
 # path -- unimportable inside Isaac Sim's interpreter, which has no tyro and must not gain
 # packages that could disturb its numpy or torch.
-
 from openpi.mot_jepa.action_dit import ActionDiTConfig
 from openpi.mot_jepa.drifting import DriftingConfig
 from openpi.mot_jepa.layout import LAYOUT_BASE
@@ -51,6 +50,13 @@ class DataConfig:
     set brackets. RoPE ``t`` is the tubelet index and carries no rate, so an encoder handed a
     different frame rate cannot tell -- it simply sees a slower or faster world than it trained
     on, silently.
+    """
+    action_stride: int | None = None
+    """Control-frame stride between action targets.
+
+    This is independent of observation ``strides``: deployment observes at stride 2 but acts
+    every control step, so policy runs use ``1``. ``None`` is safe only for pretraining, which
+    has no action horizon; supervised dataset construction rejects an unspecified value.
     """
     index_step: int = 1
     """Stride between enumerated clip starts. Raise it to shrink the index on huge corpora."""
@@ -279,11 +285,9 @@ CONFIGS: dict[str, MotJepaTrainConfig] = {
 
 def cli() -> MotJepaTrainConfig:
     """Mirrors the repository's tyro entrypoint style (``training/config.py:1335``)."""
-    import tyro
+    import tyro  # noqa: PLC0415
 
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in CONFIGS.items()})
-
-
 
 
 # ======================================================================================
@@ -293,11 +297,12 @@ def cli() -> MotJepaTrainConfig:
 
 @dataclasses.dataclass(frozen=True)
 class PolicyConfig:
-    """One action-policy run. The pretrained encoder is frozen throughout.
+    """One supervised action-policy run over a pretrained MoT-JEPA encoder.
 
-    ``encoder``/``predictor`` are here only to rebuild the pretrained student so the frozen
-    backbone can be loaded into it -- they must match the pretraining run the checkpoint came
-    from, or the positional shadow copy raises on the parameter count.
+    ``encoder``/``predictor`` rebuild the pretrained student so its EMA backbone can be loaded.
+    They must match the pretraining run the checkpoint came from, or the positional shadow copy
+    raises on the parameter count. ``backbone_train_mode`` then decides whether that backbone is
+    frozen, adapted only in its final transformer blocks, or adapted end to end.
     """
 
     name: str = "mot_jepa_policy"
@@ -318,6 +323,19 @@ class PolicyConfig:
     resumes from its own checkpoint instead. The normalizer is not carried over -- a different
     dataset has different domains, and refitting is the point.
     """
+
+    backbone_train_mode: str = "frozen"
+    """``frozen``, ``last_blocks``, or ``full``.
+
+    Missing in historical ``run_config.json`` files means ``frozen`` through the dataclass
+    default, preserving the exact behaviour of every existing policy run.
+    """
+    backbone_last_n_blocks: int = 2
+    """Number of final encoder blocks adapted under ``last_blocks``; final norms are included."""
+    backbone_lr_multiplier: float = 0.1
+    """Backbone LR relative to the head's existing ``lr_peak``/``lr_end`` schedule."""
+    gradient_checkpointing: bool = False
+    """Checkpoint encoder blocks while adapting the backbone. Ignored when it is frozen."""
 
     layout_preset: str = "pilot"
     encoder: MoTEncoderConfig = dataclasses.field(default_factory=MoTEncoderConfig)
@@ -345,6 +363,21 @@ class PolicyConfig:
     find_unused_parameters: bool = False
     """False, unlike pretraining: every head parameter is used on every step. Pretraining needs
     True only because mask mode T_HARD drops the tactile expert entirely on some steps."""
+
+    def __post_init__(self) -> None:
+        modes = {"frozen", "last_blocks", "full"}
+        if self.backbone_train_mode not in modes:
+            raise ValueError(
+                f"backbone_train_mode must be one of {sorted(modes)}, got {self.backbone_train_mode!r}"
+            )
+        if self.backbone_last_n_blocks <= 0:
+            raise ValueError("backbone_last_n_blocks must be positive")
+        if self.backbone_train_mode == "last_blocks" and self.backbone_last_n_blocks > self.encoder.depth:
+            raise ValueError(
+                f"cannot adapt {self.backbone_last_n_blocks} blocks from an encoder of depth {self.encoder.depth}"
+            )
+        if not 0.0 < self.backbone_lr_multiplier <= 1.0:
+            raise ValueError("backbone_lr_multiplier must be in (0, 1]")
 
     @property
     def layout(self) -> TokenLayout:
@@ -381,7 +414,7 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="drifting"),
-        data=DataConfig(index_step=4, num_workers=6),
+        data=DataConfig(strides=(2,), action_stride=1, index_step=4, num_workers=6),
     ),
     "mot_jepa_policy_linear": PolicyConfig(
         # Diagnostic baseline: a single affine map from the frozen readout, trained through the
@@ -391,7 +424,7 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="linear"),
-        data=DataConfig(index_step=4, num_workers=6),
+        data=DataConfig(strides=(2,), action_stride=1, index_step=4, num_workers=6),
     ),
     "mot_jepa_policy_linear_perdomain": PolicyConfig(
         # The same affine map, but with a per-domain trunk instead of a shared one -- eight fully
@@ -405,19 +438,19 @@ POLICY_CONFIGS: dict[str, PolicyConfig] = {
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="linear", per_domain_trunk=True),
-        data=DataConfig(index_step=4, num_workers=6),
+        data=DataConfig(strides=(2,), action_stride=1, index_step=4, num_workers=6),
     ),
     "mot_jepa_policy_flowmatch": PolicyConfig(
         name="mot_jepa_policy_flowmatch",
         encoder=MoTEncoderConfig(depth=12, num_local_layers=4, num_heads=6, head_dim=64, rope=_PILOT_ROPE),
         predictor=MoTPredictorConfig(depth=6, width=192, num_heads=3, head_dim=64, rope=_PILOT_ROPE),
         head=ActionDiTConfig(objective="flowmatch"),
-        data=DataConfig(index_step=4, num_workers=6),
+        data=DataConfig(strides=(2,), action_stride=1, index_step=4, num_workers=6),
     ),
 }
 
 
 def policy_cli() -> PolicyConfig:
-    import tyro
+    import tyro  # noqa: PLC0415
 
     return tyro.extras.overridable_config_cli({name: (name, cfg) for name, cfg in POLICY_CONFIGS.items()})

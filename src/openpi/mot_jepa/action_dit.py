@@ -238,7 +238,10 @@ class ActionDiT(nn.Module):
 
     def context_tokens(self, encoded: EncoderOutput) -> tuple[torch.Tensor, torch.Tensor]:
         """``(B, 2*num_steps, width)`` cross-attention memory and the ``(B, width)`` adaLN vector."""
-        projected = [proj(readout.to(proj.weight.dtype)) for proj, readout in zip(self.context_proj, encoded.final_readout, strict=True)]
+        projected = [
+            proj(readout.to(proj.weight.dtype))
+            for proj, readout in zip(self.context_proj, encoded.final_readout, strict=True)
+        ]
         context = self.context_norm(torch.cat(projected, dim=1))
         return context, context.mean(dim=1)
 
@@ -326,9 +329,7 @@ def flow_matching_loss(
     slots contributes the same per-live-dimension weight as one that populates 40.
     """
     noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype, generator=generator)
-    # Beta(1.5, 1.0) concentrates samples near t=0 where the velocity field is hardest to fit.
-    beta = torch.distributions.Beta(1.5, 1.0)
-    t = beta.sample((actions.shape[0],)).to(actions.device) * 0.999 + 0.001
+    t = _sample_flow_time(actions.shape[0], device=actions.device, generator=generator)
     t_b = t.reshape(-1, 1, 1)
 
     x_t = t_b * noise + (1.0 - t_b) * actions
@@ -338,6 +339,24 @@ def flow_matching_loss(
     error = (velocity - u_t) ** 2 * chunk_mask
     loss = error.sum() / chunk_mask.sum().clamp_min(1.0)
     return loss, {"flow_mse": float(loss.detach())}
+
+
+def _sample_flow_time(
+    batch_size: int,
+    *,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Draw ``Beta(1.5, 1)`` time with the caller's generator.
+
+    ``torch.distributions.Beta.sample`` cannot accept a generator, which made a requeued policy
+    run restart its time/noise sequence even though the data sampler and LR resumed at the right
+    optimizer step. For ``Beta(a, 1)``, inverse-CDF sampling is exactly ``U ** (1/a)``; using
+    ``a=1.5`` therefore preserves the intended distribution while making the whole stochastic
+    loss a pure function of the per-step generator.
+    """
+    uniform = torch.rand(batch_size, device=device, dtype=torch.float32, generator=generator)
+    return uniform.pow(2.0 / 3.0) * 0.999 + 0.001
 
 
 class LinearHead(nn.Module):
@@ -459,10 +478,9 @@ class RidgeHead(nn.Module):
     weights; `fitted_domains` says which are real.
     """
 
-    def __init__(self, path, layout: TokenLayout, *, horizon: int, action_dim: int = ACTION_DIM) -> None:
+    def __init__(self, path, layout: TokenLayout, *, horizon: int | None = None, action_dim: int = ACTION_DIM) -> None:
         super().__init__()
         blob = np.load(path, allow_pickle=False)
-        self.horizon = horizon
         self.action_dim = action_dim
         self.names = [str(n) for n in blob["domains"]]
         # The shape check below cannot catch a ridge fitted on the OTHER readout: sync_readout and
@@ -474,6 +492,21 @@ class RidgeHead(nn.Module):
                 f"{path} was fitted on {fitted_on!r}, but heads read final_readout. The two have "
                 "the same width, so this would load silently -- refit the ridge."
             )
+        required_metadata = ("observation_stride", "action_stride", "horizon")
+        missing_metadata = [key for key in required_metadata if key not in blob]
+        if missing_metadata:
+            raise ValueError(
+                f"{path} has no authoritative sampling metadata {missing_metadata}; refit the ridge "
+                "instead of guessing how its observations and targets were sampled"
+            )
+        self.observation_stride = int(np.asarray(blob["observation_stride"]).item())
+        self.action_stride = int(np.asarray(blob["action_stride"]).item())
+        fitted_horizon = int(np.asarray(blob["horizon"]).item())
+        if self.observation_stride < 1 or self.action_stride < 1:
+            raise ValueError(f"invalid ridge sampling strides {self.observation_stride}/{self.action_stride}")
+        if horizon is not None and fitted_horizon != horizon:
+            raise ValueError(f"ridge horizon is {fitted_horizon}, evaluator requested {horizon}")
+        self.horizon = fitted_horizon
         features = layout.num_steps * (layout.video_width + layout.tactile_width)
 
         # Which keys exist is the source of truth for which domains were fitted -- the script skips
@@ -482,7 +515,7 @@ class RidgeHead(nn.Module):
         self.fitted_domains = sorted(int(k.removeprefix("weights_")) for k in blob if k.startswith("weights_"))
         for domain in self.fitted_domains:
             weights = torch.as_tensor(blob[f"weights_{domain}"], dtype=torch.float32)
-            expected = (features + 1, horizon * action_dim)
+            expected = (features + 1, self.horizon * action_dim)
             if tuple(weights.shape) != expected:
                 raise ValueError(f"domain {domain} weights are {tuple(weights.shape)}, expected {expected}")
             self.register_buffer(f"mean_{domain}", torch.as_tensor(blob[f"mean_{domain}"], dtype=torch.float32))

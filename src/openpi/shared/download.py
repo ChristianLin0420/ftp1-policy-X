@@ -178,7 +178,9 @@ def _ensure_permissions(path: pathlib.Path) -> None:
 
 def _get_mtime(year: int, month: int, day: int) -> float:
     """Get the mtime of a given date at midnight UTC."""
-    date = datetime.datetime(year, month, day, tzinfo=datetime.UTC)
+    # ``datetime.UTC`` was added in Python 3.11, while Isaac Sim 4.5 embeds Python 3.10.
+    # ``timezone.utc`` is identical and keeps the documented UniVTAC inference environment usable.
+    date = datetime.datetime(year, month, day, tzinfo=datetime.timezone.utc)
     return time.mktime(date.timetuple())
 
 

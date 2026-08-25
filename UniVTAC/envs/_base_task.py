@@ -245,6 +245,9 @@ class BaseTask(UipcRLEnv):
         self.keep_still_times = 0
         self.atom_tag = ''
         self.atom_id = 0
+        # Optional task-level phase supervision for control-policy data collection.  Tasks that
+        # do not set it remain in phase 0; lift_bottle assigns the V3 four-phase contract.
+        self.control_phase = 0
         self.log = ''
         self.metadata = {}
  
@@ -561,7 +564,10 @@ class BaseTask(UipcRLEnv):
         self.step_count += 1
 
         is_save = is_save and (not self.in_pre_move) and (not self.mode == 'eval_test')
-        save_freq = (self.cfg.video_frequency > 0 and self.step_count % self.cfg.save_frequency == 0)
+        # Dataset capture and debug-video writing are independent cadences.  Coupling saving to
+        # video_frequency silently produced zero observations when a headless collection disabled
+        # MP4 output, and made an offline "action stride 1" mean two simulator control steps.
+        save_freq = self.cfg.save_frequency > 0 and self.step_count % self.cfg.save_frequency == 0
         video_freq = (self.cfg.video_frequency > 0 and self.step_count % self.cfg.video_frequency == 0)
         render_freq = (self.cfg.render_frequency > 0 and self.step_count % self.cfg.render_frequency == 0)
 
@@ -639,7 +645,11 @@ class BaseTask(UipcRLEnv):
             'atom': {
                 'id': self.atom_id,
                 'tag': self.atom_tag
-            }
+            },
+            'control': {
+                'phase': int(self.control_phase),
+                'contact': False,
+            },
         }
 
         if 'embodiment' in self.cfg.obs_data_type:
@@ -648,6 +658,15 @@ class BaseTask(UipcRLEnv):
             obs['observation'] = self._camera_manager.get_observations(self.cfg.obs_data_type['camera'])
         if 'tactile' in self.cfg.obs_data_type:
             obs['tactile'] = self._tactile_manager.get_observations(self.cfg.obs_data_type['tactile'])
+            # A simulator label is used only as an auxiliary training target; deployment still
+            # infers contact from GEL images.  Depth equals the far plane when nothing touches a
+            # pad and drops below it on contact.
+            far_plane = float(self.cfg.robot.tactile_far_plane)
+            for tactile_obs in obs['tactile'].values():
+                depth = tactile_obs.get('depth')
+                if depth is not None and bool(torch.any(torch.as_tensor(depth) < far_plane - 1e-4)):
+                    obs['control']['contact'] = True
+                    break
         if 'actor' in self.cfg.obs_data_type:
             obs['actor'] = self._actor_manager.get_observations()
         return obs

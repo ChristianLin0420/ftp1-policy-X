@@ -9,6 +9,7 @@ UniVTAC HDF5 -> FTP1 Zarr parser.
   7 arm dimensions + 1 gripper dimension.
 - Supports both tactile key conventions:
   `left/right_tactile` and `left/right_gsmini`.
+- Preserves numeric HDF5 filename stems as per-episode `meta/source_episode_seed` identity.
 - Supports `--episodes_per_task` to cap the number of trajectories per task.
 - If an earlier version produced BGR zarr outputs, regenerate them with this
   script before training.
@@ -121,6 +122,43 @@ def _load_univtac_episode(
         joint_state = joint[arange]   # (T, 9) 或 (T, 8)
         joint_8 = joint_state[:, :8].astype(np.float32)   # (T, 8)：7 arm + 1 gripper
 
+        # V3 control collection records the exact command and task phase.  Historical UniVTAC
+        # files do not, so keep them usable with an explicit validity mask instead of silently
+        # pretending observed qpos was the commanded target.
+        if "command" in f["embodiment"]:
+            command_full = np.asarray(f["embodiment"]["command"][()], dtype=np.float32)
+            if command_full.shape != (T_full, 8):
+                raise ValueError(f"embodiment/command must be {(T_full, 8)}, got {command_full.shape}")
+            command_8 = command_full[arange]
+            command_valid = np.ones(T, dtype=np.uint8)
+        else:
+            command_8 = np.concatenate([joint_8[:1], joint_8[:-1]], axis=0)
+            command_valid = np.zeros(T, dtype=np.uint8)
+
+        if "step" in f:
+            control_step_full = np.asarray(f["step"][()], dtype=np.int64).reshape(-1)
+            if control_step_full.shape != (T_full,):
+                raise ValueError(f"step must be {(T_full,)}, got {control_step_full.shape}")
+            control_step = control_step_full[arange]
+            control_step_valid = np.ones(T, dtype=np.uint8)
+        else:
+            control_step = np.arange(T, dtype=np.int64)
+            control_step_valid = np.zeros(T, dtype=np.uint8)
+
+        control = f.get("control")
+        if control is not None and "phase" in control:
+            phase_id = np.asarray(control["phase"][()], dtype=np.int64)[arange]
+            if np.any((phase_id < 0) | (phase_id > 3)):
+                raise ValueError(f"control/phase contains values outside [0, 3] in {hdf5_path}")
+        else:
+            phase_id = _infer_control_phase(joint_8[:, 7])
+        if control is not None and "contact" in control:
+            contact = np.asarray(control["contact"][()], dtype=np.float32)[arange]
+            contact_valid = np.ones(T, dtype=np.uint8)
+        else:
+            contact = np.zeros(T, dtype=np.float32)
+            contact_valid = np.zeros(T, dtype=np.uint8)
+
         def _read_rgb(*path_parts: str):
             """读取 HDF5 中图像路径并解码，key 不存在或解码失败时 raise，不返回 None。"""
             path_str = "/".join(path_parts)
@@ -201,6 +239,15 @@ def _load_univtac_episode(
         "right_tactile_area_gripper": right_tactile_area_gripper,
         "right_tactile_sensor_gripper": right_tactile_sensor_gripper,
         "right_tactile_type_gripper": right_tactile_type_gripper,
+        # MoT-Control V3-only fields.  FTP-1 ignores unknown arrays; the derived clip builder
+        # preserves them for the standalone action decoder.
+        "command8": command_8.astype(np.float32),
+        "command_valid": command_valid,
+        "phase_id": phase_id.astype(np.int64),
+        "contact": contact.astype(np.float32),
+        "contact_valid": contact_valid,
+        "control_step": control_step,
+        "control_step_valid": control_step_valid,
     }
     if wrist_rgb is not None:
         episode["right_wrist_camera_rgb"] = wrist_rgb
@@ -208,9 +255,85 @@ def _load_univtac_episode(
     return episode
 
 
+def _infer_control_phase(gripper: np.ndarray, *, threshold: float = 1e-5) -> np.ndarray:
+    """Best-effort four-phase labels for legacy demonstrations.
+
+    New V3 episodes carry authoritative simulator phase ids.  The legacy 100-episode release has
+    only qpos, but its lift-bottle script is monotonic: settle, close, manipulate, release.  This
+    fallback makes the old data usable while remaining visibly weaker through the missing command
+    and contact validity masks.
+    """
+    values = np.asarray(gripper, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return np.empty(0, dtype=np.int64)
+    delta = np.diff(values, prepend=values[0])
+    closing = np.flatnonzero(delta < -threshold)
+    opening = np.flatnonzero((delta > threshold) & (np.arange(values.size) > values.size // 2))
+    close_start = int(closing[0]) if closing.size else min(1, values.size)
+    release_start = int(opening[0]) if opening.size else values.size
+
+    phase = np.full(values.size, 2, dtype=np.int64)
+    phase[:close_start] = 0
+    if closing.size:
+        # Retain one settled post-close frame as LIFT whenever the episode provides one.  This
+        # avoids assigning the entire grasp-to-release interval to CLOSE on short legacy demos.
+        close_stop = min(int(closing[-1]) + 2, release_start)
+        if release_start > close_start + 1:
+            close_stop = min(close_stop, release_start - 1)
+        phase[close_start:close_stop] = 1
+    phase[release_start:] = 3
+    return phase
+
+
 # The upstream repository historically used demo/hdf5/. The published UniVTAC
 # dataset uses clean/. Accept both without requiring users to rearrange downloads.
 HDF5_SUBDIR_CANDIDATES = ("demo/hdf5", "clean")
+
+
+def _numeric_episode_seed(path: Path) -> int | None:
+    """Return the non-negative integer encoded by an HDF5 filename stem, if any."""
+    stem = path.stem
+    if not stem.isascii() or not stem.isdecimal():
+        return None
+    seed = int(stem)
+    if seed > np.iinfo(np.int64).max:
+        return None
+    return seed
+
+
+def _is_authoritative_v3_episode(episode: dict[str, np.ndarray]) -> bool:
+    """Whether an episode carries any authoritative V3 control supervision."""
+    validity_keys = ("command_valid", "contact_valid", "control_step_valid")
+    return any(bool(np.asarray(episode.get(key, []), dtype=bool).any()) for key in validity_keys)
+
+
+def _source_episode_seed_array(records: list[tuple[Path, bool]]) -> np.ndarray | None:
+    """Build stable episode metadata, requiring it for authoritative V3 collections.
+
+    Legacy UniVTAC releases may use descriptive filenames, so their stores remain readable and
+    simply omit this optional metadata.  Once any accepted episode is V3-authoritative, however,
+    every accepted episode must have a unique numeric source filename: a partial identity vector
+    would be worse than a loud conversion failure.
+    """
+    if not records:
+        return None
+    seeds = [_numeric_episode_seed(path) for path, _authoritative in records]
+    authoritative = any(is_authoritative for _path, is_authoritative in records)
+    invalid = [path.name for (path, _is_authoritative), seed in zip(records, seeds, strict=True) if seed is None]
+    numeric = [seed for seed in seeds if seed is not None]
+    seen: set[int] = set()
+    duplicate: set[int] = set()
+    for seed in numeric:
+        if seed in seen:
+            duplicate.add(seed)
+        seen.add(seed)
+    if authoritative and invalid:
+        raise ValueError(f"authoritative V3 HDF5 filenames must have numeric int64 stems; invalid: {invalid}")
+    if authoritative and duplicate:
+        raise ValueError(f"authoritative V3 HDF5 filenames encode duplicate episode seeds: {sorted(duplicate)}")
+    if invalid or duplicate:
+        return None
+    return np.asarray(numeric, dtype=np.int64)
 
 
 def _discover_task_dirs(base_dir: Path, task_list: list[str] | None) -> list[tuple[str, Path, Path]]:
@@ -285,11 +408,10 @@ def _run(
     }
 
     for task_id, _task_dir, hdf5_dir in task_dirs:
-        def _episode_sort_key(p: Path) -> int:
-            try:
-                return int(p.stem)
-            except ValueError:
-                return 0
+        def _episode_sort_key(p: Path) -> tuple[bool, int, str]:
+            seed = _numeric_episode_seed(p)
+            return (seed is None, seed if seed is not None else 0, p.name)
+
         hdf5_files = sorted(hdf5_dir.glob("*.hdf5"), key=_episode_sort_key)
         if not hdf5_files:
             continue
@@ -310,6 +432,7 @@ def _run(
             shutil.rmtree(zarr_path)
         replay_buffer = ReplayBuffer.create_from_path(str(zarr_path), mode="a")
 
+        source_episode_records: list[tuple[Path, bool]] = []
         for h5_path in tqdm(hdf5_files, desc=f"UniVTAC {task_id}"):
             if episodes_per_task is not None and count >= episodes_per_task:
                 break
@@ -343,8 +466,19 @@ def _run(
             # sub_task_instruction: (56,)
             # import pdb; pdb.set_trace()
             replay_buffer.add_episode(episode, compressors="disk")
+            source_episode_records.append((h5_path, _is_authoritative_v3_episode(episode)))
             count += 1
             # break
+
+        source_episode_seeds = _source_episode_seed_array(source_episode_records)
+        if source_episode_seeds is not None:
+            chunk_size = max(1, min(1024, int(source_episode_seeds.size)))
+            replay_buffer.root["meta"].create_array(
+                name="source_episode_seed",
+                data=source_episode_seeds,
+                chunks=(chunk_size,),
+                compressor=None,
+            )
 
         print(f"  {task_id}: wrote {count} episodes -> {zarr_path}")
 

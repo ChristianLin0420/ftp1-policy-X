@@ -11,9 +11,10 @@ Training vs Eval consistency (state / image / action / robot):
   eval builds state from observation["embodiment"]["joint"][:8] and fills [9:16]=arm, [16+28]=gripper,
   pose9d left zeros (UniVTAC zarr has no wrist_pose). Gripper uses the same absolute qpos
   convention in both data_processing and eval (no affine flip).
-- Image: 224x224, BGR (training zarr from parse_data_univtac uses cv2.imdecode → BGR; eval converts
-  sim RGB to BGR before resize so model sees same channel order).
-- Tactile: (1,2,224,224,3) BGR; two pads: [left_tac (thumb), right_tac (index)] matching
+- Image: 224x224 in UniVTAC's native numeric channel order. The writer encodes simulator arrays
+  directly, and the parser's BGR->RGB followed by its Zarr channel reversal cancel. Eval therefore
+  preserves live arrays exactly instead of applying an extra reversal.
+- Tactile: (1,2,224,224,3) in the same native order; two pads: [left_tac (thumb), right_tac (index)] matching
   parse_data_univtac.py lines 147-166 which reads both left_gsmini AND right_gsmini separately.
 - Action: action representation must match training (`action_joint_rep`).
   This script supports relative, absolute, and mix outputs.
@@ -40,6 +41,7 @@ import re
 import sys
 import time
 import traceback
+import zipfile
 import yaml
 from dataclasses import dataclass
 from multiprocessing import get_context
@@ -48,6 +50,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from episode_trace import MAX_TRAJECTORY_ACTIONS, EpisodeTraceRecorder, validate_episode_trace
 from eval_result_utils import build_run_id, load_worker_metadata, summarize_worker_metadata, worker_name, write_json
 from openpi.models_pytorch.ftp1_model_config import FTP1_RESERVED_ACTION_DIM
 from openpi.models_pytorch.ftp1_model_config import FTP1_SINGLE_ARM_ACTION_REP_DIM
@@ -237,19 +240,27 @@ def _save_infer_input_sample(
     state: np.ndarray,
     tactiles: dict[str, np.ndarray] | None,
     prompt: str,
+    episode_seed: int | None,
 ) -> None:
-    """Save one sample of the exact inputs passed to the model (224x224, BGR)."""
+    """Save one sample of the exact numeric arrays passed to the model."""
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    exact: dict[str, np.ndarray] = {
+        "state": np.asarray(state),
+        "prompt": np.asarray(prompt),
+        "episode_seed": np.asarray(-1 if episode_seed is None else episode_seed, dtype=np.int64),
+    }
     for key, img in images.items():
         if img is not None and img.size > 0:
+            exact[f"image__{key}"] = np.asarray(img)
             out = save_dir / f"{key.replace('/', '_')}.png"
             cv2.imwrite(str(out), img)
     tac_strips = []
     if tactiles is not None:
         for key, tac in tactiles.items():
+            exact[f"tactile__{key}"] = np.asarray(tac)
             for i in range(tac.shape[1]):
-                frame = tac[0, i]
+                frame = np.clip(tac[0, i], 0, 255).astype(np.uint8)
                 cv2.imwrite(str(save_dir / f"tactile_{key.replace('/', '_')}_pad{i}.png"), frame)
                 tac_strips.append(frame)
     # One preview image: [head | wrist | tac0 | tac1] side by side (all 224 wide)
@@ -261,16 +272,30 @@ def _save_infer_input_sample(
     if parts:
         preview = np.concatenate(parts, axis=1)  # (224, 224*N, 3)
         cv2.imwrite(str(save_dir / "model_input_preview.png"), preview)
+    np.savez_compressed(save_dir / "ftp1_input.npz", **exact)
     (save_dir / "state.txt").write_text(f"state shape={state.shape}\nstate[0] (first 16)={state[0, :16].tolist()}")
     (save_dir / "prompt.txt").write_text(prompt or "")
-    readme = """Images here are exactly what is fed to the FTP1 model (224x224, BGR).
+    readme = """The NPZ contains the exact numeric arrays fed to the FTP1 wrapper.
 - camera_ego_rgb_0.png = head camera
 - right_wrist_camera_rgb_0.png = wrist camera
 - tactile_*_pad0.png, pad1.png = two tactile pads
 - model_input_preview.png = [head | wrist | tac0 | tac1] concatenated
-Channel order is BGR (same as training from parse_data imdecode).
+Channel order is UniVTAC-native: byte-equivalent to the training Zarr / cv2.imdecode output.
 """
     (save_dir / "README.txt").write_text(readme)
+    (save_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "channel_order": "univtac_native_cv2_decoded",
+                "image_keys": sorted(images),
+                "tactile_keys": sorted(tactiles or {}),
+                "tactile_pad_order": ["left/thumb", "right/index"],
+                "episode_seed": episode_seed,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def _get_task_instruction(task_name: str) -> str:
@@ -387,6 +412,46 @@ def _get_qpos8(observation: dict[str, Any]) -> np.ndarray:
     return np.asarray(qpos8, dtype=np.float32).reshape(8)
 
 
+def _get_task_qpos8(task: Any) -> np.ndarray:
+    """Read post-action joints without rendering cameras or tactile sensors again."""
+    joint = task._robot_manager.get_observations(["joint"])["joint"][:8]  # noqa: SLF001
+    if isinstance(joint, torch.Tensor):
+        joint = joint.detach().cpu().numpy()
+    return np.asarray(joint, dtype=np.float32).reshape(8)
+
+
+def _get_first_action_debug(rtac: Any, qpos8_before: np.ndarray) -> dict[str, Any]:
+    """Extract the latest chunk's first executable vector under the policy's raw action semantics."""
+    history = getattr(rtac, "_chunk_history", None)
+    if not history:
+        raise RuntimeError("policy did not retain the predicted chunk required for trajectory diagnostics")
+    chunk = np.asarray(history[-1][0])
+    if chunk.ndim != 2:
+        raise ValueError(f"latest policy chunk must be rank 2, got {chunk.shape}")
+    first_index = int(getattr(rtac, "first_executable_index", getattr(rtac, "_rtac_chunk_index_offset", 1)))
+    if not 0 <= first_index < chunk.shape[0]:
+        raise ValueError(f"first executable index {first_index} outside chunk shape {chunk.shape}")
+    raw_vector = np.asarray(chunk[first_index], dtype=np.float32).reshape(-1)
+    if raw_vector.shape != (int(rtac.action_dim),):
+        raise ValueError(f"raw action has shape {raw_vector.shape}, expected {(int(rtac.action_dim),)}")
+    chunk_action_rep = str(getattr(rtac, "chunk_action_rep", rtac.action_rep))
+    raw_action8 = _extract_univtac_action_from_ftp1(
+        raw_vector,
+        int(rtac.action_dim),
+        rtac.mapping,
+        action_rep=chunk_action_rep,
+    )
+    resolved_action8 = _resolve_univtac_abs_action_from_ftp1(raw_action8, qpos8_before, chunk_action_rep)
+    return {
+        "chunk_shape": tuple(int(value) for value in chunk.shape),
+        "first_executable_index": first_index,
+        "chunk_action_rep": chunk_action_rep,
+        "raw_first_vector": raw_vector,
+        "raw_first_action8": raw_action8,
+        "resolved_first_action8": resolved_action8,
+    }
+
+
 def _load_task_settings() -> dict[str, Any]:
     """Load UniVTAC policy/task_settings.json; keys are task names, values have e.g. camera_type: 'head' | 'all'."""
     path = Path(__file__).resolve().parent.parent / "policy" / "task_settings.json"
@@ -431,6 +496,7 @@ class FTP1ChunkPolicy:
         save_infer_input_dir: str | Path | None = None,
         use_temporal_ensemble: bool = False,
         ensemble_K: float = DEFAULT_ENSEMBLE_K,
+        sample_seed: int = 0,
     ):
         normalized_action_rep = _canonicalize_action_joint_rep(action_rep)
         if normalized_action_rep is None:
@@ -446,6 +512,9 @@ class FTP1ChunkPolicy:
             device=device,
             num_inference_steps=num_inference_steps,
         )
+        self.sample_seed = int(sample_seed)
+        self._generator = torch.Generator(device=self.wrapper.device)
+        self._generator.manual_seed(self.sample_seed)
         self.model_action_dim = int(self.wrapper.get_action_dim())
         self.state_dim = int(self.wrapper.get_state_dim())
         self.action_dim = int(self.wrapper.get_action_dim())
@@ -471,6 +540,7 @@ class FTP1ChunkPolicy:
         self._chunk_history: list[tuple[np.ndarray, int, np.ndarray]] = []
         self._exec_step: int = 0
         self._last_action_debug: dict[str, Any] | None = None
+        self._episode_seed: int | None = None
 
         if not self.use_tactile_input:
             print(
@@ -478,7 +548,10 @@ class FTP1ChunkPolicy:
                 flush=True,
             )
 
-    def reset(self):
+    def reset(self, seed: int | None = None):
+        episode_seed = 0 if seed is None else int(seed)
+        self._episode_seed = seed
+        self._generator.manual_seed((self.sample_seed + episode_seed) % (2**63 - 1))
         self._cached_chunk = None
         self._cached_idx = 0
         self._chunk_history = []
@@ -549,16 +622,17 @@ class FTP1ChunkPolicy:
             
         # import pdb; pdb.set_trace()
 
-        # if self.save_infer_input_dir and not self._saved_infer_input:
-        #     _save_infer_input_sample(
-        #         self.save_infer_input_dir,
-        #         images=images,
-        #         state=state,
-        #         tactiles=tactiles,
-        #         prompt=prompt,
-        #     )
-        #     self._saved_infer_input = True
-        #     print(f"[eval_ftp1] Saved model input sample to {self.save_infer_input_dir}", flush=True)
+        if self.save_infer_input_dir and not self._saved_infer_input:
+            _save_infer_input_sample(
+                self.save_infer_input_dir,
+                images=images,
+                state=state,
+                tactiles=tactiles,
+                prompt=prompt,
+                episode_seed=self._episode_seed,
+            )
+            self._saved_infer_input = True
+            print(f"[eval_ftp1] Saved model input sample to {self.save_infer_input_dir}", flush=True)
         
         # from PIL import Image
         # images['camera_ego_rgb_0']
@@ -575,6 +649,7 @@ class FTP1ChunkPolicy:
             tactiles=tactiles,
             tactile_function_areas=tactile_function_areas,
             tactile_sensors=tactile_sensors,
+            noise_generator=self._generator,
         )
         if chunk.ndim != 2 or chunk.shape[1] != self.action_dim:
             raise ValueError(f"Unexpected FTP1 output shape {chunk.shape}, expected (H,{self.action_dim})")
@@ -706,14 +781,17 @@ def _collect_resume_state_from_videos(
     worker_id: int,
     start_seed: int,
     total_num: int,
+    require_trajectory: bool = False,
 ) -> tuple[dict[int, str], int, int]:
     """Return (completed_results, deleted_abnormal_videos, synced_metadata_entries)."""
     seed_set = set(range(start_seed, start_seed + total_num))
     worker = worker_name(worker_id)
     video_dir = Path(save_root) / "video" / worker
     metadata_path = Path(save_root) / "metadata" / f"{worker}.json"
+    trajectory_dir = Path(save_root) / "trajectory" / worker
 
     completed_candidates: dict[int, tuple[str, float, Path]] = {}
+    validated_trajectories: dict[int, dict[str, Any]] = {}
     deleted_abnormal_videos = 0
     if video_dir.exists():
         for video_path in sorted(video_dir.glob("*.mp4")):
@@ -723,6 +801,21 @@ def _collect_resume_state_from_videos(
                 if seed not in seed_set:
                     continue
                 if result in _COMPLETED_VIDEO_RESULTS:
+                    if require_trajectory:
+                        trajectory_path = trajectory_dir / f"{seed}.npz"
+                        try:
+                            trajectory = validate_episode_trace(trajectory_path, expected_seed=seed)
+                        except (FileNotFoundError, KeyError, OSError, ValueError, zipfile.BadZipFile):
+                            # A video alone is not a complete episode when trajectory capture is required.
+                            video_path.unlink(missing_ok=True)
+                            deleted_abnormal_videos += 1
+                            continue
+                        if trajectory["result"] != result:
+                            video_path.unlink(missing_ok=True)
+                            deleted_abnormal_videos += 1
+                            continue
+                        trajectory["path"] = str(trajectory_path.relative_to(save_root))
+                        validated_trajectories[seed] = trajectory
                     mtime = float(video_path.stat().st_mtime)
                     prev = completed_candidates.get(seed)
                     if prev is None or mtime >= prev[1]:
@@ -757,6 +850,10 @@ def _collect_resume_state_from_videos(
         if entry.get("resume_from_video") is not True:
             entry["resume_from_video"] = True
             changed = True
+        trajectory = validated_trajectories.get(seed)
+        if trajectory is not None and entry.get("trajectory") != trajectory:
+            entry["trajectory"] = trajectory
+            changed = True
         if changed or key not in worker_metadata:
             worker_metadata[key] = entry
             synced_metadata_entries += 1
@@ -775,10 +872,13 @@ def _run_one_task(
     rtac: FTP1ChunkPolicy,
     save_root: Path,
     worker_id: int,
+    *,
     no_video: bool = False,
     max_steps: int | None = None,
     video_frequency: int = 0,
     resume_from_videos: bool = False,
+    save_trajectory: bool = False,
+    trajectory_max_actions: int = 500,
 ) -> dict[str, Any]:
     seeds = list(range(start_seed, start_seed + total_num))
     resumed_results: dict[int, str] = {}
@@ -790,6 +890,7 @@ def _run_one_task(
             worker_id=worker_id,
             start_seed=start_seed,
             total_num=total_num,
+            require_trajectory=save_trajectory,
         )
     pending_seeds = [seed for seed in seeds if seed not in resumed_results]
     next_seed = pending_seeds[0] if pending_seeds else None
@@ -834,10 +935,22 @@ def _run_one_task(
     succ = sum(1 for result in resumed_results.values() if result == "success")
     done = len(resumed_results)
 
+    def finalize_trace(
+        recorder: EpisodeTraceRecorder | None,
+        *,
+        termination_reason: str,
+        result: str,
+    ) -> None:
+        if recorder is None:
+            return
+        metadata = recorder.write(termination_reason=termination_reason, result=result)
+        metadata["path"] = str(Path(metadata["path"]).relative_to(save_root))
+        task.metadata["trajectory"] = metadata
+
     try:
         for seed in pending_seeds:
             t0 = time.perf_counter()
-            rtac.reset()
+            rtac.reset(seed=seed)
             task.mode = "eval"
             task.reset(seed=seed, instructions=instructions)
             task.mean_steps = task.cfg.step_lim
@@ -848,10 +961,21 @@ def _run_one_task(
                 task.video_handler.write(task.get_frame_shot(init_obs))
 
             ok = False
+            termination_reason = "action_limit"
+            trace = (
+                EpisodeTraceRecorder(
+                    seed=seed,
+                    output_path=save_root / "trajectory" / worker_name(worker_id) / f"{seed}.npz",
+                    max_actions=trajectory_max_actions,
+                )
+                if save_trajectory
+                else None
+            )
             try:
                 while task.take_action_cnt < task.cfg.step_lim:
                     # 按仿真步数上限停止（max_steps 表示 step_count，不是 action 次数）
                     if max_steps is not None and max_steps > 0 and task.step_count >= max_steps:
+                        termination_reason = "sim_step_limit"
                         break
                     obs = task._get_observations()
                     prompt = instructions[0]
@@ -867,22 +991,30 @@ def _run_one_task(
                     action_index = int(task.take_action_cnt) + 1
                     step_count_before = int(task.step_count)
                     action8 = rtac.act(obs, prompt=prompt)
-                    model_debug = rtac.get_last_action_debug()
+                    action_debug = (
+                        _get_first_action_debug(rtac, qpos8_before)
+                        if is_first_step or trace is not None
+                        else None
+                    )
 
                     if is_first_step:
-                        last_chunk = rtac._chunk_history[-1][0] if rtac._chunk_history else None
-                        if last_chunk is not None:
-                            print(f"[DEBUG] raw chunk shape: {last_chunk.shape}", flush=True)
-                            print(f"[DEBUG] chunk[0] (placeholder): arm={last_chunk[0, 9:16].tolist()}, gripper_slot28={last_chunk[0, 44]:.6f}", flush=True)
-                            print(f"[DEBUG] chunk[1] (1st action):  arm={last_chunk[1, 9:16].tolist()}, gripper_slot28={last_chunk[1, 44]:.6f}", flush=True)
-                        delta8_dbg = _extract_univtac_action_from_ftp1(
-                            last_chunk[1] if last_chunk is not None else np.zeros(rtac.action_dim),
-                            rtac.action_dim, rtac.mapping, action_rep=rtac.action_rep,
-                        )
-                        print(f"[DEBUG] extracted model-space 8D from chunk[1]: {delta8_dbg.tolist()}", flush=True)
+                        assert action_debug is not None
+                        first_executable_index = action_debug["first_executable_index"]
+                        raw_action8 = action_debug["raw_first_action8"]
+                        print(f"[DEBUG] raw chunk shape: {action_debug['chunk_shape']}", flush=True)
                         print(
-                            f"[DEBUG] resolved abs target from chunk[1]: "
-                            f"{_resolve_univtac_abs_action_from_ftp1(delta8_dbg, qpos8_before, rtac.action_rep).tolist()}",
+                            f"[DEBUG] first executable chunk index={first_executable_index}: "
+                            f"arm={raw_action8[:7].tolist()}, gripper={raw_action8[7]:.6f}",
+                            flush=True,
+                        )
+                        print(
+                            f"[DEBUG] extracted model-space 8D from chunk[{first_executable_index}]: "
+                            f"{raw_action8.tolist()}",
+                            flush=True,
+                        )
+                        print(
+                            f"[DEBUG] resolved abs target from chunk[{first_executable_index}]: "
+                            f"{action_debug['resolved_first_action8'].tolist()}",
                             flush=True,
                         )
                         print(f"[DEBUG] ensembled action8 (sent to take_action): {action8.tolist()}", flush=True)
@@ -890,18 +1022,44 @@ def _run_one_task(
                         print(f"{'='*80}\n", flush=True)
 
                     action_tensor = torch.from_numpy(action8).to(task.device).float()
-                    task.take_action(action_tensor, action_type="qpos")
-                    if task.eval_success:
+                    exec_success, _ = task.take_action(action_tensor, action_type="qpos")
+                    qpos8_after = _get_task_qpos8(task)
+                    eval_success_after = bool(task.eval_success)
+                    early_stop_after = False if eval_success_after else bool(task.check_early_stop())
+                    if trace is not None:
+                        assert action_debug is not None
+                        trace.append(
+                            action_index=action_index,
+                            sim_step_before=step_count_before,
+                            sim_step_after=int(task.step_count),
+                            qpos8_before=qpos8_before,
+                            qpos8_after=qpos8_after,
+                            sent_action8=action8,
+                            raw_first_vector=action_debug["raw_first_vector"],
+                            raw_first_action8=action_debug["raw_first_action8"],
+                            resolved_first_action8=action_debug["resolved_first_action8"],
+                            first_executable_index=action_debug["first_executable_index"],
+                            raw_action_rep=action_debug["chunk_action_rep"],
+                            exec_success=bool(exec_success),
+                            eval_success_after=eval_success_after,
+                            early_stop_after=early_stop_after,
+                        )
+                    if eval_success_after:
                         ok = True
+                        termination_reason = "success"
                         break
-                    if task.check_early_stop():
+                    if early_stop_after:
+                        termination_reason = "task_early_stop"
                         break
             except Exception:
+                finalize_trace(trace, termination_reason="error", result="error")
                 task.clean_cache(result="error")
                 raise
             else:
                 cost = time.perf_counter() - t0
-                task.clean_cache(result="success" if ok else "failed")
+                result = "success" if ok else "failed"
+                finalize_trace(trace, termination_reason=termination_reason, result=result)
+                task.clean_cache(result=result)
                 done += 1
                 if ok:
                     succ += 1
@@ -929,7 +1087,7 @@ def _write_task_run_summary(
     worker_payloads = load_worker_metadata(task_run_root / "metadata")
     summary = summarize_worker_metadata(worker_payloads)
     summary.update({
-        "policy_name": "FTP1",
+        "policy_name": str((args_dict or {}).get("policy_name", "FTP1")),
         "task_name": task_name,
         "run_id": run_id,
         "run_root": str(task_run_root),
@@ -1089,6 +1247,8 @@ def _worker_main(
     AppLauncher.add_app_launcher_args(parser)
     app_args = parser.parse_args([])  # defaults
     app_args.enable_cameras = True
+    # Match UniVTAC's upstream parallel evaluator exactly. This selects its standard rendering
+    # experience; livestream=0 selects a distinct headless experience and changes the protocol.
     app_args.livestream = 2
     app_args.num_envs = 1
     # 强制 quality 渲染，减少 RTX 杂点（大显存机上 FTP1+Isaac 同 GPU 时易出现噪点）
@@ -1121,6 +1281,7 @@ def _worker_main(
             save_infer_input_dir=save_infer_dir,
             use_temporal_ensemble=bool(args_dict.get("temporal_ensemble", False)),
             ensemble_K=float(args_dict.get("ensemble_K", DEFAULT_ENSEMBLE_K)),
+            sample_seed=int(args_dict.get("policy_sample_seed", 0)),
         )
         print(
             f"[eval_ftp1] Worker {worker_id}: FTP1 loaded "
@@ -1153,6 +1314,8 @@ def _worker_main(
                 max_steps=args_dict.get("max_steps"),
                 video_frequency=int(args_dict.get("video_frequency", 0)),
                 resume_from_videos=bool(args_dict.get("resume", False)),
+                save_trajectory=bool(args_dict.get("save_trajectory", False)),
+                trajectory_max_actions=int(args_dict.get("trajectory_max_actions", 500)),
             )
             if int(args_dict.get("workers", 1)) <= 1:
                 _backfill_task_run_summary(
@@ -1178,6 +1341,7 @@ def main():
     cli_argv = _rewrite_cli_device_flags(sys.argv[1:])
     parser = argparse.ArgumentParser(description="Evaluate FTP1 on UniVTAC tasks (multi-task, optional parallel).")
     parser.add_argument("--checkpoint_dir", type=str, default="", help="FTP1 checkpoint step dir, e.g. .../7999")
+    parser.add_argument("--policy_name", type=str, default="FTP1", help="Policy label recorded in result metadata")
     parser.add_argument("--domain_name", type=str, default="", help="Normalization domain name under checkpoint/normalization/")
     parser.add_argument("--task_list", type=str, default="", help="Comma-separated UniVTAC task names, e.g. lift_bottle,insert_hole")
     parser.add_argument("--task_config", type=str, default="contact.yml", help="Task config yaml under UniVTAC/task_config/ or an absolute path")
@@ -1214,6 +1378,17 @@ def main():
     parser.add_argument("--no_video", action="store_true", help="Disable video recording (useful when ffmpeg is not installed)")
     parser.add_argument("--video_frequency", type=int, default=0,
                         help="Override video_frequency from task config. 1 = record every step. 0 = use task config default.")
+    parser.add_argument(
+        "--save_trajectory",
+        action="store_true",
+        help="Save one bounded, compressed per-action NPZ for every attempted episode.",
+    )
+    parser.add_argument(
+        "--trajectory_max_actions",
+        type=int,
+        default=500,
+        help=f"Maximum recorded actions per episode (1..{MAX_TRAJECTORY_ACTIONS}); evaluation continues if capped.",
+    )
     parser.add_argument("--gripper_slot_idx", type=int, default=28, help="Index into 32-slot hand vector for gripper (default 28)")
 
     # 91D/other dim override (recommended for dim91 checkpoint)
@@ -1222,7 +1397,13 @@ def main():
     parser.add_argument("--action_rep", type=str, default="auto", choices=["auto", "relative", "absolute", "mix"],
                         help="Action representation: auto (infer from checkpoint train_config.json), relative (all deltas), absolute (all targets), or mix (arm delta + hand non-gripper relative + gripper(slot28) absolute)")
     parser.add_argument("--save_infer_input_dir", type=str, default=None,
-                        help="If set, save one sample of the exact images/state/tactile fed to the model (224x224 BGR) to this dir for inspection.")
+                        help="If set, save one exact numeric model-input sample and previews to this directory.")
+    parser.add_argument(
+        "--policy_sample_seed",
+        type=int,
+        default=0,
+        help="Base seed for FTP1's episode-local flow-noise generator (episode seed is added).",
+    )
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Max simulation steps (step_count) per episode; stop when step_count >= this. Use 0 to only use task step_lim (max actions). .sh default is 160.")
     parser.add_argument("--temporal_ensemble", action="store_true",
@@ -1256,6 +1437,8 @@ def main():
     args = parser.parse_args(cli_argv)
     if args.chunk_first_n < 0:
         raise ValueError("--chunk_first_n must be >= 0")
+    if not 1 <= args.trajectory_max_actions <= MAX_TRAJECTORY_ACTIONS:
+        raise ValueError(f"--trajectory_max_actions must be in [1, {MAX_TRAJECTORY_ACTIONS}]")
 
     task_cfg_path = _resolve_task_config_path(args.task_config, must_exist=not bool(args.summary_only_run_roots))
 

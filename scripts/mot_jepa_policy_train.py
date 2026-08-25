@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train a DiT action head on a frozen MoT-JEPA encoder.
+"""Train an action policy from a pretrained MoT-JEPA encoder.
 
 Two arms behind one script, differing in exactly one config field:
 
@@ -10,7 +10,9 @@ The control exists because this pipeline changes two things at once relative to 
 the conditioning encoder (frozen MoT-JEPA rather than PaliGemma) *and* the generative objective.
 An arm that changes only the encoder is what makes a bad result attributable.
 
-The encoder is frozen and runs under ``no_grad``; only the head trains. Requeue, checkpointing and
+The historical default keeps the encoder frozen. ``backbone_train_mode`` can instead adapt its
+last blocks or every reachable parameter; in those modes the encoder and head sit behind one DDP
+reducer and the adapted backbone is an explicit checkpoint artifact. Requeue, checkpointing and
 sample-order continuity are inherited from the pretraining trainer.
 
     torchrun ... scripts/mot_jepa_policy_train.py mot_jepa_policy_drifting \
@@ -21,6 +23,7 @@ sample-order continuity are inherited from the pretraining trainer.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -41,13 +44,15 @@ from openpi.mot_jepa import runtime
 from openpi.mot_jepa.action_dit import ActionDiT
 from openpi.mot_jepa.action_dit import ActionNormalizer
 from openpi.mot_jepa.action_dit import LinearHead
-from openpi.mot_jepa.action_dit import flow_matching_loss
-from openpi.mot_jepa.action_dit import regression_loss
 from openpi.mot_jepa.clip_dataset import MotJepaClipDataset
 from openpi.mot_jepa.clip_dataset import collate_clips
 from openpi.mot_jepa.clip_dataset import load_domain_config
 from openpi.mot_jepa.clip_dataset import split_clip_index
-from openpi.mot_jepa.drifting import drifting_loss
+from openpi.mot_jepa.policy_finetune import BackboneSelection
+from openpi.mot_jepa.policy_finetune import PolicyTrainModel
+from openpi.mot_jepa.policy_finetune import configure_backbone_trainability
+from openpi.mot_jepa.policy_finetune import grad_norm
+from openpi.mot_jepa.policy_finetune import make_step_generator
 from openpi.shared.wandb_compat import wandb
 from scripts.mot_jepa_train import InfiniteBatchSampler
 from scripts.mot_jepa_train import lr_at
@@ -87,7 +92,12 @@ def build_dataset(cfg: config_module.PolicyConfig) -> MotJepaClipDataset:
         lowdim_channels=cfg.data.lowdim_channels,
         with_conditioning=True,
         action_horizon=cfg.head.horizon,
+        action_stride=cfg.data.action_stride,
     )
+    # Domain ids are only meaningful together with this exact ordering. Persist the names in
+    # action_stats.npz so adding or renaming a store cannot silently route a checkpoint through a
+    # different task-specific embedding/output row at evaluation time.
+    dataset.domain_names = tuple(names)
     if cfg.holdout_mod > 1:
         before = len(dataset)
         dataset.clip_index = split_clip_index(dataset.clip_index, holdout_mod=cfg.holdout_mod, want="train")
@@ -96,7 +106,14 @@ def build_dataset(cfg: config_module.PolicyConfig) -> MotJepaClipDataset:
 
 
 def fit_action_stats(
-    dataset: MotJepaClipDataset, num_domains: int, path: pathlib.Path, *, clips_per_domain: int = 4096
+    dataset: MotJepaClipDataset,
+    num_domains: int,
+    path: pathlib.Path,
+    *,
+    observation_strides: tuple[int, ...],
+    action_stride: int,
+    domain_names: tuple[str, ...],
+    clips_per_domain: int = 4096,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-domain, per-dimension mean/std of the action chunk, cached to ``path``.
 
@@ -110,6 +127,20 @@ def fit_action_stats(
     """
     if path.exists():
         blob = np.load(path)
+        required = {"observation_strides", "action_stride", "horizon", "domains"}
+        missing = sorted(required - set(blob.files))
+        if missing:
+            raise ValueError(f"{path} lacks sampling metadata {missing}; refuse to reuse stale action statistics")
+        stored_observation = tuple(int(v) for v in np.asarray(blob["observation_strides"]).reshape(-1))
+        stored_action = int(np.asarray(blob["action_stride"]).item())
+        stored_horizon = int(np.asarray(blob["horizon"]).item())
+        stored_domains = tuple(str(name) for name in blob["domains"])
+        expected = (observation_strides, action_stride, dataset.action_horizon)
+        actual = (stored_observation, stored_action, stored_horizon)
+        if actual != expected:
+            raise ValueError(f"{path} sampling metadata is {actual}, expected {expected}; refuse stale statistics")
+        if stored_domains != domain_names:
+            raise ValueError(f"{path} domain mapping is {stored_domains}, expected {domain_names}")
         return torch.from_numpy(blob["mean"]), torch.from_numpy(blob["scale"])
 
     total = np.zeros((num_domains, 120), dtype=np.float64)
@@ -142,7 +173,15 @@ def fit_action_stats(
     scale[count == 0] = 1.0
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, mean=mean.astype(np.float32), scale=scale.astype(np.float32))
+    np.savez(
+        path,
+        mean=mean.astype(np.float32),
+        scale=scale.astype(np.float32),
+        observation_strides=np.asarray(observation_strides, dtype=np.int64),
+        action_stride=np.asarray(action_stride, dtype=np.int64),
+        horizon=np.asarray(dataset.action_horizon, dtype=np.int64),
+        domains=np.asarray(domain_names),
+    )
     logger.info(
         "action stats over %d clips: median live scale %.5f (min %.5f, max %.5f)",
         len(picks),
@@ -165,19 +204,191 @@ def init_tracking(cfg: config_module.PolicyConfig, run_dir: pathlib.Path, *, res
         id_path.write_text(str(wandb.run.id))
 
 
+def optimizer_step_bounds(optimizer: torch.optim.Optimizer) -> tuple[int, int] | None:
+    """Min/max Adam counter across parameters that have entered the executed graph."""
+    steps = []
+    for state in optimizer.state.values():
+        if "step" not in state:
+            continue
+        value = state["step"]
+        steps.append(int(value.item()) if isinstance(value, torch.Tensor) else int(value))
+    return (min(steps), max(steps)) if steps else None
+
+
+def gather_peak_gpu_memory(device: torch.device) -> list[dict[str, int]]:
+    """Collect allocated/reserved CUDA peaks from every rank in stable rank order."""
+    if device.type != "cuda":
+        return [{"allocated": 0, "reserved": 0}]
+    local = torch.tensor(
+        [torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+        dtype=torch.int64,
+        device=device,
+    )
+    if runtime.get_world_size() > 1:
+        gathered = [torch.zeros_like(local) for _ in range(runtime.get_world_size())]
+        torch.distributed.all_gather(gathered, local)
+    else:
+        gathered = [local]
+    return [
+        {"allocated": int(values[0].item()), "reserved": int(values[1].item())}
+        for values in gathered
+    ]
+
+
+def file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(16 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def head_initialization_provenance(cfg: config_module.PolicyConfig) -> dict:
+    """Validate and stamp the completed policy checkpoint used for a fresh adaptation run."""
+    if not cfg.init_head_from:
+        return {
+            "init_head_path": None,
+            "init_head_sha256": None,
+            "init_head_source_run": None,
+            "init_head_source_step": None,
+            "init_head_source_config_sha256": None,
+        }
+
+    init_path = pathlib.Path(cfg.init_head_from).resolve()
+    if init_path.name != "student.pt" or init_path.parent.parent.name != "checkpoints":
+        raise ValueError(f"init_head_from must be <completed_run>/checkpoints/<step>/student.pt, got {init_path}")
+    try:
+        source_step = int(init_path.parent.name)
+    except ValueError as exc:
+        raise ValueError(f"head source checkpoint directory is not an integer step: {init_path.parent}") from exc
+    source_run = init_path.parent.parent.parent
+    expected_path = source_run / "checkpoints" / str(source_step) / "student.pt"
+    if init_path != expected_path.resolve() or not init_path.is_file():
+        raise FileNotFoundError(f"missing canonical head source {expected_path}")
+    done_path = source_run / "DONE"
+    latest_path = source_run / "checkpoints" / "latest"
+    if not done_path.is_file() or int(done_path.read_text().strip()) != source_step:
+        raise ValueError(f"head source is not a completed run at step {source_step}: {done_path}")
+    if not latest_path.is_file() or int(latest_path.read_text().strip()) != source_step:
+        raise ValueError(f"head source latest pointer does not equal completed step {source_step}: {latest_path}")
+
+    source_config_path = source_run / "run_config.json"
+    source_payload = json.loads(source_config_path.read_text())
+    target_payload = json.loads(cfg.to_json())
+    exact_fields = ("name", "layout_preset", "encoder", "predictor", "head", "holdout_mod", "seed")
+    mismatches = {
+        field: (source_payload.get(field), target_payload.get(field))
+        for field in exact_fields
+        if source_payload.get(field) != target_payload.get(field)
+    }
+    data_fields = (
+        "store_glob",
+        "domain_config",
+        "strides",
+        "index_step",
+        "lowdim_channels",
+        "lowdim_log_compress",
+        "action_stride",
+    )
+    for field in data_fields:
+        source_value = source_payload.get("data", {}).get(field)
+        target_value = target_payload.get("data", {}).get(field)
+        if source_value != target_value:
+            mismatches[f"data.{field}"] = (source_value, target_value)
+    source_pretrained_run = pathlib.Path(str(source_payload.get("pretrained_run", ""))).resolve()
+    target_pretrained_run = pathlib.Path(cfg.pretrained_run).resolve()
+    if source_pretrained_run != target_pretrained_run:
+        mismatches["pretrained_run"] = (str(source_pretrained_run), str(target_pretrained_run))
+    if source_payload.get("pretrained_step") != cfg.pretrained_step:
+        mismatches["pretrained_step"] = (source_payload.get("pretrained_step"), cfg.pretrained_step)
+    if mismatches:
+        raise ValueError(f"head source/target policy contract differs: {mismatches}")
+
+    return {
+        "init_head_path": str(init_path),
+        "init_head_sha256": file_sha256(init_path),
+        "init_head_source_run": str(source_run.resolve()),
+        "init_head_source_step": source_step,
+        "init_head_source_config_sha256": file_sha256(source_config_path),
+    }
+
+
+def policy_checkpoint_metadata(
+    *,
+    cfg: config_module.PolicyConfig,
+    source_backbone_step: int,
+    backbone_selection: BackboneSelection,
+    optimizer: torch.optim.Optimizer,
+    head_parameters: tuple[torch.nn.Parameter, ...],
+    world_size: int,
+    last_record: dict[str, float] | None,
+    initialization_provenance: dict,
+    peak_gpu_memory_by_rank: list[dict[str, int]],
+) -> dict:
+    """Self-describing provenance for a policy/backbone/optimizer tuple."""
+    bounds = optimizer_step_bounds(optimizer)
+    return {
+        "policy_checkpoint_schema": 2,
+        "backbone_train_mode": cfg.backbone_train_mode,
+        "backbone_last_n_blocks": cfg.backbone_last_n_blocks,
+        "backbone_lr_multiplier": cfg.backbone_lr_multiplier,
+        "gradient_checkpointing": cfg.gradient_checkpointing,
+        "source_backbone_run": str(pathlib.Path(cfg.pretrained_run).resolve()),
+        "source_backbone_step": source_backbone_step,
+        "trainable_backbone_tensors": len(backbone_selection.parameters),
+        "trainable_backbone_parameters": backbone_selection.num_parameters,
+        "trainable_backbone_name_sha256": backbone_selection.name_digest,
+        "excluded_unreachable_backbone_parameters": list(backbone_selection.excluded_unreachable),
+        "trainable_head_parameters": sum(parameter.numel() for parameter in head_parameters),
+        "optimizer_step_min": bounds[0] if bounds else 0,
+        "optimizer_step_max": bounds[1] if bounds else 0,
+        "optimizer_groups": [
+            {
+                "name": str(group.get("group_name", f"group_{index}")),
+                "lr": float(group["lr"]),
+                "lr_multiplier": float(group.get("lr_multiplier", 1.0)),
+                "parameters": sum(parameter.numel() for parameter in group["params"]),
+            }
+            for index, group in enumerate(optimizer.param_groups)
+        ],
+        "world_size": world_size,
+        "last_train_metrics": dict(last_record or {}),
+        "peak_gpu_memory_bytes_by_rank": peak_gpu_memory_by_rank,
+        **initialization_provenance,
+    }
+
+
 def train(cfg: config_module.PolicyConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     use_ddp, local_rank, device = runtime.setup_ddp()
     rank, world_size = runtime.get_rank(), runtime.get_world_size()
 
     run_dir = cfg.run_dir
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if runtime.is_main_process():
+        run_dir.mkdir(parents=True, exist_ok=True)
+    runtime.barrier()
+    frozen_json, drift = runtime.resolve_run_config(run_dir, cfg.to_json())
+    if drift and runtime.is_main_process():
+        logger.warning("run_config.json differs from the CLI config; the FROZEN one wins:")
+        for key, (frozen_value, incoming) in drift.items():
+            logger.warning("  %s: frozen=%r cli=%r", key, frozen_value, incoming)
+    cfg = config_module.PolicyConfig.from_json(frozen_json)
     torch.manual_seed(cfg.seed + rank)
+    np.random.seed(cfg.seed + rank)
 
     if not cfg.pretrained_run:
         raise ValueError("--pretrained_run is required; the head is meaningless without an encoder")
+    initialization_provenance = head_initialization_provenance(cfg)
     backbone, backbone_step = runtime.load_frozen_backbone(
         pathlib.Path(cfg.pretrained_run), cfg.pretrained_step, cfg, device
+    )
+    backbone_selection = configure_backbone_trainability(
+        backbone,
+        mode=cfg.backbone_train_mode,
+        last_n_blocks=cfg.backbone_last_n_blocks,
+    )
+    backbone.set_gradient_checkpointing(
+        enabled=cfg.gradient_checkpointing and cfg.backbone_train_mode != "frozen"
     )
     dataset = build_dataset(cfg)
     logger.info("%d clips at horizon %d", len(dataset), cfg.head.horizon)
@@ -191,19 +402,45 @@ def train(cfg: config_module.PolicyConfig) -> None:
     head_cls = LinearHead if cfg.head.objective == "linear" else ActionDiT
     head = head_cls(cfg.head, cfg.layout, num_domains=num_domains).to(device)
     logger.info(
-        "frozen backbone step %d; head %s over %d domains, %.1fM trainable params",
+        "source backbone step %d; mode=%s (%d blocks, %.1fM trainable%s); "
+        "head %s over %d domains, %.1fM trainable params",
         backbone_step,
+        cfg.backbone_train_mode,
+        cfg.backbone_last_n_blocks if cfg.backbone_train_mode == "last_blocks" else 0,
+        backbone_selection.num_parameters / 1e6,
+        f", excluded={backbone_selection.excluded_unreachable}" if backbone_selection.excluded_unreachable else "",
         cfg.head.objective,
         num_domains,
         sum(p.numel() for p in head.parameters()) / 1e6,
     )
 
     stats_path = run_dir / "action_stats.npz"
+    if cfg.data.action_stride is None:
+        raise ValueError("policy training requires data.action_stride")
     if runtime.is_main_process():
-        fit_action_stats(dataset, num_domains, stats_path)
+        fit_action_stats(
+            dataset,
+            num_domains,
+            stats_path,
+            observation_strides=cfg.data.strides,
+            action_stride=cfg.data.action_stride,
+            domain_names=dataset.domain_names,
+        )
     runtime.barrier()
     normalizer = ActionNormalizer(num_domains).to(device)
-    normalizer.load_stats(*[t.to(device) for t in fit_action_stats(dataset, num_domains, stats_path)])
+    normalizer.load_stats(
+        *[
+            t.to(device)
+            for t in fit_action_stats(
+                dataset,
+                num_domains,
+                stats_path,
+                observation_strides=cfg.data.strides,
+                action_stride=cfg.data.action_stride,
+                domain_names=dataset.domain_names,
+            )
+        ]
+    )
     # Domain-pure batches, which pretraining does not need but IDP does. Its neighbour geometry
     # and its reference variance are both computed WITHIN a batch, so a batch mixing embodiments
     # would compare a 16-slot arm against a 40-slot bimanual rig and read the difference in
@@ -228,16 +465,75 @@ def train(cfg: config_module.PolicyConfig) -> None:
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
     )
 
+    head_parameters = tuple(head.parameters())
+    optimizer_groups: list[dict] = [
+        {
+            "params": head_parameters,
+            "lr": cfg.lr_peak,
+            "lr_multiplier": 1.0,
+            "group_name": "head",
+        }
+    ]
+    if backbone_selection.parameters:
+        optimizer_groups.append(
+            {
+                "params": backbone_selection.parameters,
+                "lr": cfg.lr_peak * cfg.backbone_lr_multiplier,
+                "lr_multiplier": cfg.backbone_lr_multiplier,
+                "group_name": "backbone",
+            }
+        )
     optimizer = torch.optim.AdamW(
-        head.parameters(), lr=cfg.lr_peak, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay
+        optimizer_groups, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay
     )
 
     resume_step = runtime.find_latest_step(cfg.checkpoint_dir)
     global_step = 0
     if resume_step is not None:
-        global_step = runtime.load_checkpoint(
-            cfg.checkpoint_dir, resume_step, student=head, teacher=None, optimizer=optimizer, device=device
+        resume_path = cfg.checkpoint_dir / str(resume_step)
+        resume_metadata = torch.load(resume_path / "metadata.pt", map_location="cpu", weights_only=True)
+        expected_resume_metadata = {
+            "policy_checkpoint_schema": 2,
+            "global_step": resume_step,
+            "backbone_train_mode": cfg.backbone_train_mode,
+            "backbone_last_n_blocks": cfg.backbone_last_n_blocks,
+            "source_backbone_run": str(pathlib.Path(cfg.pretrained_run).resolve()),
+            "source_backbone_step": backbone_step,
+            "trainable_backbone_name_sha256": backbone_selection.name_digest,
+            "world_size": world_size,
+            **initialization_provenance,
+        }
+        resume_mismatches = {
+            key: (resume_metadata.get(key), expected)
+            for key, expected in expected_resume_metadata.items()
+            if resume_metadata.get(key) != expected
+        }
+        if resume_mismatches:
+            raise RuntimeError(
+                "resume provenance/topology differs from the checkpoint; refuse a discontinuous "
+                f"sample/RNG/weight stream: {resume_mismatches}"
+            )
+        resume_modules = (
+            {"backbone": backbone}
+            if (resume_path / "backbone.pt").exists() or cfg.backbone_train_mode != "frozen"
+            else None
         )
+        global_step = runtime.load_checkpoint(
+            cfg.checkpoint_dir,
+            resume_step,
+            student=head,
+            teacher=None,
+            optimizer=optimizer,
+            device=device,
+            loss_fn=normalizer,
+            extra_modules=resume_modules,
+        )
+        bounds = optimizer_step_bounds(optimizer)
+        if bounds is not None and bounds != (global_step, global_step):
+            raise RuntimeError(
+                f"optimizer counters {bounds} do not match resumed global step {global_step}; "
+                "refuse a discontinuous LR/noise sequence"
+            )
         logger.info("resumed from step %d", global_step)
     elif cfg.init_head_from:
         # Fine-tuning: start from a head trained on another dataset, at step 0 with a fresh
@@ -248,7 +544,7 @@ def train(cfg: config_module.PolicyConfig) -> None:
         # fine-tuning corpus has different domains, so the shapes need not even match. Refitting
         # is also what we want -- the head predicts in normalised units, which is precisely what
         # lets it transfer across datasets whose raw action scales differ ~8x.
-        init_path = pathlib.Path(cfg.init_head_from)
+        init_path = pathlib.Path(initialization_provenance["init_head_path"])
         weights = torch.load(init_path, map_location=device, weights_only=True)
         missing, unexpected = head.load_state_dict(weights, strict=False)
         if missing or unexpected:
@@ -260,14 +556,25 @@ def train(cfg: config_module.PolicyConfig) -> None:
     sampler.set_start_step(global_step)
     init_tracking(cfg, run_dir, resuming=resume_step is not None)
 
-    model = head
+    train_model = PolicyTrainModel(
+        backbone,
+        head,
+        objective=cfg.head.objective,
+        drifting_config=cfg.drifting,
+        train_backbone=bool(backbone_selection.parameters),
+    )
+    model = train_model
     if use_ddp:
         model = DistributedDataParallel(
-            head, device_ids=[local_rank], find_unused_parameters=cfg.find_unused_parameters
+            train_model,
+            device_ids=[local_rank],
+            find_unused_parameters=cfg.find_unused_parameters,
+            gradient_as_bucket_view=True,
         )
 
     monitor = runtime.PreemptionMonitor(run_dir / "PREEMPT_REQUEST", device)
     records: list[dict[str, float]] = []
+    last_record: dict[str, float] | None = None
     window_clips, window_start = 0, time.time()
     iterator = iter(loader)
     preempted = False
@@ -289,7 +596,9 @@ def train(cfg: config_module.PolicyConfig) -> None:
             total=cfg.num_train_steps,
         )
         for group in optimizer.param_groups:
-            group["lr"] = lr
+            # Historical frozen checkpoints have no custom multiplier in their one optimizer
+            # group; defaulting to 1.0 makes them resume bit-for-bit instead of becoming unloadable.
+            group["lr"] = lr * float(group.get("lr_multiplier", 1.0))
 
         inputs = to_inputs(batch, device)
         domain_id = batch["domain_id"].to(device, non_blocking=True)
@@ -297,35 +606,57 @@ def train(cfg: config_module.PolicyConfig) -> None:
         chunk_mask = batch["chunk_mask"].to(device, non_blocking=True).float()
         # Normalise, then re-apply the mask: z-scoring a dead slot would turn its structural zero
         # into -mean/scale, which is not zero and would be regressed as if it were a real target.
-        actions = normalizer.normalize(
-            batch["action_chunk"].to(device, non_blocking=True).float(), domain_id
-        ) * chunk_mask
-
-        # The encoder never trains, so no activations are kept for it. That is what makes the
-        # step affordable: only the 61.9M-parameter head holds a graph.
-        with torch.no_grad(), torch.autocast(device.type, torch.bfloat16, enabled=device.type == "cuda"):
-            encoded = backbone.encode_full(inputs)
-        encoded = type(encoded)(
-            tokens=[t.float() for t in encoded.tokens],
-            sync_readout=[t.float() for t in encoded.sync_readout],
-            final_readout=[t.float() for t in encoded.final_readout],
+        actions = (
+            normalizer.normalize(batch["action_chunk"].to(device, non_blocking=True).float(), domain_id) * chunk_mask
         )
 
-        if cfg.head.objective == "drifting":
-            loss, extras = drifting_loss(
-                model, encoded, actions, action_mask, chunk_mask, domain_id, config=cfg.drifting
-            )
-        elif cfg.head.objective == "linear":
-            loss, extras = regression_loss(model, encoded, actions, action_mask, chunk_mask, domain_id)
-        else:
-            loss, extras = flow_matching_loss(model, encoded, actions, action_mask, chunk_mask, domain_id)
-
         optimizer.zero_grad(set_to_none=True)
+        generator = make_step_generator(device, base_seed=cfg.seed, step=global_step, rank=rank)
+        loss, extras = model(
+            inputs,
+            actions,
+            action_mask,
+            chunk_mask,
+            domain_id,
+            generator=generator,
+        )
+        if not bool(torch.isfinite(loss.detach())):
+            raise FloatingPointError(f"non-finite policy loss at step {global_step}: {float(loss.detach())}")
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(head.parameters(), cfg.clip_grad_norm)
+
+        missing_head = [name for name, parameter in head.named_parameters() if parameter.requires_grad and parameter.grad is None]
+        missing_backbone = [
+            name
+            for name, parameter in backbone.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        if missing_head or missing_backbone:
+            raise RuntimeError(
+                f"trainable parameters missing gradients at step {global_step}: "
+                f"head={missing_head[:8]}, backbone={missing_backbone[:8]}"
+            )
+
+        head_grad_norm = grad_norm(head_parameters, device=device)
+        backbone_grad_norm = grad_norm(backbone_selection.parameters, device=device)
+        trainable_parameters = (*head_parameters, *backbone_selection.parameters)
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, cfg.clip_grad_norm)
+        norms = torch.stack([head_grad_norm, backbone_grad_norm, total_grad_norm])
+        if not bool(torch.isfinite(norms).all()):
+            raise FloatingPointError(
+                f"non-finite gradient norm at step {global_step}: "
+                f"head={float(head_grad_norm)}, backbone={float(backbone_grad_norm)}, total={float(total_grad_norm)}"
+            )
         optimizer.step()
 
-        records.append({"loss": float(loss.detach()), "learning_rate": lr, "grad_norm": float(grad_norm), **extras})
+        last_record = {
+            "loss": float(loss.detach()),
+            "learning_rate": lr,
+            "grad_norm": float(total_grad_norm),
+            "head_grad_norm": float(head_grad_norm),
+            "backbone_grad_norm": float(backbone_grad_norm),
+            **extras,
+        }
+        records.append(last_record)
         window_clips += cfg.local_batch_size * world_size
 
         if global_step % cfg.log_interval == 0:
@@ -347,19 +678,34 @@ def train(cfg: config_module.PolicyConfig) -> None:
                 if cfg.wandb_enabled:
                     wandb.log({f"policy/{k}": v for k, v in metrics.items()}, step=global_step)
 
-        if global_step % cfg.save_interval == 0 and runtime.is_main_process():
-            runtime.save_checkpoint(
-                cfg.checkpoint_dir,
-                global_step,
-                student=head,
-                teacher=None,
-                optimizer=optimizer,
-                config_json=cfg.to_json(),
-                loss_fn=normalizer,
-                keep_last=cfg.keep_last,
-                keep_period=cfg.keep_period,
-            )
+        if global_step % cfg.save_interval == 0:
+            peak_gpu_memory_by_rank = gather_peak_gpu_memory(device)
+            if runtime.is_main_process():
+                runtime.save_checkpoint(
+                    cfg.checkpoint_dir,
+                    global_step,
+                    student=head,
+                    teacher=None,
+                    optimizer=optimizer,
+                    config_json=cfg.to_json(),
+                    loss_fn=normalizer,
+                    extra_modules={"backbone": backbone},
+                    keep_last=cfg.keep_last,
+                    keep_period=cfg.keep_period,
+                    extra=policy_checkpoint_metadata(
+                        cfg=cfg,
+                        source_backbone_step=backbone_step,
+                        backbone_selection=backbone_selection,
+                        optimizer=optimizer,
+                        head_parameters=head_parameters,
+                        world_size=world_size,
+                        last_record=last_record,
+                        initialization_provenance=initialization_provenance,
+                        peak_gpu_memory_by_rank=peak_gpu_memory_by_rank,
+                    ),
+                )
 
+    peak_gpu_memory_by_rank = gather_peak_gpu_memory(device)
     if runtime.is_main_process():
         runtime.save_checkpoint(
             cfg.checkpoint_dir,
@@ -369,8 +715,20 @@ def train(cfg: config_module.PolicyConfig) -> None:
             optimizer=optimizer,
             config_json=cfg.to_json(),
             loss_fn=normalizer,
+            extra_modules={"backbone": backbone},
             keep_last=cfg.keep_last,
             keep_period=cfg.keep_period,
+            extra=policy_checkpoint_metadata(
+                cfg=cfg,
+                source_backbone_step=backbone_step,
+                backbone_selection=backbone_selection,
+                optimizer=optimizer,
+                head_parameters=head_parameters,
+                world_size=world_size,
+                last_record=last_record,
+                initialization_provenance=initialization_provenance,
+                peak_gpu_memory_by_rank=peak_gpu_memory_by_rank,
+            ),
         )
         if not preempted:
             # Stops the requeue chain; the batch script checks for this before resubmitting.

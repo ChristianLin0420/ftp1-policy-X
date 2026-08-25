@@ -1,0 +1,6 @@
+# Keep the FTP1 overlay compatible with packages owned by the UniVTAC Isaac Sim image.
+numpy==1.26.4
+opencv-python==4.11.0.86
+pillow==11.2.1
+scipy==1.11.4
+wrapt==1.17.3

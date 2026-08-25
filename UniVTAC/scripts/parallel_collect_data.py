@@ -1,17 +1,19 @@
+import argparse
+import importlib
+import io
+import json
 import os
 import sys
 import time
-import json
-import yaml
-import argparse
-import importlib
 import traceback
-import io
-from tqdm import tqdm
-from queue import Empty
+from multiprocessing import Event, Queue, current_process, get_context
 from pathlib import Path
-from typing import Literal, TYPE_CHECKING
-from multiprocessing import Process, Queue, Manager, Event, current_process
+from queue import Empty
+from threading import BrokenBarrierError
+from typing import TYPE_CHECKING, Literal
+
+import yaml
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from envs._base_task import BaseTask, BaseTaskCfg
@@ -33,24 +35,102 @@ def get_config(file, default_root: Path, type: Literal['yaml', 'json']):
 def split_devices(cuda_visible_devices: str, workers: int):
     devices = [d.strip() for d in cuda_visible_devices.split(',') if d.strip() != '']
     if not devices:
-        return [['']] * workers
+        return [[] for _ in range(workers)]
     assignment = []
     for i in range(workers):
         assignment.append([devices[i % len(devices)]])
     return assignment
 
 
-def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
-               progress, stop_event: Event, log_file: Path, device_list,
-               status_dict, result_q: Queue):
-    # Per-process env: assign CUDA devices
-    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(device_list) if device_list else ''
+def worker_http_ports(http_port_base: int, workers: int) -> list[int]:
+    """Return a collision-free HTTP transport port for every Isaac worker."""
+    if http_port_base < 1024 or http_port_base + workers - 1 > 65535:
+        raise ValueError(
+            f"HTTP port range [{http_port_base}, {http_port_base + workers - 1}] "
+            "must be within [1024, 65535]"
+        )
+    return list(range(http_port_base, http_port_base + workers))
+
+
+def advance_collection_seed(seed: int, seed_step: int) -> int:
+    """Advance within one deterministic, disjoint collection seed stream."""
+    if seed_step < 1:
+        raise ValueError("seed_step must be positive")
+    return seed + seed_step
+
+
+def configure_worker_env(env_cfg, task_config, base_save_dir: Path, worker_id: str):
+    """Route every collection YAML field before constructing the Isaac task."""
+    env_cfg.worker_name = f"worker_{int(worker_id) - 1}"
+    env_cfg.save_dir = base_save_dir / ".workers" / env_cfg.worker_name
+    env_cfg.tactile_sensor_type = task_config.get("sensor_type", env_cfg.tactile_sensor_type)
+    env_cfg.random_texture = task_config.get("random_texture", env_cfg.random_texture)
+    env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
+    env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
+    env_cfg.video_frequency = task_config.get("video_frequency", env_cfg.video_frequency)
+    env_cfg.render_frequency = task_config.get("render_frequency", env_cfg.render_frequency)
+    env_cfg.obs_data_type = task_config.get("observations", {})
+    env_cfg.scene.num_envs = 1
+    return env_cfg
+
+
+def validate_worker_topology(exitcodes, statuses, successes: int, target_episodes: int):
+    """Reject a collection that silently ran with fewer workers than requested."""
+    failed_workers = [
+        f"Worker-{index}:exit={exitcode}"
+        for index, exitcode in enumerate(exitcodes, start=1)
+        if exitcode != 0
+    ]
+    unready_workers = [
+        f"Worker-{index}"
+        for index, status in enumerate(statuses, start=1)
+        if status.get('ready') is not True
+    ]
+    idle_workers = [
+        f"Worker-{index}"
+        for index, status in enumerate(statuses, start=1)
+        if int(status.get('started_attempts', 0)) < 1
+    ]
+    if successes != target_episodes or failed_workers or unready_workers or idle_workers:
+        raise RuntimeError(
+            "parallel collection did not satisfy the requested worker topology: "
+            f"successes={successes}/{target_episodes}, failed={failed_workers}, "
+            f"unready={unready_workers}, no_attempt={idle_workers}"
+        )
+
+
+def worker_run(
+    task_config,
+    task_file_name,
+    base_save_dir: Path,
+    seed_q: Queue,
+    progress,
+    progress_lock,
+    startup_barrier,
+    target_episodes: int,
+    stop_event: Event,
+    log_file: Path,
+    device_list,
+    http_port: int,
+    status_dict,
+    result_q: Queue,
+):
+    # Assign an explicit multi-worker split only when requested.  An empty device list preserves
+    # Pyxis' allocation-owned CUDA/Vulkan mapping; overwriting it with logical "0" or an empty
+    # mask can make Omniverse select a different physical device than Vulkan mounted.
+    if device_list:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(device_list)
 
     # Redirect stdout/stderr to unified log
     log_fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(log_fd, 1)
     os.dup2(log_fd, 2)
     sys.path.insert(0, '.')
+
+    # Every livestream=2 Isaac app starts an HTTP transport server.  The default is 8011, so
+    # concurrent workers must receive distinct ports before AppLauncher is imported/constructed.
+    # This is the same Kit setting used by the upstream multi-worker evaluator.
+    sys.argv.append(f"--/exts/omni.services.transport.server.http/port={http_port}")
 
     # Create Isaac app inside worker
     from isaaclab.app import AppLauncher
@@ -70,13 +150,9 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
 
         env_cfg: 'BaseTaskCfg' = task_module.TaskCfg()
         worker_id = current_process().name.split('-')[-1]
-        env_cfg.save_dir = base_save_dir
-        env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
-        env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
-        env_cfg.video_frequency = task_config.get("video_frequency", env_cfg.video_frequency)
-        env_cfg.render_frequency = task_config.get("render_frequency", env_cfg.render_frequency)
-        env_cfg.obs_data_type = task_config.get("observations", {})
-        env_cfg.scene.num_envs = 1
+        # Keep simulator workspaces, temporary frames, and metadata process-local.  The default
+        # worker_0 path is unsafe when this parallel collector launches more than one Isaac app.
+        configure_worker_env(env_cfg, task_config, base_save_dir, worker_id)
         # Device routing by CUDA env
 
         init_start = time.perf_counter()
@@ -92,7 +168,7 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
         task._step_callback = step_callback
 
         init_cost = time.perf_counter() - init_start
-        print(f"[Worker {worker_id}] Task init in {init_cost:.2f}s; save_dir={base_save_dir}")
+        print(f"[Worker {worker_id}] Task init in {init_cost:.2f}s; save_dir={env_cfg.save_dir}")
 
         mean_steps = 0.0
         status_dict['state'] = 'idle'
@@ -104,6 +180,12 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
         status_dict['attempts'] = 0
         status_dict['succ'] = 0
         status_dict['errors'] = 0
+        status_dict['ready'] = True
+        status_dict['started_attempts'] = 0
+        try:
+            startup_barrier.wait(timeout=300)
+        except BrokenBarrierError as error:
+            raise RuntimeError("not every requested Isaac worker reached the startup barrier") from error
         while not stop_event.is_set():
             try:
                 seed = seed_q.get(timeout=1.0)
@@ -111,6 +193,7 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
                 continue
             if seed is None:
                 break
+            status_dict['started_attempts'] += 1
 
             try:
                 status_dict['state'] = 'running'
@@ -120,8 +203,9 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
                 task.play_once()
                 cost_t = time.perf_counter() - start_t
             except Exception:
-                progress['errors'] += 1
-                progress['attempts'] += 1
+                with progress_lock:
+                    progress['errors'] += 1
+                    progress['attempts'] += 1
                 status_dict['attempts'] += 1
                 status_dict['errors'] += 1
                 status_dict['last_result'] = 'error'
@@ -146,10 +230,23 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
                 continue
 
             if task.plan_success and task.check_success() and not task.check_early_stop():
-                task.save_to_hdf5()
-                progress['succ'] += 1
-                progress['done'] += 1  # done counts successful episodes
-                progress['attempts'] += 1
+                # Serialize only the final reservation/write. Simulations still run concurrently,
+                # but exactly target_episodes files can commit even when several workers finish
+                # their last rollout together.
+                with progress_lock:
+                    if progress['done'] >= target_episodes:
+                        should_save = False
+                    else:
+                        task.save_to_hdf5()
+                        progress['succ'] += 1
+                        progress['done'] += 1  # done counts successful episodes
+                        progress['attempts'] += 1
+                        should_save = True
+                        global_successes = progress['succ']
+                if not should_save:
+                    task.clean_cache(mean_steps=mean_steps, result='discarded')
+                    stop_event.set()
+                    break
                 status_dict['attempts'] += 1
                 status_dict['succ'] += 1
                 status_dict['last_result'] = 'success'
@@ -158,7 +255,11 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
                 status_dict['save_count'] = task.save_count
                 status_dict['current_seed'] = None
                 status_dict['state'] = 'idle'
-                mean_steps = ((progress['succ'] - 1) * mean_steps + task.step_count) / progress['succ'] if progress['succ'] > 1 else task.step_count
+                mean_steps = (
+                    ((global_successes - 1) * mean_steps + task.step_count) / global_successes
+                    if global_successes > 1
+                    else task.step_count
+                )
                 task.clean_cache(mean_steps=mean_steps)
                 print(f"[Worker {worker_id}] Seed {seed} success in {cost_t:.2f}s; steps {task.step_count}, save frames {task.save_count}")
                 result_q.put({
@@ -173,7 +274,8 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
                     'traceback': None,
                 })
             else:
-                progress['attempts'] += 1
+                with progress_lock:
+                    progress['attempts'] += 1
                 status_dict['attempts'] += 1
                 status_dict['last_result'] = 'fail'
                 status_dict['last_cost'] = cost_t
@@ -205,6 +307,7 @@ def worker_run(task_config, task_file_name, base_save_dir: Path, seed_q: Queue,
             simulation_app.close()
         except Exception:
             pass
+        raise
 
 
 def main():
@@ -215,7 +318,23 @@ def main():
     parser.add_argument("--episodes", type=int, default=None, help="Total successful episodes to collect (override config episode_num)")
     parser.add_argument("--gpu", type=str, default=os.environ.get('CUDA_VISIBLE_DEVICES', ''),
                         help="CUDA_VISIBLE_DEVICES list to split among workers")
+    parser.add_argument(
+        "--http-port-base",
+        type=int,
+        default=int(os.environ.get("UNIVTAC_HTTP_PORT_BASE", "8011")),
+        help="First per-worker Isaac HTTP transport port",
+    )
+    parser.add_argument(
+        "--seed-step",
+        type=int,
+        default=1,
+        help="Increment between attempted simulator seeds",
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    if args.seed_step < 1:
+        parser.error("--seed-step must be positive")
 
     task_config, task_config_file = get_config(
         args.config,
@@ -223,6 +342,8 @@ def main():
         type='yaml'
     )
     target_episodes = args.episodes if args.episodes is not None else task_config.get("episode_num", 10)
+    if target_episodes < 1:
+        parser.error("--episodes/config episode_num must be positive")
 
     # Base save dir with timestamp; per-worker subfolders appended inside worker
     curr_time = time.strftime(r'%Y-%m-%d_%H:%M:%S')
@@ -233,11 +354,16 @@ def main():
     out_log.touch()
     clean_log.touch()
 
-    manager = Manager()
-    seed_q = Queue()
+    # Isaac/Kit is not fork-safe.  Match the evaluator and launch every simulator from a clean
+    # interpreter so the parent cannot leak threads, CUDA state, or extension registries.
+    mp_ctx = get_context("spawn")
+    manager = mp_ctx.Manager()
+    seed_q = mp_ctx.Queue()
     progress = manager.dict(done=0, succ=0, errors=0, attempts=0)
-    stop_event = Event()
-    result_q = Queue()
+    progress_lock = manager.Lock()
+    startup_barrier = mp_ctx.Barrier(args.workers)
+    stop_event = mp_ctx.Event()
+    result_q = mp_ctx.Queue()
 
     def write_out(msg: str):
         with open(out_log, 'a') as f:
@@ -255,6 +381,7 @@ def main():
     next_seed = start_seed
 
     assignments = split_devices(args.gpu, args.workers)
+    http_ports = worker_http_ports(args.http_port_base, args.workers)
 
     # Initial run parameters into clean log
     write_clean("Run parameters:")
@@ -265,6 +392,8 @@ def main():
         'target_episodes': target_episodes,
         'workers': args.workers,
         'cuda_assignments': assignments,
+        'http_ports': http_ports,
+        'seed_step': args.seed_step,
         'save_dir': str(base_save_dir),
     }, ensure_ascii=False, indent=4)
     write_clean(params_json)
@@ -280,10 +409,25 @@ def main():
     for w in range(args.workers):
         status_proxy = manager.dict()
         worker_status.append(status_proxy)
-        p = Process(
+        p = mp_ctx.Process(
             target=worker_run,
             name=f"Worker-{w+1}",
-            args=(task_config, args.task, base_save_dir, seed_q, progress, stop_event, out_log, assignments[w], status_proxy, result_q)
+            args=(
+                task_config,
+                args.task,
+                base_save_dir,
+                seed_q,
+                progress,
+                progress_lock,
+                startup_barrier,
+                target_episodes,
+                stop_event,
+                out_log,
+                assignments[w],
+                http_ports[w],
+                status_proxy,
+                result_q,
+            ),
         )
         p.start()
         workers.append(p)
@@ -295,9 +439,10 @@ def main():
         last_update = 0
         last_render = 0
         last_block = ""
+        stopping = False
         for _ in range(args.workers):
             seed_q.put(next_seed)
-            next_seed += 1
+            next_seed = advance_collection_seed(next_seed, args.seed_step)
 
         while any(p.is_alive() for p in workers):
             # Drain results queue and log clean summaries
@@ -316,14 +461,17 @@ def main():
                         write_clean(f"{prefix} error; see out.log for traceback")
                     write_out(f"{prefix} result={event['result']} cost={event['cost']} steps={event['steps']} saves={event['save_count']} plan={event['plan_success']} check={event['check_success']}")
 
+                    done = progress.get('done', 0)
                     if done < target_episodes:
-                        for _ in range(args.workers):
-                            seed_q.put(next_seed)
-                            next_seed += 1
-                    else:
+                        # Refill only the slot which produced this event.  Enqueuing one seed per
+                        # worker for every event grows an unbounded backlog and defeats stop_event.
+                        seed_q.put(next_seed)
+                        next_seed = advance_collection_seed(next_seed, args.seed_step)
+                    elif not stopping:
                         for _ in range(args.workers):
                             seed_q.put(None)
                         stop_event.set()
+                        stopping = True
 
             done = progress.get('done', 0)
             pbar.n = done
@@ -381,6 +529,12 @@ def main():
         print(final_msg)
         write_clean(final_msg)
         write_out(final_msg)
+        validate_worker_topology(
+            [process.exitcode for process in workers],
+            worker_status,
+            succ,
+            target_episodes,
+        )
 
 
 if __name__ == "__main__":

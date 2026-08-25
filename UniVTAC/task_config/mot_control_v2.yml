@@ -1,0 +1,21 @@
+save_dir: ./data_v3
+
+decimation: 1
+# One saved row is one simulator command, matching V3 action_stride=1 at deployment.
+save_frequency: 1
+video_frequency: 0
+# Match the qualified official evaluator: AppLauncher maps zero to livestream=2 even in
+# headless mode. Saved observations still force a render every control step.
+render_frequency: 0
+random_texture: false
+
+use_seed: true
+start_seed: 2000000
+episode_num: 1000
+sensor_type: gsmini
+
+observations:
+  camera: [rgb]
+  tactile: [rgb_marker, depth]
+  embodiment: [joint, ee, command]
+  actor: true

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Closed-loop UniVTAC evaluation of the frozen MoT-JEPA encoder + fitted per-domain ridge.
+"""Closed-loop UniVTAC evaluation of a frozen MoT-JEPA encoder plus an action head.
 
 A SIBLING of ``UniVTAC/scripts/eval_ftp1.py``, not a fork of it. That file is 1400 lines of
 episode loop, seeding, resume logic, video writing and result accounting, all of which is exactly
@@ -11,10 +11,9 @@ So this substitutes the single thing that differs. ``eval_ftp1.main()`` construc
 MoT-JEPA-backed class with the same constructor signature and the same methods, then call
 ``main()``. Same seeds, same task config, same success criterion, same recorded artefacts.
 
-Deploys the RIDGE rather than a trained head: on 699 held-out clips the ridge scores 0.00329 RMSE
-against a per-domain constant's 0.00435 and wins on all eight domains, while every trained head
-lands 0.00454-0.00484 -- worse than the constant. And it re-plans EVERY step, because integrated
-open-loop drift is 0.00231 rad at k=1 but 0.101 rad at k=32.
+``MOTJEPA_POLICY_KIND=ridge`` loads a fitted raw-unit ridge. ``flow`` loads a completed supervised
+ActionDiT run and its checkpointed ActionNormalizer. Both execute MoT-JEPA chunk index zero and
+re-plan every control step; unlike FTP-1, their chunks contain no current-timestamp placeholder.
 
     RIDGE=.../ridge_policy.npz SNAP=.../probe2_s50000 \
       python scripts/eval_motjepa.py --task_list lift_bottle --task_config demo \
@@ -32,43 +31,105 @@ sys.path.insert(0, str(_REPO / "UniVTAC" / "scripts"))
 sys.path.insert(0, str(_REPO / "UniVTAC"))
 sys.path.insert(0, str(_REPO / "src"))
 
-import numpy as np
-import torch
+import torch  # noqa: E402
 
 
 def _build_policy_class():
     """Defer every heavy import until after Isaac's app is up, as eval_ftp1 itself does."""
-    from openpi.mot_jepa import config as config_module
-    from openpi.mot_jepa import runtime
-    from openpi.mot_jepa.action_parse import ACTION_DIM
-    from openpi.mot_jepa.action_dit import RidgeHead
-    from openpi.mot_jepa.deploy import MotJepaRidgePolicy
+    from openpi.mot_jepa import config as config_module  # noqa: PLC0415
+    from openpi.mot_jepa import runtime  # noqa: PLC0415
+    from openpi.mot_jepa.action_dit import RidgeHead  # noqa: PLC0415
+    from openpi.mot_jepa.action_parse import ACTION_DIM  # noqa: PLC0415
+    from openpi.mot_jepa.deploy import MotJepaFlowPolicy  # noqa: PLC0415
+    from openpi.mot_jepa.deploy import MotJepaRidgePolicy  # noqa: PLC0415
+    from openpi.mot_jepa.deploy import load_trained_policy_artifacts  # noqa: PLC0415
+
+    policy_kind = os.environ.get("MOTJEPA_POLICY_KIND", "ridge").strip().lower()
+    if policy_kind not in {"ridge", "flow"}:
+        raise ValueError(f"MOTJEPA_POLICY_KIND must be ridge or flow, got {policy_kind!r}")
+
+    def prepare_device(device) -> torch.device:
+        dev = torch.device(device if isinstance(device, str) else "cuda")
+        if dev.type == "cuda":
+            frac = float(os.environ.get("TORCH_MEM_FRAC", "0.15"))
+            torch.cuda.set_per_process_memory_fraction(frac, dev.index or 0)
+            print(f"[eval_motjepa] torch memory fraction {frac} on {dev}", flush=True)
+        return dev
+
+    def configure_harness(policy, mapping) -> None:
+        policy.mapping = mapping
+        # The MoT-JEPA policy consumes raw observations and returns absolute qpos8 directly. These
+        # dimensions exist only because the common harness prints them.
+        policy.state_dim = ACTION_DIM
+        policy.model_action_dim = ACTION_DIM
+        policy.use_temporal_ensemble = False
+
+    if policy_kind == "flow":
+
+        class MotJepaChunkPolicy(MotJepaFlowPolicy):
+            """Completed supervised flow head wearing FTP1ChunkPolicy's constructor."""
+
+            def __init__(self, checkpoint_dir, domain_name, device, **kwargs):
+                run = pathlib.Path(os.environ["MOTJEPA_POLICY_RUN"])
+                if pathlib.Path(checkpoint_dir).resolve() != run.resolve():
+                    raise ValueError(f"harness checkpoint {checkpoint_dir} does not match flow run {run}")
+                raw_step = os.environ.get("MOTJEPA_POLICY_STEP")
+                requested_step = int(raw_step) if raw_step else None
+                dev = prepare_device(device)
+                artifacts = load_trained_policy_artifacts(run, dev, step=requested_step)
+                if artifacts.config.head.objective != "flowmatch":
+                    raise ValueError(
+                        f"flow deployment requires objective=flowmatch, got {artifacts.config.head.objective}"
+                    )
+
+                task = str(domain_name).replace("UniVTAC_", "")
+                if task not in artifacts.domain_names:
+                    raise KeyError(f"task {task!r} not present in trained domains {artifacts.domain_names}")
+                domain_id = artifacts.domain_names.index(task)
+                super().__init__(
+                    artifacts.backbone,
+                    artifacts.head,
+                    artifacts.normalizer,
+                    artifacts.config.layout,
+                    domain_id,
+                    dev,
+                    observation_stride=artifacts.observation_stride,
+                    action_stride=artifacts.action_stride,
+                    domain_names=artifacts.domain_names,
+                    num_inference_steps=int(kwargs.get("num_inference_steps", 10)),
+                    num_samples=int(os.environ.get("MOTJEPA_NUM_SAMPLES", "1")),
+                    sample_seed=int(os.environ.get("MOTJEPA_SAMPLE_SEED", "0")),
+                    save_infer_input_dir=kwargs.get("save_infer_input_dir"),
+                )
+                configure_harness(self, kwargs.get("mapping"))
+                print(
+                    f"[eval_motjepa] flow domain {task!r} -> id {domain_id}, "
+                    f"head step {artifacts.head_step}, backbone step {artifacts.backbone_step}, "
+                    f"backbone mode={artifacts.backbone_train_mode}, "
+                    f"backbone checkpoint={artifacts.backbone_checkpoint}, "
+                    f"adapted step={artifacts.adapted_backbone_step}, "
+                    f"K={self.num_samples}, Euler={self.num_inference_steps}",
+                    flush=True,
+                )
+
+        return MotJepaChunkPolicy
 
     class MotJepaChunkPolicy(MotJepaRidgePolicy):
         """Wears FTP1ChunkPolicy's constructor so eval_ftp1's worker can build it unmodified."""
 
         def __init__(self, checkpoint_dir, domain_name, device, **kwargs):
-            # eval_ftp1 passes num_inference_steps, tactile_key, tactile_sensor, chunk_first_n,
-            # save_infer_input_dir, temporal ensembling. None apply: the ridge is a closed-form
-            # single-pass map with no sampler and no ensembling, and it consumes the raw
-            # observation dict rather than FTP-1's tokenised inputs.
-            mapping = kwargs.get("mapping")
+            # The ridge is a closed-form single-pass map with no sampler or temporal ensemble.
             ridge_path = os.environ["RIDGE"]
             snapshot = os.environ["SNAP"]
-            step = int(os.environ.get("SNAP_STEP", "50000"))
+            if pathlib.Path(checkpoint_dir).resolve() != pathlib.Path(snapshot).resolve():
+                raise ValueError(f"harness checkpoint {checkpoint_dir} does not match ridge backbone {snapshot}")
+            raw_step = os.environ.get("SNAP_STEP")
+            step = int(raw_step) if raw_step else None
             cfg = config_module.CONFIGS[os.environ.get("MOTJEPA_CONFIG", "mot_jepa_pilot")]
 
-            dev = torch.device(device if isinstance(device, str) else "cuda")
-            # Isaac's RTX renderer shares this GPU and died with ERROR_DEVICE_LOST / "Failure to
-            # upload Texture" -- the renderer could not allocate while torch's caching allocator
-            # held the device. Cap our share; the encoder is 30M params and the ridge 566 MB, so a
-            # small fraction of an 80 GB H100 is ample.
-            if dev.type == "cuda":
-                frac = float(os.environ.get("TORCH_MEM_FRAC", "0.15"))
-                torch.cuda.set_per_process_memory_fraction(frac, dev.index or 0)
-                print(f"[eval_motjepa] torch memory fraction {frac} on {dev}", flush=True)
-            backbone, _ = runtime.load_frozen_backbone(pathlib.Path(snapshot), step, cfg, dev)
-            head = RidgeHead(ridge_path, cfg.layout, horizon=32).to(dev)
+            dev = prepare_device(device)
+            backbone, step = runtime.load_frozen_backbone(pathlib.Path(snapshot), step, cfg, dev)
+            head = RidgeHead(ridge_path, cfg.layout).to(dev)
 
             # Which ridge row to use. The npz stores the domain NAMES it was fitted on, so match on
             # the task rather than on an index -- an off-by-one here would silently evaluate one
@@ -81,23 +142,20 @@ def _build_policy_class():
             if domain_id not in head.fitted_domains:
                 raise KeyError(f"ridge for {task!r} exists but was skipped at fit time (too few clips)")
 
-            super().__init__(backbone, head, cfg.layout, domain_id, dev)
-            self.mapping = mapping
-            # Every attribute eval_ftp1's episode loop reads off the policy object, enumerated from
-            # the source (`grep -o 'rtac\.[a-z_]*'`) rather than discovered one crashed job at a
-            # time: act, reset, set_task, get_last_action_debug, action_dim, action_rep, mapping,
-            # model_action_dim, state_dim, use_temporal_ensemble, _chunk_history.
-            #
-            # state_dim and model_action_dim exist only so the harness can size FTP-1's tokenised
-            # state vector. This policy consumes the raw observation dict and never uses either, so
-            # they are reported as our own layout's width instead of being invented.
-            self.state_dim = ACTION_DIM
-            self.model_action_dim = ACTION_DIM
-            # No temporal ensembling: the ridge is a single closed-form pass, and the drift
-            # measurement makes per-step re-planning the point rather than chunk blending.
-            self.use_temporal_ensemble = False
-            print(f"[eval_motjepa] ridge domain {task!r} -> id {domain_id}, backbone step {step}",
-                  flush=True)
+            super().__init__(
+                backbone,
+                head,
+                cfg.layout,
+                domain_id,
+                dev,
+                domain_names=tuple(names),
+                save_infer_input_dir=kwargs.get("save_infer_input_dir"),
+            )
+            configure_harness(self, kwargs.get("mapping"))
+            print(
+                f"[eval_motjepa] ridge domain {task!r} -> id {domain_id}, backbone step {step}",
+                flush=True,
+            )
 
     return MotJepaChunkPolicy
 
@@ -114,10 +172,10 @@ def _stub_ftp1_model_stack() -> None:
     The constants come from OUR action_parse rather than being written as literals, so if the
     layout ever changes these cannot silently disagree with the policy's own view of it.
     """
-    import types
+    import types  # noqa: PLC0415
 
-    from openpi.mot_jepa.action_parse import RESERVED_ACTION_DIM
-    from openpi.mot_jepa.action_parse import SINGLE_ARM_ACTION_REP_DIM
+    from openpi.mot_jepa.action_parse import RESERVED_ACTION_DIM  # noqa: PLC0415
+    from openpi.mot_jepa.action_parse import SINGLE_ARM_ACTION_REP_DIM  # noqa: PLC0415
 
     cfg = types.ModuleType("openpi.models_pytorch.ftp1_model_config")
     cfg.FTP1_RESERVED_ACTION_DIM = RESERVED_ACTION_DIM
@@ -128,7 +186,7 @@ def _stub_ftp1_model_stack() -> None:
 
     class FTP1InferenceWrapper:  # never instantiated: FTP1ChunkPolicy is replaced below
         def __init__(self, *args, **kwargs):
-            raise RuntimeError("FTP1InferenceWrapper is stubbed; eval_motjepa uses the ridge policy")
+            raise RuntimeError("FTP1InferenceWrapper is stubbed; eval_motjepa supplies the policy")
 
     wrapper.FTP1InferenceWrapper = FTP1InferenceWrapper
     sys.modules["openpi.policies.ftp1_inference_wrapper"] = wrapper
@@ -136,13 +194,15 @@ def _stub_ftp1_model_stack() -> None:
 
 def main() -> int:
     _stub_ftp1_model_stack()
-    import eval_ftp1
+    import eval_ftp1  # noqa: PLC0415
 
     eval_ftp1.FTP1ChunkPolicy = _build_policy_class()
     # eval_ftp1 infers action_rep from the FTP-1 checkpoint's train_config.json, which we have no
     # equivalent of. Ours is fixed by construction: deploy.chunk_to_absolute_qpos8 integrates the
     # arm deltas and passes the gripper through, so the harness must not re-base on top of that.
-    sys.argv += ["--action_rep", "absolute"]
+    # The replacement class is local to this process. eval_ftp1's optional multiprocessing-spawn
+    # workers would re-import its original FTP1 class instead of inheriting this binding.
+    sys.argv += ["--action_rep", "absolute", "--workers", "1"]
     return eval_ftp1.main()
 
 

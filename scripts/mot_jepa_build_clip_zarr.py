@@ -47,6 +47,7 @@ cv2.setNumThreads(0)
 # Keep lz4/NOSHUFFLE, matching what the released stores already use. Level 1 rather than 5:
 # this store is read far more often than it is written, and decode speed is the constraint.
 COMPRESSOR = BloscCodec(cname="lz4", clevel=1, shuffle=BloscShuffle.noshuffle)
+SOURCE_EPISODE_SEED_KEY = "source_episode_seed"
 
 
 def _resize_batch(frames: np.ndarray, size: int) -> np.ndarray:
@@ -106,6 +107,25 @@ def build_store(
     dest_meta = dest.create_group("meta")
     dest_meta.create_array("episode_ends", shape=episode_ends.shape, dtype="int64")
     dest_meta["episode_ends"][:] = episode_ends
+    copied_episode_meta: list[str] = []
+    if SOURCE_EPISODE_SEED_KEY in set(source["meta"].array_keys()):
+        source_episode_seed = source["meta"][SOURCE_EPISODE_SEED_KEY]
+        if tuple(source_episode_seed.shape) != tuple(episode_ends.shape):
+            raise ValueError(
+                f"meta/{SOURCE_EPISODE_SEED_KEY} must have one value per episode; "
+                f"expected {episode_ends.shape}, got {source_episode_seed.shape}"
+            )
+        if np.dtype(source_episode_seed.dtype).kind not in "iu":
+            raise ValueError(f"meta/{SOURCE_EPISODE_SEED_KEY} must be integer, got {source_episode_seed.dtype}")
+        seed_values = np.asarray(source_episode_seed[:])
+        seed_out = dest_meta.create_array(
+            SOURCE_EPISODE_SEED_KEY,
+            shape=seed_values.shape,
+            chunks=(max(1, min(1024, int(seed_values.size))),),
+            dtype=seed_values.dtype,
+        )
+        seed_out[:] = seed_values
+        copied_episode_meta.append(SOURCE_EPISODE_SEED_KEY)
 
     video_out = dest_data.create_array(
         "video",
@@ -131,6 +151,33 @@ def build_store(
         compressors=[COMPRESSOR],
     )
 
+    # Optional task-control supervision.  These arrays are emitted by the UniVTAC V3 parser and
+    # deliberately copied without reinterpretation; other FTP-1 domains simply omit them.
+    control_arrays: dict[str, object] = {}
+    for name in (
+        "command8",
+        "command_valid",
+        "phase_id",
+        "contact",
+        "contact_valid",
+        "control_step",
+        "control_step_valid",
+    ):
+        if name not in set(data.array_keys()):
+            continue
+        source_array = data[name]
+        shape = tuple(source_array.shape)
+        if not shape or shape[0] != total:
+            raise ValueError(f"data/{name} must be time-major with {total} rows, got {shape}")
+        chunk_shape = (num_frames * 64, *shape[1:])
+        control_arrays[name] = dest_data.create_array(
+            name,
+            shape=shape,
+            chunks=chunk_shape,
+            dtype=source_array.dtype,
+            compressors=[COMPRESSOR],
+        )
+
     start_time = time.time()
     for begin in range(0, total, batch_frames):
         end = min(begin + batch_frames, total)
@@ -148,6 +195,9 @@ def build_store(
                 cache[spec.key] = tp.read_lowdim(np.asarray(data[spec.key][begin:end]), spec)
             width = min(spec.width, lowdim_width)
             lowdim_out[begin:end, slot, :width] = cache[spec.key][:, unit, :width]
+
+        for name, output_array in control_arrays.items():
+            output_array[begin:end] = np.asarray(data[name][begin:end])
 
         print(f"    {end}/{total} frames ({end / total:.0%})", end="\r", flush=True)
 
@@ -187,6 +237,8 @@ def build_store(
         "dropped_gel_units": gel_wanted - len(gel_slots),
         "dropped_lowdim_units": low_wanted - len(lowdim_slots),
         "chunk_frames": num_frames,
+        "control_arrays": sorted(control_arrays),
+        "episode_meta_arrays": copied_episode_meta,
         "seconds": round(elapsed, 1),
     }
 

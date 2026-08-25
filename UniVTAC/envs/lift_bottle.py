@@ -56,7 +56,18 @@ class Task(BaseTask):
         self.target_pose = self.wall.get_pose().add_bias([-0.08, 0, 0])
         
     def _play_once(self):
+        # V3 control phases are saved with every expert observation.  Include a short stable
+        # approach/settle prefix so all four classes have real support instead of manufacturing an
+        # "approach" label from the first closing samples.
+        self.control_phase = 0  # approach / settle
+        # T16 at observation stride 2 first becomes eligible at row 30.  Saving exactly 31
+        # settle rows gives the training index a real APPROACH example whose next target begins
+        # CLOSE, while avoiding a hold target that an episode-time-free policy would repeat
+        # forever at deployment cold start.
+        self.delay(31, is_save=True)
+        self.control_phase = 1  # close
         self.move(self.atom.close_gripper())
+        self.control_phase = 2  # manipulate / lift
         self.gripper_rotate(self.bottle, 70/180*np.pi, steps=4)
         if not self.check_mid_success():
             self.move(self.atom.move_by_displacement(
@@ -65,6 +76,7 @@ class Task(BaseTask):
             self.move(self.atom.move_by_displacement(
                 x = self.target_pose[0] - self.bottle.get_pose()[0] + 0.02
             ), time_dilation_factor=0.5)
+        self.control_phase = 3  # release
         self.move(self.atom.open_gripper(0.5))
         self.delay(30, is_save=False)
 

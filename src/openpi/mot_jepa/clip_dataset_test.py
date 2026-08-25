@@ -385,7 +385,7 @@ def test_action_horizon_shrinks_the_index_and_never_crosses_an_episode(tmp_path)
 
     horizon = 8
     plain = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,))
-    gated = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,), action_horizon=horizon)
+    gated = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(1,), action_horizon=horizon, action_stride=1)
     assert len(gated) < len(plain), "a horizon must remove clips that have no future left"
 
     ends = np.cumsum(lengths)
@@ -410,7 +410,7 @@ def test_action_chunk_is_the_future_not_the_observed_clip(tmp_path):
 
     horizon = 6
     dataset = MotJepaClipDataset(
-        [path], LAYOUT, strides=(1,), with_conditioning=True, action_horizon=horizon
+        [path], LAYOUT, strides=(1,), with_conditioning=True, action_horizon=horizon, action_stride=1
     )
     sample = dataset[0]
     assert sample.action_chunk.shape == (horizon, ap.ACTION_DIM)
@@ -438,3 +438,49 @@ def test_action_chunk_is_absent_without_a_horizon(tmp_path):
     sample = dataset[0]
     assert torch.equal(sample.action_chunk, torch.zeros_like(sample.action_chunk))
     assert torch.equal(sample.chunk_mask, torch.zeros_like(sample.chunk_mask))
+
+
+def test_observation_and_action_strides_are_independent(tmp_path):
+    """The encoder can observe every second frame while the policy predicts every control step."""
+    path = make_store(tmp_path / "independent_strides.zarr", [30])
+    add_conditioning_arrays(path, [30])
+    dataset = MotJepaClipDataset(
+        [path],
+        LAYOUT,
+        strides=(2,),
+        with_conditioning=True,
+        action_horizon=5,
+        action_stride=1,
+    )
+
+    entry = dataset.clip_index[0]
+    sample = dataset[0]
+    np.testing.assert_allclose(sample.state[:, 0].numpy(), entry.start + np.array([0, 2, 4, 6]))
+    live = sample.chunk_mask[0].bool()
+    plain = live.clone()
+    for block in ap.POSE_BLOCKS:
+        plain[block] = False
+    assert plain.any()
+    assert torch.allclose(sample.action_chunk[:, plain], torch.ones_like(sample.action_chunk[:, plain]))
+
+
+def test_decoupled_action_stride_changes_only_the_required_future_span(tmp_path):
+    path = make_store(tmp_path / "span.zarr", [16])
+    # obs=2 consumes frames 0..6. A horizon of 5 reaches frame 11 at action stride 1 but frame 16
+    # at action stride 2, which is outside this episode.
+    decoupled = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(2,), action_horizon=5, action_stride=1)
+    coupled = ClipIndex.build([path], num_frames=LAYOUT.num_frames, strides=(2,), action_horizon=5, action_stride=2)
+    assert len(decoupled) > len(coupled)
+    ends = np.asarray(zarr.open(path, mode="r")["meta/episode_ends"][:], dtype=np.int64)
+    for entry in (decoupled[i] for i in range(len(decoupled))):
+        last_target = entry.start + (LAYOUT.num_frames - 1) * entry.stride + 5
+        assert last_target < ends[entry.episode_idx]
+
+
+@pytest.mark.parametrize("action_stride", [None, 0, -1])
+def test_action_horizon_requires_a_positive_explicit_action_stride(tmp_path, action_stride):
+    path = make_store(tmp_path / "bad_stride.zarr", [30])
+    with pytest.raises(ValueError, match="action_stride"):
+        ClipIndex.build(
+            [path], num_frames=LAYOUT.num_frames, strides=(2,), action_horizon=5, action_stride=action_stride
+        )

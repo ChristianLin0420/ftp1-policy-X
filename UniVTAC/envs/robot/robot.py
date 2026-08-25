@@ -38,6 +38,12 @@ class RobotManager:
         self.gripper_max_qpos = 0.039
         self.last_arm_velocity = None
         self.last_gripper_velocity = None
+        # The V3 MoT control dataset records the command that produced each observation.  Robot
+        # state alone cannot distinguish tracking lag from the policy's intended motion, and the
+        # online policy always knows the previous command.  Keep this bookkeeping in the robot
+        # manager so scripted collection and closed-loop evaluation use the same definition.
+        self.last_arm_command = None
+        self.last_gripper_command = None
 
         if self.robot_type == 'franka_panda':
             self.hand_name = 'panda_hand'
@@ -129,6 +135,10 @@ class RobotManager:
 
     def set_arm(self, pos:torch.Tensor, vel:torch.Tensor=None, env_ids:slice=None, force:bool=True):
         '''设置目标位姿'''
+        command = torch.as_tensor(pos, device=self.device).detach().reshape(-1)
+        if command.numel() < len(self._arm_ids):
+            raise ValueError(f"arm command has {command.numel()} values, expected at least {len(self._arm_ids)}")
+        self.last_arm_command = command[: len(self._arm_ids)].clone()
         self.robot.set_joint_position_target(pos, joint_ids=self._arm_ids, env_ids=env_ids)
         if vel is not None:
             self.robot.set_joint_velocity_target(vel, joint_ids=self._arm_ids, env_ids=env_ids)
@@ -140,6 +150,12 @@ class RobotManager:
 
     def set_gripper(self, pos:torch.Tensor, vel:torch.Tensor=None, env_ids:slice=None, force:bool=True):
         '''设置目标位姿'''
+        command = torch.as_tensor(pos, device=self.device).detach().reshape(-1)
+        if command.numel() < 1:
+            raise ValueError("gripper command is empty")
+        # UniVTAC's public qpos8 contract carries one finger.  Both simulated fingers receive the
+        # same target, so retaining the first is exact and matches embodiment/joint[:8].
+        self.last_gripper_command = command[0].clone()
         self.robot.set_joint_position_target(pos, joint_ids=self._gripper_ids, env_ids=env_ids)
         if vel is not None:
             self.robot.set_joint_velocity_target(vel, joint_ids=self._gripper_ids, env_ids=env_ids)
@@ -198,6 +214,8 @@ class RobotManager:
             self._setup_robot_properties()
         joint_pos = self.robot.data.default_joint_pos.clone()
         joint_vel = torch.zeros_like(joint_pos)
+        self.last_arm_command = joint_pos[0, self._arm_ids].detach().clone()
+        self.last_gripper_command = joint_pos[0, self._gripper_ids[0]].detach().clone()
         
         self.planner.reset()
         self.robot.set_joint_position_target(joint_pos)
@@ -209,6 +227,14 @@ class RobotManager:
             obs['ee'] = self.get_ee_pose().totensor(device=self.device)
         if 'joint' in data_type:
             obs['joint'] = self.robot.data.joint_pos.squeeze(0)
+        if 'command' in data_type:
+            arm = self.last_arm_command
+            gripper = self.last_gripper_command
+            if arm is None:
+                arm = self.robot.data.joint_pos[0, self._arm_ids]
+            if gripper is None:
+                gripper = self.robot.data.joint_pos[0, self._gripper_ids[0]]
+            obs['command'] = torch.cat([arm.reshape(-1), gripper.reshape(1)])
         return obs
     
     def get_grasp_perfect_direction(self):

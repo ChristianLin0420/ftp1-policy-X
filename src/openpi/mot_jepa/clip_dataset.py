@@ -183,6 +183,7 @@ class ClipIndex:
         strides: tuple[int, ...] = (1, 2),
         step: int = 1,
         action_horizon: int = 0,
+        action_stride: int | None = None,
     ) -> ClipIndex:
         """Enumerate valid clips by scanning only ``meta/episode_ends``.
 
@@ -190,12 +191,20 @@ class ClipIndex:
         ``s + (num_frames - 1) * r < episode_end``. Starts that would run past the end are
         dropped outright rather than clamped.
 
-        ``action_horizon > 0`` additionally requires the *future* window to fit:
-        ``s + (num_frames - 1 + horizon) * r < episode_end``. A policy conditioned on a clip
-        must predict actions that genuinely follow it, and an edge-padded chunk would be a
-        chunk of repeated rows -- perfectly predictable, and it would inflate any metric
-        computed over it. Same contract as the observation window: reject, never clamp.
+        ``action_horizon > 0`` additionally requires the *future* window to fit. Observation
+        and action cadence are deliberately independent: for observation stride ``r`` and
+        action stride ``a``, the last required frame is
+        ``s + (num_frames - 1) * r + horizon * a``. Deployment observes every second control
+        frame but re-plans every control step, so coupling both cadences silently trains on the
+        wrong target. A policy-conditioned index must therefore specify ``action_stride``
+        explicitly. Same contract as the observation window: reject, never clamp.
         """
+        if action_horizon < 0:
+            raise ValueError(f"action_horizon must be >= 0, got {action_horizon}")
+        if action_horizon > 0 and action_stride is None:
+            raise ValueError("action_stride must be specified when action_horizon > 0")
+        if action_stride is not None and action_stride < 1:
+            raise ValueError(f"action_stride must be >= 1, got {action_stride}")
         rows = []
         unreadable: list[str] = []
         for store_idx, path in enumerate(store_paths):
@@ -217,7 +226,10 @@ class ClipIndex:
             starts = np.concatenate([[0], ends[:-1]])
             for episode_idx, (episode_start, episode_end) in enumerate(zip(starts, ends, strict=True)):
                 for stride in strides:
-                    span = (num_frames - 1 + action_horizon) * stride
+                    span = (num_frames - 1) * stride
+                    if action_horizon:
+                        assert action_stride is not None
+                        span += action_horizon * action_stride
                     last_start = episode_end - 1 - span
                     if last_start < episode_start:
                         continue
@@ -309,6 +321,7 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         prefer_rgb: str | None = None,
         with_conditioning: bool = False,
         action_horizon: int = 0,
+        action_stride: int | None = None,
     ) -> None:
         self.store_paths = list(store_paths)
         self.layout = layout
@@ -321,12 +334,14 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
         # A horizon shrinks the index -- every clip must now have `horizon` frames of future
         # inside its own episode -- so it belongs in the index build, not just the read path.
         self.action_horizon = action_horizon
+        self.action_stride = action_stride
         self.clip_index = clip_index or ClipIndex.build(
             self.store_paths,
             num_frames=layout.num_frames,
             strides=strides,
             step=index_step,
             action_horizon=action_horizon,
+            action_stride=action_stride,
         )
         if len(self.clip_index) == 0:
             raise ValueError(
@@ -402,7 +417,9 @@ class MotJepaClipDataset(torch.utils.data.Dataset):
             # horizon+1 states gives horizon actions, and the index guarantees the window is
             # inside the episode, so nothing is padded and nothing crosses a boundary.
             last = int(frames[-1])
-            future = np.arange(last, last + (self.action_horizon + 1) * entry.stride, entry.stride, dtype=np.int64)
+            if self.action_stride is None:
+                raise RuntimeError("action_stride is required to construct an action chunk")
+            future = last + np.arange(self.action_horizon + 1, dtype=np.int64) * self.action_stride
             future_state = np.asarray(group["data"]["state"][future], dtype=np.float32)
             chunk = ap.actions_from_state(future_state, mask)
             out["action_chunk"] = torch.from_numpy(np.ascontiguousarray(chunk))

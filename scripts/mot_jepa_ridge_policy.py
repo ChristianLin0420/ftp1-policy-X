@@ -34,6 +34,7 @@ import glob
 import logging
 import os
 import pathlib
+import time
 
 import numpy as np
 import torch
@@ -60,6 +61,7 @@ RIDGE_GRID = (1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)
 def collect(backbone, loader, device, max_batches: int) -> dict[int, dict[str, list]]:
     """Frozen readout, action chunk and mask, grouped by domain."""
     out: dict[int, dict[str, list]] = collections.defaultdict(lambda: collections.defaultdict(list))
+    started = time.monotonic()
     for seen, batch in enumerate(loader):
         if seen >= max_batches:
             break
@@ -75,19 +77,31 @@ def collect(backbone, loader, device, max_batches: int) -> dict[int, dict[str, l
             out[domain]["x"].append(features[row])
             out[domain]["y"].append(chunk[row].reshape(-1))
             out[domain]["m"].append(mask[row].reshape(-1))
+            out[domain]["e"].append(int(batch["store_idx"][row]) * 1_000_000 + int(batch["episode_idx"][row]))
+        if (seen + 1) % 50 == 0:
+            elapsed = max(time.monotonic() - started, 1e-6)
+            logger.info("collected %d batches (%.1f clips/s)", seen + 1, (seen + 1) * len(chunk) / elapsed)
     return out
 
 
-def fit_one_domain(x: np.ndarray, y: np.ndarray, *, val_frac: float = 0.2) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def fit_one_domain(
+    x: np.ndarray, y: np.ndarray, episode: np.ndarray, *, val_frac: float = 0.2
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Ridge with the penalty chosen on a validation split. Returns (mean, scale, weights, lambda).
 
     The penalty is the whole game at ``p >> n``: 4608 features against a few hundred clips. A fixed
     value interpolates the training set and generalises at random, which is what the very first
     version of the readout gate did before the grid was added.
     """
-    cut = int(x.shape[0] * (1.0 - val_frac))
-    x_fit, x_val = x[:cut], x[cut:]
-    y_fit, y_val = y[:cut], y[cut:]
+    unique_episodes = np.unique(episode)
+    if unique_episodes.size < 2:
+        raise ValueError("ridge lambda selection requires at least two training episodes")
+    shuffled = np.random.default_rng(0).permutation(unique_episodes)
+    num_val = min(max(1, round(unique_episodes.size * val_frac)), unique_episodes.size - 1)
+    val_episodes = shuffled[:num_val]
+    is_val = np.isin(episode, val_episodes)
+    x_fit, x_val = x[~is_val], x[is_val]
+    y_fit, y_val = y[~is_val], y[is_val]
 
     mean, scale = x_fit.mean(0), x_fit.std(0)
     scale = np.where(scale > 1e-8, scale, 1.0)
@@ -99,13 +113,20 @@ def fit_one_domain(x: np.ndarray, y: np.ndarray, *, val_frac: float = 0.2) -> tu
     gram, rhs = xf.T @ xf, xf.T @ y_fit
     eye = np.eye(gram.shape[0])
 
-    best = (np.inf, None, float("nan"))
+    best = (np.inf, float("nan"))
     for lam in RIDGE_GRID:
         weights = np.linalg.solve(gram + lam * eye, rhs)
         err = float(((y_val - xv @ weights) ** 2).mean())
         if err < best[0]:
-            best = (err, weights, lam)
-    return mean, scale, best[1], best[2]
+            best = (err, lam)
+
+    # Lambda is selected without sharing an episode between fit and validation. Once fixed,
+    # refit on every non-test episode; otherwise 20% of the allowed training data is discarded.
+    mean, scale = x.mean(0), x.std(0)
+    scale = np.where(scale > 1e-8, scale, 1.0)
+    full = np.hstack([(x - mean) / scale, np.ones((x.shape[0], 1))])
+    weights = np.linalg.solve(full.T @ full + best[1] * np.eye(full.shape[1]), full.T @ y)
+    return mean, scale, weights, best[1]
 
 
 def feature_share(weights: np.ndarray, x_std: np.ndarray) -> tuple[float, float]:
@@ -150,19 +171,33 @@ def main() -> int:
     parser.add_argument("--clips", required=True)
     parser.add_argument("--config", default="mot_jepa_pilot")
     parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--observation-stride", type=int, default=2)
+    parser.add_argument("--action-stride", type=int, default=1)
     parser.add_argument("--holdout_mod", type=int, default=10)
     parser.add_argument("--index-step", type=int, default=17)
     parser.add_argument("--batches", type=int, default=600)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--out", type=pathlib.Path, default=None)
-    parser.add_argument("--normalized-targets", action="store_true",
-                        help="Fit on per-domain z-scored actions the way the trained heads do, then "
-                             "denormalise before scoring. Isolates the target space as the cause of "
-                             "the ridge-vs-head gap.")
+    parser.add_argument(
+        "--normalized-targets",
+        action="store_true",
+        help="Fit on per-domain z-scored actions the way the trained heads do, then "
+        "denormalise before scoring. Isolates the target space as the cause of "
+        "the ridge-vs-head gap.",
+    )
     args = parser.parse_args()
+
+    if args.observation_stride < 1 or args.action_stride < 1:
+        parser.error("--observation-stride and --action-stride must both be positive")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = config_module.CONFIGS[args.config]
+    trained_cfg = runtime.architecture_from_run(args.pretrained_run, cfg, args.pretrained_step)
+    if args.observation_stride not in trained_cfg.data.strides:
+        raise ValueError(
+            f"observation stride {args.observation_stride} was not used to train this backbone; "
+            f"checkpoint strides are {trained_cfg.data.strides}"
+        )
     backbone, step = runtime.load_frozen_backbone(args.pretrained_run, args.pretrained_step, cfg, device)
 
     stores = sorted(glob.glob(args.clips))
@@ -174,10 +209,11 @@ def main() -> int:
             stores,
             cfg.layout,
             domain_ids=domain_ids,
-            strides=(1,),
+            strides=(args.observation_stride,),
             index_step=args.index_step,
             with_conditioning=True,
             action_horizon=args.horizon,
+            action_stride=args.action_stride,
         )
         dataset.clip_index = split_clip_index(dataset.clip_index, holdout_mod=args.holdout_mod, want=want)
         return dataset
@@ -200,12 +236,14 @@ def main() -> int:
     # lower normalised MSE while raising the number we report. Fitting the ridge BOTH ways on
     # identical data isolates that, since nothing else differs between the two runs.
     action_stats: dict[int, tuple] = {}
+    train_constants: dict[int, np.ndarray] = {}
     models: dict[int, tuple] = {}
     for domain, blob in sorted(train.items()):
-        x, y = np.stack(blob["x"]), np.stack(blob["y"])
+        x, y, episode = np.stack(blob["x"]), np.stack(blob["y"]), np.asarray(blob["e"])
         if x.shape[0] < 40:
             logger.warning("%s has only %d train clips; skipping", names[domain], x.shape[0])
             continue
+        train_constants[domain] = y.mean(axis=0)
         if args.normalized_targets:
             # Per-slot over clips AND horizon steps, matching ActionNormalizer's (num_domains, 120).
             chunks = y.reshape(y.shape[0], args.horizon, -1)
@@ -214,12 +252,16 @@ def main() -> int:
             a_scale = np.where(a_scale > 1e-6, a_scale, 1.0)
             action_stats[domain] = (a_mean, a_scale)
             y = ((chunks - a_mean) / a_scale).reshape(y.shape[0], -1)
-        models[domain] = fit_one_domain(x, y)
+        models[domain] = fit_one_domain(x, y, episode)
         logger.info("%s: fitted on %d clips, lambda=%.0e", names[domain], x.shape[0], models[domain][3])
 
-    # Score with the evaluator's metric: RMSE in raw action units over live slots, against the
-    # holdout's own per-domain mean as the reference constant.
-    print(f"\nridge policy on backbone step {step}, horizon {args.horizon}\n")
+    # Score with the evaluator's metric: RMSE in raw action units over live slots. The constant
+    # uses the TRAIN split's mean; using the holdout's own mean would leak test labels into the
+    # baseline and make the comparison impossible to deploy.
+    print(
+        f"\nridge policy on backbone step {step}, horizon {args.horizon}, "
+        f"observation/action stride {args.observation_stride}/{args.action_stride}\n"
+    )
     print(f"{'domain':24s} {'clips':>7s} {'RMSE':>11s} {'constant':>11s} {'better?':>9s}")
     sq_r = sq_c = n_tot = 0.0
     shares: dict[int, tuple[float, float]] = {}
@@ -235,7 +277,7 @@ def main() -> int:
             a_mean, a_scale = action_stats[domain]
             pred = (pred.reshape(pred.shape[0], args.horizon, -1) * a_scale + a_mean).reshape(pred.shape[0], -1)
         err_r = float((((pred - y) * m) ** 2).sum())
-        err_c = float((((y.mean(0) - y) * m) ** 2).sum())
+        err_c = float((((train_constants[domain] - y) * m) ** 2).sum())
         count = float(m.sum())
         sq_r += err_r
         sq_c += err_c
@@ -285,12 +327,17 @@ def main() -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             args.out,
-            domains=np.array([names[d] for d in sorted(models)]),
+            # Preserve the original domain-id mapping even if a low-data domain was skipped.
+            # The fitted weight keys, not this list, say which maps exist.
+            domains=np.asarray(names),
             # Which encoder tensor these weights were fitted on. The policy feature moved from
             # sync_readout (layer-S snapshot) to final_readout (last block) and the WIDTH is
             # identical, so without this stamp a ridge fitted on the old tensor loads against the
             # new one with no error and quietly scores a different model.
             readout=np.array("final_readout"),
+            observation_stride=np.array(args.observation_stride, dtype=np.int64),
+            action_stride=np.array(args.action_stride, dtype=np.int64),
+            horizon=np.array(args.horizon, dtype=np.int64),
             **{f"mean_{d}": models[d][0] for d in models},
             **{f"scale_{d}": models[d][1] for d in models},
             **{f"weights_{d}": models[d][2] for d in models},

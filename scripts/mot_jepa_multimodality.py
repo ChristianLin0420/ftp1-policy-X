@@ -123,6 +123,8 @@ def main() -> int:
     parser.add_argument("--clips", required=True)
     parser.add_argument("--config", default="mot_jepa_pilot")
     parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--observation-stride", type=int, default=2)
+    parser.add_argument("--action-stride", type=int, default=1)
     parser.add_argument("--batches", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--index-step", type=int, default=53)
@@ -139,10 +141,11 @@ def main() -> int:
         stores,
         cfg.layout,
         domain_ids=domain_ids,
-        strides=(1,),
+        strides=(args.observation_stride,),
         index_step=args.index_step,
         with_conditioning=True,
         action_horizon=args.horizon,
+        action_stride=args.action_stride,
     )
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=6, collate_fn=collate_clips

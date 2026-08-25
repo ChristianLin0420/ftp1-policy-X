@@ -374,7 +374,7 @@ class FTP1InferenceWrapper:
             self._load_norm_stats()
         self._load_tokenizer()
 
-        logger.info(f"FTP1InferenceWrapper initialized successfully")
+        logger.info("FTP1InferenceWrapper initialized successfully")
         logger.info(f"  Checkpoint: {self.ckpt_dir}")
         logger.info(f"  Domain: {self.domain_name}")
         logger.info(f"  Device: {self.device}")
@@ -890,6 +890,7 @@ class FTP1InferenceWrapper:
         tactile_function_areas: dict[str, list[int]] | None = None,
         tactile_sensors: dict[str, str] | None = None,
         action_mask: np.ndarray | None = None,
+        noise_generator: torch.Generator | None = None,
     ) -> np.ndarray:
         """Run inference and return denormalized actions.
 
@@ -944,6 +945,10 @@ class FTP1InferenceWrapper:
                 Shape ``(B, T, D) = (1, action_horizon, action_dim)``.
                 - Current FTP1 master sampling keeps diffusion ``x_t`` unmasked.
 
+            noise_generator: torch.Generator | None
+                Optional episode-local generator for the initial flow noise. Supplying this makes
+                rollouts repeatable without changing the process-global RNG used by the simulator.
+
         Returns:
             np.ndarray: Predicted actions in RAW SCALE (denormalized).
                 - Shape: (action_horizon, action_dim), where ``action_dim`` matches
@@ -982,9 +987,24 @@ class FTP1InferenceWrapper:
 
         # Run model inference
         t0 = time_module.perf_counter()
+        noise = None
+        if noise_generator is not None:
+            noise = torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=(
+                    observation.state.shape[0],
+                    self.model_config.action_horizon,
+                    self.model_config.action_dim,
+                ),
+                generator=noise_generator,
+                dtype=torch.float32,
+                device=self.device,
+            )
         action = self.model.sample_actions(
             device=self.device,
             observation=observation,
+            noise=noise,
             num_steps=self.num_inference_steps,
         )
         timings['sample_actions'] = time_module.perf_counter() - t0

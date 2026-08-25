@@ -182,7 +182,7 @@ def collect(
         # question: it is retrospective over the observed clip, not the future.
         chunks = (batch["action_chunk"] * batch["chunk_mask"]).numpy()
         masks = batch["action_mask"].numpy()
-        anchors = batch["state"][:, :: 2].numpy()  # tubelet anchors, the POSITIVE CONTROL target
+        anchors = batch["state"][:, ::2].numpy()  # tubelet anchors, the POSITIVE CONTROL target
         store = batch["store_idx"].tolist()
         episode = batch["episode_idx"].tolist()
         for row, domain in enumerate(batch["domain_id"].tolist()):
@@ -203,6 +203,8 @@ def main() -> int:
     parser.add_argument("--clips", required=True, help="glob for the derived *.zarr stores")
     parser.add_argument("--config", default="mot_jepa_pilot")
     parser.add_argument("--horizon", type=int, default=15)
+    parser.add_argument("--observation-stride", type=int, default=2)
+    parser.add_argument("--action-stride", type=int, default=1)
     parser.add_argument("--batches", type=int, default=192)
     parser.add_argument(
         "--test-mean-baseline",
@@ -237,10 +239,11 @@ def main() -> int:
         stores,
         cfg.layout,
         domain_ids=domain_ids,
-        strides=(1,),
+        strides=(args.observation_stride,),
         index_step=37,
         with_conditioning=True,
         action_horizon=args.horizon,
+        action_stride=args.action_stride,
     )
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, num_workers=6, collate_fn=collate_clips
@@ -249,8 +252,10 @@ def main() -> int:
 
     collected = collect(backbone, loader, device, args.batches, layernorm_features=args.layernorm_features)
 
-    print(f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}"
-          f"{'  [LayerNorm features]' if args.layernorm_features else ''}")
+    print(
+        f"\nbackbone step {step}, horizon {args.horizon}, {args.batches} batches of {args.batch_size}"
+        f"{'  [LayerNorm features]' if args.layernorm_features else ''}"
+    )
     print(f"\n{'domain':26s} {'clips':>7s} {'R2 action':>11s} {'lambda':>9s} {'R2 state(ctl)':>14s}")
     rows, all_x, all_y, all_c, all_e = [], [], [], [], []
     for domain in sorted(collected):

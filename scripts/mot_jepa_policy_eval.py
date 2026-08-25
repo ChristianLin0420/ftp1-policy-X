@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import glob
 import json
 import logging
@@ -54,13 +55,63 @@ logger = logging.getLogger("mot_jepa.policy_eval")
 GROUPS = get_ftp1_action_group_slices(48, 7, 15)
 
 
-def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device: torch.device):
+def _match_trained_value(name: str, requested, trained):
+    """Use the saved training value and reject an explicit evaluation-time mismatch."""
+    if requested is not None and requested != trained:
+        raise ValueError(f"evaluation {name}={requested!r} does not match trained {name}={trained!r}")
+    return trained
+
+
+def _validate_action_stats_metadata(stats_path: pathlib.Path, cfg, names: list[str]) -> None:
+    """Prove that the normalizer and checkpoint use the evaluation sampling contract."""
+    if not stats_path.exists():
+        raise FileNotFoundError(f"{stats_path} missing; cannot validate task routing or sampling semantics")
+    with np.load(stats_path, allow_pickle=False) as stats:
+        required = {"domains", "observation_strides", "action_stride", "horizon"}
+        missing = sorted(required - set(stats.files))
+        if missing:
+            raise ValueError(f"{stats_path} lacks metadata {missing}; refuse to guess legacy evaluation semantics")
+        trained_names = [str(name) for name in stats["domains"]]
+        observation_strides = tuple(int(value) for value in np.asarray(stats["observation_strides"]).reshape(-1))
+        action_stride = int(np.asarray(stats["action_stride"]).item())
+        horizon = int(np.asarray(stats["horizon"]).item())
+
+    if trained_names != names:
+        raise ValueError(f"evaluation domains {names} do not match the trained domain mapping {trained_names}")
+    expected = (tuple(cfg.data.strides), cfg.data.action_stride, cfg.head.horizon)
+    actual = (observation_strides, action_stride, horizon)
+    if actual != expected:
+        raise ValueError(f"{stats_path} sampling metadata is {actual}, expected {expected}")
+
+
+def _require_completed_run(run: pathlib.Path, cfg, requested_step: int | None) -> int:
+    """Return the final trained step, refusing a partial/preempted run."""
+    done_path = run / "DONE"
+    if not done_path.exists():
+        raise RuntimeError(f"{done_path} missing; refuse to evaluate an incomplete or preempted run")
+    try:
+        done_step = int(done_path.read_text().strip())
+    except ValueError as error:
+        raise ValueError(f"{done_path} does not contain an integer step") from error
+    if done_step != cfg.num_train_steps:
+        raise ValueError(
+            f"{done_path} records step {done_step}, but run_config.json requires {cfg.num_train_steps} steps"
+        )
+    if requested_step is not None and requested_step != done_step:
+        raise ValueError(f"requested head step {requested_step} is not the completed run step {done_step}")
+    return done_step
+
+
+def load_head(run: pathlib.Path, step: int | None, cfg, names: list[str], device: torch.device):
     """Head weights plus the normaliser fitted during that run.
 
     The normaliser is not optional. The head emits normalised actions, so without the exact
     per-domain statistics its run was trained against, every number below would be in the wrong
     units -- and plausibly so, which is worse than an error.
     """
+    num_domains = len(names)
+    _validate_action_stats_metadata(run / "action_stats.npz", cfg, names)
+
     checkpoint_dir = run / "checkpoints"
     step = step or runtime.find_latest_step(checkpoint_dir)
     if step is None:
@@ -89,8 +140,18 @@ def load_head(run: pathlib.Path, step: int | None, cfg, num_domains: int, device
 
 
 @torch.no_grad()
-def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: int, num_samples: int = 1,
-             drift_ks: tuple[int, ...] = ()) -> dict:
+def evaluate(
+    backbone,
+    head,
+    normalizer,
+    loader,
+    device,
+    names,
+    *,
+    num_steps: int,
+    num_samples: int = 1,
+    drift_ks: tuple[int, ...] = (),
+) -> dict:
     """Squared error accumulated per domain and per action group, over live slots only.
 
     ``drift_ks`` additionally measures INTEGRATED open-loop drift: the error in joint POSITION
@@ -143,6 +204,8 @@ def evaluate(backbone, head, normalizer, loader, device, names, *, num_steps: in
         # Back to raw units before scoring, so the RMSE is in radians and comparable across arms
         # whose normalisers differ.
         predicted = normalizer.denormalize(predicted, domain_id) * chunk_mask
+        if not bool(torch.isfinite(predicted).all()):
+            raise FloatingPointError("policy produced a non-finite action during held-out evaluation")
         error = (predicted - truth * chunk_mask) ** 2
 
         for row, domain in enumerate(batch["domain_id"].tolist()):
@@ -191,23 +254,47 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", type=pathlib.Path, default=None, help="Policy run directory.")
     parser.add_argument("--step", type=int, default=None)
-    parser.add_argument("--ridge", type=pathlib.Path, default=None,
-                        help="Score a fitted ridge (.npz from mot_jepa_ridge_policy.py) instead of a "
-                             "trained run. Mutually exclusive with --run.")
+    parser.add_argument(
+        "--ridge",
+        type=pathlib.Path,
+        default=None,
+        help="Score a fitted ridge (.npz from mot_jepa_ridge_policy.py) instead of a "
+        "trained run. Mutually exclusive with --run.",
+    )
     parser.add_argument("--pretrained_run", type=pathlib.Path, required=True)
     parser.add_argument("--pretrained_step", type=int, default=None)
     parser.add_argument("--clips", required=True)
     parser.add_argument("--config", default=None, help="Policy preset; inferred from the run dir if unset.")
-    parser.add_argument("--holdout_mod", type=int, default=10)
-    parser.add_argument("--index-step", type=int, default=17)
+    parser.add_argument(
+        "--holdout_mod",
+        type=int,
+        default=None,
+        help="Episode holdout modulus. For a trained run it is inferred from run_config.json; an override must match.",
+    )
+    parser.add_argument(
+        "--index-step",
+        type=int,
+        default=None,
+        help="Clip-index subsampling. For a trained run it is inferred from run_config.json; an override must match.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--euler-steps", type=int, default=10)
-    parser.add_argument("--num-samples", type=int, default=1,
-                        help="Average K samples per observation to estimate the conditional mean.")
+    parser.add_argument(
+        "--num-samples", type=int, default=1, help="Average K samples per observation to estimate the conditional mean."
+    )
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed for reproducible generative-policy sampling.")
+    parser.add_argument(
+        "--expected-clips",
+        type=int,
+        default=None,
+        help="Fail unless the held-out index has exactly this many clips.",
+    )
     parser.add_argument("--out", type=pathlib.Path, default=None)
-    parser.add_argument("--drift-ks", default="1,2,4,8,16,32",
-                        help="Truncation lengths for the integrated open-loop drift table. Empty "
-                             "string disables it.")
+    parser.add_argument(
+        "--drift-ks",
+        default="1,2,4,8,16,32",
+        help="Truncation lengths for the integrated open-loop drift table. Empty string disables it.",
+    )
     args = parser.parse_args()
     drift_ks = tuple(int(k) for k in args.drift_ks.split(",") if k.strip())
 
@@ -232,15 +319,53 @@ def main() -> int:
             f"Known: {sorted(config_module.POLICY_CONFIGS)}"
         )
     cfg = config_module.POLICY_CONFIGS[preset]
+    if args.run:
+        saved_config = args.run / "run_config.json"
+        if not saved_config.exists():
+            raise FileNotFoundError(f"{saved_config} missing; refuse to reconstruct a trained run from live defaults")
+        cfg = config_module.PolicyConfig.from_json(saved_config.read_text())
+        logger.info("using authoritative policy config from %s", saved_config)
+        head_step_arg = _require_completed_run(args.run, cfg, args.step)
+        holdout_mod = _match_trained_value("holdout_mod", args.holdout_mod, cfg.holdout_mod)
+        index_step = _match_trained_value("index_step", args.index_step, cfg.data.index_step)
+        if not cfg.pretrained_run:
+            raise ValueError(f"{saved_config} has no pretrained_run")
+        configured_backbone = pathlib.Path(cfg.pretrained_run)
+        if args.pretrained_run.resolve() != configured_backbone.resolve():
+            raise ValueError(
+                f"evaluation backbone {args.pretrained_run} does not match trained backbone {configured_backbone}"
+            )
+        backbone_step_arg = _match_trained_value("pretrained_step", args.pretrained_step, cfg.pretrained_step)
+    else:
+        # Ridge artifacts predate a run directory, so retain their explicit historical defaults.
+        holdout_mod = 10 if args.holdout_mod is None else args.holdout_mod
+        index_step = 17 if args.index_step is None else args.index_step
+        backbone_step_arg = args.pretrained_step
+        head_step_arg = None
+
+    if holdout_mod <= 1:
+        raise ValueError(f"holdout_mod must be greater than 1, got {holdout_mod}")
+    if index_step <= 0:
+        raise ValueError(f"index_step must be positive, got {index_step}")
+    if args.num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {args.num_samples}")
+    if args.euler_steps <= 0:
+        raise ValueError(f"euler_steps must be positive, got {args.euler_steps}")
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     stores = sorted(glob.glob(args.clips))
     names = sorted({pathlib.Path(p).parent.name for p in stores})
     domain_ids = [names.index(pathlib.Path(p).parent.name) for p in stores]
 
-    backbone, backbone_step = runtime.load_frozen_backbone(args.pretrained_run, args.pretrained_step, cfg, device)
     if args.ridge:
-        head = RidgeHead(args.ridge, cfg.layout, horizon=cfg.head.horizon).to(device)
+        backbone, backbone_step = runtime.load_frozen_backbone(args.pretrained_run, backbone_step_arg, cfg, device)
+        backbone_train_mode = "frozen"
+        backbone_checkpoint = None
+        adapted_backbone_step = None
+        head = RidgeHead(args.ridge, cfg.layout).to(device)
         # The ridge regresses onto raw action_chunk, so there is nothing to invert. A
         # default-constructed ActionNormalizer is mean 0 / scale 1, making denormalize an exact
         # identity -- the alternative, special-casing the scoring loop, would leave two code paths
@@ -248,31 +373,67 @@ def main() -> int:
         normalizer = ActionNormalizer(len(names)).to(device)
         step = -1
         missing = sorted(set(range(len(names))) - set(head.fitted_domains))
+        if head.names != names:
+            raise ValueError(f"ridge domain mapping {head.names} does not match evaluation stores {names}")
         if missing:
             logger.warning("no ridge fitted for %s; those domains predict zero", [names[d] for d in missing])
+        observation_strides = (head.observation_stride,)
+        action_stride = head.action_stride
+        evaluation_horizon = head.horizon
     else:
-        head, normalizer, step = load_head(args.run, args.step, cfg, len(names), device)
+        head, normalizer, step = load_head(args.run, head_step_arg, cfg, names, device)
+        loaded_backbone = runtime.load_policy_backbone(args.run, step, cfg, device)
+        backbone = loaded_backbone.backbone
+        backbone_step = loaded_backbone.source_step
+        backbone_train_mode = loaded_backbone.mode
+        backbone_checkpoint = loaded_backbone.checkpoint
+        adapted_backbone_step = loaded_backbone.adapted_step
+        observation_strides = cfg.data.strides
+        action_stride = cfg.data.action_stride
+        if action_stride is None:
+            raise ValueError("trained policy config has no action_stride; refuse to guess legacy sampling semantics")
+        evaluation_horizon = cfg.head.horizon
+
+    too_long = tuple(k for k in drift_ks if k > evaluation_horizon)
+    if too_long:
+        logger.warning("dropping drift checkpoints %s beyond horizon %d", too_long, evaluation_horizon)
+        drift_ks = tuple(k for k in drift_ks if k <= evaluation_horizon)
 
     dataset = MotJepaClipDataset(
         stores,
         cfg.layout,
         domain_ids=domain_ids,
-        strides=(1,),
-        index_step=args.index_step,
+        strides=observation_strides,
+        index_step=index_step,
         with_conditioning=True,
-        action_horizon=cfg.head.horizon,
+        action_horizon=evaluation_horizon,
+        action_stride=action_stride,
     )
     before = len(dataset)
-    dataset.clip_index = split_clip_index(dataset.clip_index, holdout_mod=args.holdout_mod, want="holdout")
-    logger.info("holdout: %d of %d clips (mod %d)", len(dataset), before, args.holdout_mod)
+    dataset.clip_index = split_clip_index(dataset.clip_index, holdout_mod=holdout_mod, want="holdout")
+    logger.info("holdout: %d of %d clips (mod %d)", len(dataset), before, holdout_mod)
     if len(dataset) == 0:
         raise RuntimeError("holdout split is empty; check --holdout_mod against how the run was trained")
+    if args.expected_clips is not None and len(dataset) != args.expected_clips:
+        raise RuntimeError(f"held-out split has {len(dataset)} clips, expected {args.expected_clips}")
 
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=6, collate_fn=collate_clips
     )
-    acc = evaluate(backbone, head, normalizer, loader, device, names, num_steps=args.euler_steps,
-                   num_samples=args.num_samples, drift_ks=drift_ks)
+    acc = evaluate(
+        backbone,
+        head,
+        normalizer,
+        loader,
+        device,
+        names,
+        num_steps=args.euler_steps,
+        num_samples=args.num_samples,
+        drift_ks=drift_ks,
+    )
+    missing_domains = sorted(set(names) - set(acc["count"]))
+    if missing_domains:
+        raise RuntimeError(f"held-out evaluation produced no samples for domains {missing_domains}")
 
     def rmse(name: str, group: str) -> float:
         c = acc["count"][name].get(group, 0.0)
@@ -280,8 +441,11 @@ def main() -> int:
 
     live = [g for g in (*GROUPS, "ALL") if any(acc["count"][n].get(g, 0.0) > 0 for n in acc["count"])]
     objective = "ridge" if args.ridge else cfg.head.objective
-    print(f"\n{preset}  head step {step}  backbone step {backbone_step}  objective {objective}")
-    print(f"held-out clips: {len(dataset)}   samples/obs: {args.num_samples}   (every {args.holdout_mod}th episode)\n")
+    backbone_label = f"source step {backbone_step}, mode {backbone_train_mode}"
+    if adapted_backbone_step is not None:
+        backbone_label += f", adapted step {adapted_backbone_step}"
+    print(f"\n{preset}  head step {step}  backbone {backbone_label}  objective {objective}")
+    print(f"held-out clips: {len(dataset)}   samples/obs: {args.num_samples}   (every {holdout_mod}th episode)\n")
     header = f"{'domain':24s}" + "".join(f"{g[:14]:>16s}" for g in live)
     print(header)
     for name in sorted(acc["count"]):
@@ -292,6 +456,9 @@ def main() -> int:
         s = sum(acc["sq"][n].get(g, 0.0) for n in acc["sq"])
         c = sum(acc["count"][n].get(g, 0.0) for n in acc["count"])
         pooled[g] = float("nan") if c <= 0 else float(np.sqrt(s / c))
+    nonfinite_pooled = {group: value for group, value in pooled.items() if not np.isfinite(value)}
+    if nonfinite_pooled:
+        raise FloatingPointError(f"non-finite pooled metrics: {nonfinite_pooled}")
     print(f"{'POOLED':24s}" + "".join(f"{pooled[g]:16.5f}" for g in live))
     print("\nRMSE in raw action units (radians for joints); live slots only.")
 
@@ -300,6 +467,7 @@ def main() -> int:
         return float("nan") if n <= 0 else float(np.sqrt(acc["drift_sq"][name][k] / n))
 
     drift_table: dict = {}
+    pooled_drift: dict = {}
     if drift_ks and acc["drift_clips"]:
         print("\n=== integrated open-loop drift: arm POSITION error after k executed deltas ===")
         print("(what the robot feels. per-step RMSE is a rate; this is its integral.)\n")
@@ -310,27 +478,29 @@ def main() -> int:
             print(f"{name:24s}{int(acc['drift_clips'][name]):7d}" + row)
             drift_table[name] = {k: drift(name, k) for k in drift_ks}
 
-        pooled_drift = {}
         for k in drift_ks:
             s_k = sum(acc["drift_sq"][n].get(k, 0.0) for n in acc["drift_sq"])
             n_k = sum(acc["drift_n"][n].get(k, 0.0) for n in acc["drift_n"])
             pooled_drift[k] = float("nan") if n_k <= 0 else float(np.sqrt(s_k / n_k))
-        print(f"{'POOLED':24s}{int(sum(acc['drift_clips'].values())):7d}"
-              + "".join(f"{pooled_drift[k]:11.5f}" for k in drift_ks))
+        print(
+            f"{'POOLED':24s}{int(sum(acc['drift_clips'].values())):7d}"
+            + "".join(f"{pooled_drift[k]:11.5f}" for k in drift_ks)
+        )
 
         # The two bounds the measured curve must be read against. Independent per-step errors grow
         # as sqrt(k); perfectly correlated ones grow as k. Where the measurement falls between them
         # IS the error correlation, which is the thing no per-step metric can show.
         per_step = pooled.get("right-arm-joints", float("nan"))
-        print(f"\n{'independent sqrt(k)':24s}{'':7s}"
-              + "".join(f"{per_step * np.sqrt(k):11.5f}" for k in drift_ks))
+        print(f"\n{'independent sqrt(k)':24s}{'':7s}" + "".join(f"{per_step * np.sqrt(k):11.5f}" for k in drift_ks))
         print(f"{'correlated k':24s}{'':7s}" + "".join(f"{per_step * k:11.5f}" for k in drift_ks))
         worst = drift_ks[-1]
         if np.isfinite(pooled_drift[worst]) and per_step > 0:
             lo_b, hi_b = per_step * np.sqrt(worst), per_step * worst
             frac = (pooled_drift[worst] - lo_b) / max(hi_b - lo_b, 1e-12)
-            print(f"\nat k={worst}: measured {pooled_drift[worst]:.5f} rad sits {frac:.0%} of the way "
-                  f"from independent ({lo_b:.5f}) to fully correlated ({hi_b:.5f}).")
+            print(
+                f"\nat k={worst}: measured {pooled_drift[worst]:.5f} rad sits {frac:.0%} of the way "
+                f"from independent ({lo_b:.5f}) to fully correlated ({hi_b:.5f})."
+            )
             print(f"as a reach error at 0.6 m that is about {pooled_drift[worst] * 600:.1f} mm.")
         dropped = len(dataset) - int(sum(acc["drift_clips"].values()))
         if dropped:
@@ -338,23 +508,46 @@ def main() -> int:
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(
-            json.dumps(
-                {
-                    "preset": preset,
-                    "objective": objective,
-                    "head_step": step,
-                    "backbone_step": backbone_step,
-                    "holdout_mod": args.holdout_mod,
-                    "num_clips": len(dataset),
-                    "pooled": pooled,
-                    "per_domain": {n: {g: rmse(n, g) for g in live} for n in sorted(acc["count"])},
-                    "drift_ks": list(drift_ks),
-                    "integrated_drift": drift_table,
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "created_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+            "preset": preset,
+            "objective": objective,
+            "metric_interpretation": "deployment_sample" if args.num_samples == 1 else "sample_mean",
+            "head_step": step,
+            "head_checkpoint": str((args.run / "checkpoints" / str(step)).resolve()) if args.run else None,
+            "backbone_step": backbone_step,
+            "source_backbone_step": backbone_step,
+            "backbone_train_mode": backbone_train_mode,
+            "backbone_checkpoint": str(backbone_checkpoint.resolve()) if backbone_checkpoint else None,
+            "adapted_backbone_step": adapted_backbone_step,
+            "policy_run": str(args.run.resolve()) if args.run else None,
+            "ridge": str(args.ridge.resolve()) if args.ridge else None,
+            "pretrained_run": str(args.pretrained_run.resolve()),
+            "stores": [str(pathlib.Path(store).resolve()) for store in stores],
+            "holdout_mod": holdout_mod,
+            "index_step": index_step,
+            "observation_strides": list(observation_strides),
+            "action_stride": action_stride,
+            "horizon": evaluation_horizon,
+            "batch_size": args.batch_size,
+            "euler_steps": args.euler_steps,
+            "num_samples": args.num_samples,
+            "seed": args.seed,
+            "domains": names,
+            "num_clips": len(dataset),
+            "expected_clips": args.expected_clips,
+            "pooled": pooled,
+            "per_domain": {n: {g: rmse(n, g) for g in live} for n in sorted(acc["count"])},
+            "squared_error": acc["sq"],
+            "live_count": acc["count"],
+            "drift_ks": list(drift_ks),
+            "integrated_drift": drift_table,
+            "pooled_integrated_drift": pooled_drift,
+            "drift_clips": acc["drift_clips"],
+        }
+        staging = args.out.with_name(f".{args.out.name}.{os.getpid()}.tmp")
+        staging.write_text(json.dumps(payload, indent=2))
+        os.replace(staging, args.out)
         logger.info("wrote %s", args.out)
     return 0
 

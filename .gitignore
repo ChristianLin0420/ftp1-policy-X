@@ -204,3 +204,4 @@ FTP-1-Dataset/
 logs/
 runs/
 *.sqsh
+slurm-[0-9]*.sh

@@ -209,6 +209,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     config_json: str,
     loss_fn: nn.Module | None = None,
+    extra_modules: dict[str, nn.Module] | None = None,
     keep_last: int = 3,
     keep_period: int | None = None,
     extra: dict | None = None,
@@ -227,6 +228,9 @@ def save_checkpoint(
 
     module = student.module if hasattr(student, "module") else student
     torch.save(module.state_dict(), staging / "student.pt")
+    for name, extra_module in _checkpoint_modules(extra_modules).items():
+        module_to_save = extra_module.module if hasattr(extra_module, "module") else extra_module
+        torch.save(module_to_save.state_dict(), staging / f"{name}.pt")
     # Post-training freezes the backbone, so there is no EMA to shadow and no teacher to save.
     if teacher is not None:
         torch.save(teacher.state_dict(), staging / "teacher_ema.pt")
@@ -278,6 +282,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     loss_fn: nn.Module | None = None,
+    extra_modules: dict[str, nn.Module] | None = None,
 ) -> int:
     """Restore student, teacher shadow, optimizer, loss state and ``global_step``.
 
@@ -292,6 +297,12 @@ def load_checkpoint(
     path = pathlib.Path(checkpoint_dir) / str(step)
     module = student.module if hasattr(student, "module") else student
     module.load_state_dict(torch.load(path / "student.pt", map_location=device))
+    for name, extra_module in _checkpoint_modules(extra_modules).items():
+        extra_path = path / f"{name}.pt"
+        if not extra_path.exists():
+            raise FileNotFoundError(f"{extra_path} missing; cannot resume module {name!r}")
+        module_to_load = extra_module.module if hasattr(extra_module, "module") else extra_module
+        module_to_load.load_state_dict(torch.load(extra_path, map_location=device, weights_only=True), strict=True)
     if teacher is not None:
         teacher.load_state_dict(torch.load(path / "teacher_ema.pt", map_location=device))
     if optimizer is not None:
@@ -308,6 +319,18 @@ def load_checkpoint(
             )
     metadata = torch.load(path / "metadata.pt", map_location="cpu")
     return int(metadata["global_step"])
+
+
+def _checkpoint_modules(extra_modules: dict[str, nn.Module] | None) -> dict[str, nn.Module]:
+    """Validate optional named module artifacts before they become checkpoint filenames."""
+    modules = extra_modules or {}
+    reserved = {"student", "teacher_ema", "optimizer", "loss", "metadata"}
+    for name, module in modules.items():
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", name) or name in reserved:
+            raise ValueError(f"invalid or reserved checkpoint module name {name!r}")
+        if not isinstance(module, nn.Module):
+            raise TypeError(f"checkpoint module {name!r} is {type(module).__name__}, expected nn.Module")
+    return modules
 
 
 def architecture_from_run(run: pathlib.Path, cfg, step: int | None = None):
@@ -390,6 +413,86 @@ def load_frozen_backbone(run: pathlib.Path, step: int | None, cfg, device: torch
     backbone.requires_grad_(requires_grad=False)
     logger.info("loaded frozen backbone from %s step %d (%d params)", checkpoint_dir, step, len(params))
     return backbone, step
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadedPolicyBackbone:
+    """A policy's executable backbone plus unambiguous source/adaptation provenance."""
+
+    backbone: nn.Module
+    source_step: int
+    checkpoint: pathlib.Path | None
+    mode: str
+    adapted_step: int | None
+
+
+def load_policy_backbone(
+    policy_run: pathlib.Path,
+    policy_step: int,
+    cfg,
+    device: torch.device,
+) -> LoadedPolicyBackbone:
+    """Load the exact backbone paired with one supervised policy checkpoint.
+
+    Historical policy runs contain only ``student.pt`` because their encoder was frozen. Those
+    retain the legacy source-EMA path. New runs also save ``backbone.pt``; adapted modes require it
+    so evaluation can never silently fall back to the pretraining snapshot.
+    """
+    mode = getattr(cfg, "backbone_train_mode", "frozen")
+    if mode not in {"frozen", "last_blocks", "full"}:
+        raise ValueError(f"unknown saved backbone_train_mode {mode!r}")
+    if not cfg.pretrained_run:
+        raise ValueError("policy config must set pretrained_run")
+    if mode != "frozen" and cfg.pretrained_step is None:
+        raise ValueError("adapted policy config must pin pretrained_step")
+
+    backbone, source_step = load_frozen_backbone(
+        pathlib.Path(cfg.pretrained_run), cfg.pretrained_step, cfg, device
+    )
+    if cfg.pretrained_step is not None and source_step != cfg.pretrained_step:
+        raise ValueError(f"loaded source backbone step {source_step} != configured {cfg.pretrained_step}")
+
+    checkpoint_dir = pathlib.Path(policy_run) / "checkpoints" / str(policy_step)
+    backbone_path = checkpoint_dir / "backbone.pt"
+    if backbone_path.exists():
+        metadata_path = checkpoint_dir / "metadata.pt"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"{metadata_path} missing beside saved policy backbone")
+        metadata = torch.load(metadata_path, map_location="cpu", weights_only=True)
+        stored_policy_step = int(metadata.get("global_step", -1))
+        if stored_policy_step != policy_step:
+            raise ValueError(f"checkpoint metadata step {stored_policy_step} != requested policy step {policy_step}")
+        stored_mode = metadata.get("backbone_train_mode")
+        if stored_mode != mode:
+            raise ValueError(f"checkpoint backbone mode {stored_mode!r} != run config mode {mode!r}")
+        stored_source_run = metadata.get("source_backbone_run")
+        configured_source_run = str(pathlib.Path(cfg.pretrained_run).resolve())
+        if stored_source_run != configured_source_run:
+            raise ValueError(
+                f"checkpoint source run {stored_source_run!r} != configured source run {configured_source_run!r}"
+            )
+        stored_source = int(metadata.get("source_backbone_step", -1))
+        if stored_source != source_step:
+            raise ValueError(f"checkpoint source step {stored_source} != loaded source step {source_step}")
+        state = torch.load(backbone_path, map_location=device, weights_only=True)
+        backbone.load_state_dict(state, strict=True)
+        selected_path: pathlib.Path | None = backbone_path
+    elif mode != "frozen":
+        raise FileNotFoundError(
+            f"{backbone_path} missing for {mode!r} policy; refuse to evaluate the frozen source backbone"
+        )
+    else:
+        # Compatibility path for every policy checkpoint written before backbone adaptation.
+        selected_path = None
+
+    backbone.eval().requires_grad_(requires_grad=False)
+    return LoadedPolicyBackbone(
+        backbone=backbone,
+        source_step=source_step,
+        checkpoint=selected_path,
+        mode=mode,
+        adapted_step=policy_step if mode != "frozen" else None,
+    )
 
 
 def resolve_run_config(

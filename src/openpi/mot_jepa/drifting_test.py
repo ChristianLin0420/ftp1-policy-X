@@ -341,7 +341,14 @@ def test_ridge_head_reproduces_the_fitting_script_composition(tmp_path):
         blob[f"scale_{domain}"] = rng.uniform(0.5, 2.0, size=features).astype(np.float32)
         blob[f"weights_{domain}"] = rng.normal(size=(features + 1, horizon * action_dim)).astype(np.float32)
     path = tmp_path / "ridge.npz"
-    np.savez(path, readout=np.array("final_readout"), **blob)
+    np.savez(
+        path,
+        readout=np.array("final_readout"),
+        observation_stride=np.array(2),
+        action_stride=np.array(1),
+        horizon=np.array(horizon),
+        **blob,
+    )
 
     head = RidgeHead(path, LAYOUT, horizon=horizon)
     assert head.fitted_domains == [0, 2]
@@ -356,8 +363,11 @@ def test_ridge_head_reproduces_the_fitting_script_composition(tmp_path):
         standardised = (x[domain] - blob[f"mean_{domain}"]) / blob[f"scale_{domain}"]
         expected = np.hstack([standardised, [1.0]]) @ blob[f"weights_{domain}"]
         torch.testing.assert_close(
-            out[domain], torch.tensor(expected.reshape(horizon, action_dim), dtype=torch.float32),
-            rtol=1e-4, atol=1e-4, msg=f"domain {domain} does not match the fitting script",
+            out[domain],
+            torch.tensor(expected.reshape(horizon, action_dim), dtype=torch.float32),
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"domain {domain} does not match the fitting script",
         )
     assert (out[1] == 0).all(), "an unfitted domain must predict zero, not another domain's map"
 
@@ -374,11 +384,47 @@ def test_ridge_fitted_on_the_other_readout_is_refused(tmp_path):
         path,
         domains=np.array(["a"]),
         readout=np.array("sync_readout"),
+        observation_stride=np.array(2),
+        action_stride=np.array(1),
+        horizon=np.array(4),
         mean_0=rng.normal(size=features).astype(np.float32),
         scale_0=np.ones(features, dtype=np.float32),
         weights_0=rng.normal(size=(features + 1, 4 * 120)).astype(np.float32),
     )
     with pytest.raises(ValueError, match="fitted on"):
+        RidgeHead(path, LAYOUT, horizon=4)
+
+
+def test_ridge_without_sampling_metadata_is_refused(tmp_path):
+    features = LAYOUT.num_steps * (LAYOUT.video_width + LAYOUT.tactile_width)
+    path = tmp_path / "unstamped.npz"
+    np.savez(
+        path,
+        domains=np.array(["a"]),
+        readout=np.array("final_readout"),
+        mean_0=np.zeros(features, dtype=np.float32),
+        scale_0=np.ones(features, dtype=np.float32),
+        weights_0=np.zeros((features + 1, 4 * 120), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="sampling metadata"):
+        RidgeHead(path, LAYOUT, horizon=4)
+
+
+def test_ridge_horizon_mismatch_is_refused(tmp_path):
+    features = LAYOUT.num_steps * (LAYOUT.video_width + LAYOUT.tactile_width)
+    path = tmp_path / "wrong_horizon.npz"
+    np.savez(
+        path,
+        domains=np.array(["a"]),
+        readout=np.array("final_readout"),
+        observation_stride=np.array(2),
+        action_stride=np.array(1),
+        horizon=np.array(8),
+        mean_0=np.zeros(features, dtype=np.float32),
+        scale_0=np.ones(features, dtype=np.float32),
+        weights_0=np.zeros((features + 1, 8 * 120), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="horizon"):
         RidgeHead(path, LAYOUT, horizon=4)
 
 
